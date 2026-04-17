@@ -1,0 +1,109 @@
+[
+  {
+    "id": "8f2d6a4b5c9e1001",
+    "type": "tab",
+    "label": "SensorThings Bridge Demo",
+    "disabled": false,
+    "info": "Demo Node-RED flow for the Brabantse Delta wastewater use case."
+  },
+  {
+    "id": "8f2d6a4b5c9e1002",
+    "type": "comment",
+    "z": "8f2d6a4b5c9e1001",
+    "name": "How to use",
+    "info": "1. Import this flow into Node-RED.\n2. Update the HTTP request URL if needed.\n3. Click the inject node to send wastewater demo readings to the connector preview endpoint.\n4. Change the URL to /connector/ingest for live forwarding once the FROST server is configured.",
+    "x": 180,
+    "y": 60,
+    "wires": []
+  },
+  {
+    "id": "8f2d6a4b5c9e1003",
+    "type": "inject",
+    "z": "8f2d6a4b5c9e1001",
+    "name": "Send demo readings",
+    "props": [
+      {
+        "p": "payload"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "{}",
+    "payloadType": "json",
+    "x": 160,
+    "y": 140,
+    "wires": [["8f2d6a4b5c9e1004"]]
+  },
+  {
+    "id": "8f2d6a4b5c9e1004",
+    "type": "function",
+    "z": "8f2d6a4b5c9e1001",
+    "name": "Build wastewater payload",
+    "func": "const now = new Date().toISOString();\nmsg.headers = { \"Content-Type\": \"application/json\" };\nmsg.payload = {\n  readings: [\n    {\n      sensor_id: \"pressure-inlet-01\",\n      sensor_name: \"Inlet Pressure Sensor\",\n      observed_property: \"pressure\",\n      unit: \"bar\",\n      value: 1.82,\n      timestamp: now,\n      quality: \"good\",\n      thing_name: \"Brabantse Delta Wastewater Demo\"\n    },\n    {\n      sensor_id: \"pressure-outlet-01\",\n      sensor_name: \"Outlet Pressure Sensor\",\n      observed_property: \"pressure\",\n      unit: \"bar\",\n      value: 1.37,\n      timestamp: now,\n      quality: \"good\",\n      thing_name: \"Brabantse Delta Wastewater Demo\"\n    },\n    {\n      sensor_id: \"flow-main-01\",\n      sensor_name: \"Main Flow Sensor\",\n      observed_property: \"flow\",\n      unit: \"m3/h\",\n      value: 24.6,\n      timestamp: now,\n      quality: \"good\",\n      thing_name: \"Brabantse Delta Wastewater Demo\"\n    },\n    {\n      sensor_id: \"pump-rpm-01\",\n      sensor_name: \"Pump RPM Sensor\",\n      observed_property: \"pump_speed\",\n      unit: \"rpm\",\n      value: 1450,\n      timestamp: now,\n      quality: \"good\",\n      thing_name: \"Brabantse Delta Wastewater Demo\"\n    }\n  ]\n};\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 410,
+    "y": 140,
+    "wires": [["8f2d6a4b5c9e1005", "8f2d6a4b5c9e1007"]]
+  },
+  {
+    "id": "8f2d6a4b5c9e1005",
+    "type": "http request",
+    "z": "8f2d6a4b5c9e1001",
+    "name": "POST to connector preview",
+    "method": "POST",
+    "ret": "obj",
+    "paytoqs": "ignore",
+    "url": "http://127.0.0.1:8010/connector/ingest-preview",
+    "tls": "",
+    "persist": false,
+    "proxy": "",
+    "insecureHTTPParser": false,
+    "authType": "",
+    "senderr": false,
+    "headers": [],
+    "x": 690,
+    "y": 140,
+    "wires": [["8f2d6a4b5c9e1006"]]
+  },
+  {
+    "id": "8f2d6a4b5c9e1006",
+    "type": "debug",
+    "z": "8f2d6a4b5c9e1001",
+    "name": "Preview response",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "statusVal": "",
+    "statusType": "auto",
+    "x": 930,
+    "y": 140,
+    "wires": []
+  },
+  {
+    "id": "8f2d6a4b5c9e1007",
+    "type": "debug",
+    "z": "8f2d6a4b5c9e1001",
+    "name": "Outgoing payload",
+    "active": false,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "statusVal": "",
+    "statusType": "auto",
+    "x": 680,
+    "y": 200,
+    "wires": []
+  }
+]
