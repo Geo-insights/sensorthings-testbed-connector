@@ -17,3 +17,9 @@ The strongest angle is to present the solution as a lightweight interoperability
 ## Suggested concise pitch
 
 We propose a lightweight bridge solution that connects heterogeneous wastewater-monitoring sensors to a central OGC SensorThings API server using Node-RED and a standards-aligned connector service. The approach is practical, reproducible, and designed to generate clear lessons learned for broader public-sector adoption.
+
+## Publication terms
+
+- source code: MIT License
+- reports, research outputs, and other deliverables: CC BY 4.0
+- public availability period: minimum six months after completion of the testbed

@@ -34,8 +34,8 @@ This approach is deliberately simple, transparent, and reproducible for other pu
 - working connection from one or more sensors to the central SensorThings server
 - validation of timing, structure, and reliability
 - public demonstration setup
-- open repository with code and reproducible documentation
-- lessons learned report
+- open repository with MIT-licensed source code and reproducible documentation
+- lessons learned report published under CC BY 4.0
 
 ## Implementation focus
 
