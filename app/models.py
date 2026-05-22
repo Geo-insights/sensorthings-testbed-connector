@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -14,7 +14,8 @@ class SensorReading(BaseModel):
     value: float
     timestamp: datetime
     quality: str = "good"
-    thing_name: str = "Wastewater Treatment Demo"
+    location: Literal["tgv", "blijdorp"] = "tgv"
+    thing_name: str = "Climate adaptation setup"
 
 
 class ObservationPayload(BaseModel):

@@ -16,16 +16,28 @@ def _load_datastream_map() -> dict[str, str]:
     return {str(key): str(value) for key, value in data.items()}
 
 
+def _load_float(name: str, default: str) -> float:
+    raw = os.getenv(name, default).strip()
+    try:
+        return float(raw)
+    except ValueError:
+        return float(default)
+
+
 @dataclass(frozen=True)
 class Settings:
     connector_name: str = os.getenv("CONNECTOR_NAME", "UrbanAdapt SensorThings Connector")
     sensorthings_base_url: str = os.getenv("SENSORTHINGS_BASE_URL", "").rstrip("/")
     things_path: str = os.getenv("SENSORTHINGS_THINGS_PATH", "/Things")
+    locations_path: str = os.getenv("SENSORTHINGS_LOCATIONS_PATH", "/Locations")
     sensors_path: str = os.getenv("SENSORTHINGS_SENSORS_PATH", "/Sensors")
     observed_properties_path: str = os.getenv("SENSORTHINGS_OBSERVED_PROPERTIES_PATH", "/ObservedProperties")
     datastreams_path: str = os.getenv("SENSORTHINGS_DATASTREAMS_PATH", "/Datastreams")
     observations_path: str = os.getenv("SENSORTHINGS_OBSERVATIONS_PATH", "/Observations")
     auth_token: str = os.getenv("SENSORTHINGS_AUTH_TOKEN", "")
+    registered_entities_path: str = os.getenv("SENSORTHINGS_REGISTERED_ENTITIES_PATH", "data/registered_entities.json")
+    failed_observations_path: str = os.getenv("SENSORTHINGS_FAILED_OBSERVATIONS_PATH", "data/failed_observations.jsonl")
+    request_timeout_seconds: float = field(default_factory=lambda: _load_float("SENSORTHINGS_REQUEST_TIMEOUT_SECONDS", "15"))
     datastream_ids: dict[str, str] = field(default_factory=_load_datastream_map)
     debug: bool = os.getenv("DEBUG", "false").lower() in {"1", "true", "yes", "on"}
 

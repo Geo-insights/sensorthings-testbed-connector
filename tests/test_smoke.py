@@ -34,6 +34,16 @@ def test_registration_preview_exposes_frost_entities():
     assert len(body["datastreams"]) >= 1
 
 
+def test_frost_status_reports_preview_mode_when_unconfigured():
+    response = client.get("/frost/status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["mode"] == "preview"
+    assert body["reachable"] is False
+    assert "preview mode" in body["message"].lower()
+
+
 def test_ingest_preview_accepts_custom_bridge_payload():
     response = client.post(
         "/connector/ingest-preview",
@@ -47,7 +57,8 @@ def test_ingest_preview_accepts_custom_bridge_payload():
                     "value": 1450,
                     "timestamp": "2026-04-17T10:00:00Z",
                     "quality": "good",
-                    "thing_name": "Brabantse Delta Wastewater Demo"
+                    "location": "tgv",
+                    "thing_name": "Climate adaptation setup"
                 }
             ]
         },

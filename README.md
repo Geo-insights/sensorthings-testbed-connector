@@ -1,46 +1,36 @@
 # SensorThings Testbed Connector
 
-A lightweight proof of concept for Geonovum implementation topic 2: connecting one or more sensors to a central OGC SensorThings API server.
+This repository contains the FastAPI connector used for the Geonovum Sensor Data Testbed 2026. It prepares climate-adaptation sensor data for an OGC SensorThings API v1.1 FROST server at `https://frost.wbd-rd.nl/FROST-Server/v1.1`.
 
-The repository is intentionally small, public-facing, and easy to demonstrate. It is designed around the Brabantse Delta wastewater digital twin scenario described in the tender and uses a bridge-based approach that fits mixed sensor inputs such as analog sensors and Modbus pump telemetry.
+The current focus is the integration of two real pilot locations:
 
-## Overview
+- The Green Village, TU Delft campus in Delft
+- Diergaarde Blijdorp in Rotterdam
 
-This project demonstrates how to:
+The codebase already includes a SensorThings client, preview endpoints, registration helpers, and a stub climate-adaptation source so the connector can be tested end-to-end before Lindsey Schwidder confirms the final sensor protocols.
 
-- ingest wastewater monitoring readings from a bridge layer such as Node-RED
-- map those readings to OGC SensorThings and OM Measurement concepts
-- preview and register demo entities against a FROST-compatible server
-- submit standardized observations for downstream querying and analysis
+## Project Purpose
 
-## Why this repo exists
+The connector translates site-specific readings into SensorThings entities and observations:
 
-This repository is separate from the main UrbanAdapt monitoring service so the tender work can stay:
+- it models each installation as a Thing with its own Location
+- it registers Sensors, ObservedProperties, Datastreams, and Observations in FROST
+- it keeps a dead-letter queue for failed observations so the stream can be replayed later
+- it exposes a status check for verifying connectivity before live testing
 
-- focused on the interoperability use case
-- easy to explain to reviewers
-- simple to publish and keep online
-- low-risk for production systems
+## Sites In Scope
 
-## Included in the repository
+### The Green Village, TU Delft, Delft
 
-| Area | Purpose |
-| --- | --- |
-| FastAPI demo app | Local service for previewing, registering, and forwarding observations |
-| Wastewater demo source | Mock readings for inlet pressure, outlet pressure, flow, and pump speed |
-| FROST-ready client logic | Registration preview and observation push flow |
-| Node-RED example | Importable bridge flow for the tender scenario |
-| Tender docs | Implementation plan, summary, architecture diagram, and notes |
+Planned setups include Hitteplein, Rainaway Parkeerplaatsen, Flowsand, Koers / Zoak / Nus, Climate Davis, and Weather Climatics. These cover climate stress, soil moisture, soil temperature, conductivity, precipitation, wind, and air pressure measurements.
 
-## Suggested use in the testbed
+### Diergaarde Blijdorp, Rotterdam
 
-1. Start with the built-in wastewater-oriented demo readings.
-2. Use Node-RED as the intermediary bridge for mixed sensor inputs.
-3. Register the Thing, Sensors, Observed Properties, and Datastreams in the central FROST server.
-4. Submit observations and validate structure, timing, and reliability.
-5. Document the lessons learned and keep the demonstrator available.
+Planned setups include microclimate sensors for animal enclosures, a weather station, Klimaatplein / Bufferblocks, and pond water quality monitoring.
 
-## Quick start
+The full draft model is documented in [docs/entity-mapping.md](docs/entity-mapping.md).
+
+## Quick Start
 
 ```powershell
 py -m venv .venv
@@ -54,62 +44,85 @@ After startup, open:
 - <http://127.0.0.1:8010/health>
 - <http://127.0.0.1:8010/connector/preview>
 - <http://127.0.0.1:8010/connector/registration-preview>
+- <http://127.0.0.1:8010/frost/status>
 - <http://127.0.0.1:8010/docs>
 
-## Main endpoints
+## Endpoints
 
 | Endpoint | Purpose |
 | --- | --- |
 | GET /health | Basic health check |
-| GET /connector/preview | Preview demo observations |
-| GET /connector/registration-preview | Preview FROST entity registration payloads |
-| POST /connector/register-demo | Register demo entities against a live SensorThings server |
-| POST /connector/ingest-preview | Validate bridge payloads without sending externally |
-| POST /connector/ingest | Forward bridge payloads to the configured SensorThings server |
-| POST /connector/push | Push the built-in demo readings |
+| GET /connector/preview | Preview stub climate-adaptation observations |
+| GET /connector/registration-preview | Preview the SensorThings registration payloads |
+| POST /connector/register-demo | Register the default climate-adaptation entity sets |
+| POST /connector/ingest-preview | Validate custom bridge payloads without posting them |
+| POST /connector/ingest | Push supplied readings to the configured SensorThings server |
+| POST /connector/push | Push the built-in stub readings |
+| POST /connector/replay-failed | Replay observations stored in the dead-letter queue |
+| GET /frost/status | Check FROST connectivity, response time, and Thing count |
 
 ## Configuration
 
-Copy .env.example to .env and adjust the values for the live testbed environment.
+Copy `.env.example` to `.env` and adjust the values for the live testbed environment.
 
-Key settings include:
+| Variable | Purpose |
+| --- | --- |
+| `CONNECTOR_NAME` | Friendly service name shown by FastAPI |
+| `SENSORTHINGS_BASE_URL` | FROST root URL, including `/v1.1` |
+| `SENSORTHINGS_THINGS_PATH` | Thing collection path, default `/Things` |
+| `SENSORTHINGS_LOCATIONS_PATH` | Location collection path, default `/Locations` |
+| `SENSORTHINGS_SENSORS_PATH` | Sensor collection path, default `/Sensors` |
+| `SENSORTHINGS_OBSERVED_PROPERTIES_PATH` | ObservedProperty collection path, default `/ObservedProperties` |
+| `SENSORTHINGS_DATASTREAMS_PATH` | Datastream collection path, default `/Datastreams` |
+| `SENSORTHINGS_OBSERVATIONS_PATH` | Observation collection path, default `/Observations` |
+| `SENSORTHINGS_AUTH_TOKEN` | Optional bearer token for authenticated FROST access |
+| `SENSORTHINGS_DATASTREAM_IDS_JSON` | Optional JSON map for preloaded Datastream IDs |
+| `SENSORTHINGS_REGISTERED_ENTITIES_PATH` | Path for cached `@iot.id` mappings, default `data/registered_entities.json` |
+| `SENSORTHINGS_FAILED_OBSERVATIONS_PATH` | Path for the dead-letter queue, default `data/failed_observations.jsonl` |
+| `SENSORTHINGS_REQUEST_TIMEOUT_SECONDS` | HTTP timeout used for FROST requests |
+| `DEBUG` | Enable debug mode |
 
-- SENSORTHINGS_BASE_URL
-- SENSORTHINGS_THINGS_PATH
-- SENSORTHINGS_SENSORS_PATH
-- SENSORTHINGS_OBSERVED_PROPERTIES_PATH
-- SENSORTHINGS_DATASTREAMS_PATH
-- SENSORTHINGS_OBSERVATIONS_PATH
-- SENSORTHINGS_AUTH_TOKEN
-- SENSORTHINGS_DATASTREAM_IDS_JSON
-- CONNECTOR_NAME
-- DEBUG
+If no base URL is configured, the app stays in preview mode and returns payloads locally without posting to FROST.
 
-If no base URL is configured, the app stays in preview mode and returns payloads locally without posting them to an external service.
+## Status
 
-## Node-RED starter assets
+Live now:
 
-- quickstart guide in docs/NODE_RED_QUICKSTART.md
-- importable flow in examples/node-red/sensorthings-bridge-flow.json
+- FastAPI app and existing preview endpoints
+- climate-adaptation stub readings for TGV and Blijdorp
+- FROST connectivity probe at `/frost/status`
+- registration caching in `data/registered_entities.json`
+- dead-letter replay from `data/failed_observations.jsonl`
 
-## Tender-facing documentation
+Stub-only pending Lindsey confirmation:
 
-- implementation plan in docs/IMPLEMENTATION_PLAN.md
-- proposal summary in docs/PROPOSAL_SUMMARY.md
-- architecture diagram in docs/ARCHITECTURE_DIAGRAM.md
-- tender response notes in docs/TENDER_RESPONSE_NOTES.md
+- exact sensor make/model details
+- final protocol and payload shapes for the field devices
+- the pond water quality parameter list
+- the final placement of several Things and sensors within each site
 
-## Recommended next steps
+## Node-RED Starter Assets
 
-- replace the mock source with the real sensor or bridge feed
-- configure the hosted FROST server once credentials are available
-- validate live datastream registration and observation delivery
-- expand logging and retry handling for a public demonstration setup
+- quickstart guide in [docs/NODE_RED_QUICKSTART.md](docs/NODE_RED_QUICKSTART.md)
+- importable flow in [examples/node-red/sensorthings-bridge-flow.json](examples/node-red/sensorthings-bridge-flow.json)
 
-## Licensing and publication terms
+## Tender-Facing Documentation
+
+- implementation plan in [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md)
+- proposal summary in [docs/PROPOSAL_SUMMARY.md](docs/PROPOSAL_SUMMARY.md)
+- architecture diagram in [docs/ARCHITECTURE_DIAGRAM.md](docs/ARCHITECTURE_DIAGRAM.md)
+- tender response notes in [docs/TENDER_RESPONSE_NOTES.md](docs/TENDER_RESPONSE_NOTES.md)
+
+## Recommended Next Steps
+
+- replace the stub source with the live sensor feed once the protocol is confirmed
+- point `SENSORTHINGS_BASE_URL` at the production FROST environment for a connectivity check
+- validate live Datastream registration and observation delivery with a small pilot subset
+
+## Licensing and Publication Terms
 
 - all source code in this repository is published under the MIT License
 - research results, reports, data, and non-code deliverables for the testbed are intended to be published under CC BY 4.0
 - deliverables should remain publicly available for at least six months after completion of the testbed
 
-See the LICENSE file for the code license details and the tender documentation for the publication requirements.
+See the [LICENSE](LICENSE) file for the code license details and the tender documentation for the publication requirements.

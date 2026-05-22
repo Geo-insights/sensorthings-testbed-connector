@@ -2,22 +2,30 @@
 
 ```mermaid
 flowchart LR
-    A[Analog pressure sensors] --> B[Node-RED bridge]
-    C[Flow sensor] --> B
-    D[Pump telemetry via Modbus] --> B
-    B --> E[SensorThings testbed connector]
-    E --> F[FROST SensorThings Server]
-    F --> G[Digital twin dashboards and analytics]
+    TGV[TGV sensors] --> AT[Adapter: TGV]
+    BL[Blijdorp sensors] --> AB[Adapter: Blijdorp]
+    AT --> CC[Connector core]
+    AB --> CC
+    CC --> FS[FROST Server (Brabantse Delta)]
+    CC --> UM[UrbanAdapt Monitoring Module]
+    FS --> Q[Geonovum testbed queries]
+    UM --> UP[UrbanAdapt platform]
+```
 
-    E --> H[Registration preview]
-    E --> I[Observation ingest]
+```mermaid
+flowchart TD
+    Thing[Thing] --> Location[Location]
+    Thing --> Datastream[Datastream]
+    Datastream --> Sensor[Sensor]
+    Datastream --> ObservedProperty[ObservedProperty]
+    Datastream --> Observations[Observations]
 ```
 
 ## Interpretation
 
 This architecture keeps the integration intentionally lightweight:
 
-- Node-RED gathers or simulates heterogeneous sensor input
-- the connector normalizes payloads for the SensorThings model
-- the FROST server acts as the central standards-based observation store
-- downstream clients can query the observations for monitoring, optimization, and digital twin scenarios
+- the TGV and Blijdorp adapters normalize site-specific sensor feeds
+- the connector core registers SensorThings entities and forwards observations
+- the FROST server is the central SensorThings store for the Geonovum testbed
+- the UrbanAdapt monitoring module can reuse the same observations downstream
