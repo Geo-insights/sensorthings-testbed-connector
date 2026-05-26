@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -34,7 +36,12 @@ def test_registration_preview_exposes_frost_entities():
     assert len(body["datastreams"]) >= 1
 
 
-def test_frost_status_reports_preview_mode_when_unconfigured():
+def test_frost_status_reports_preview_mode_when_unconfigured(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.sensorthings_client.settings",
+        SimpleNamespace(sensorthings_base_url=""),
+    )
+
     response = client.get("/frost/status")
 
     assert response.status_code == 200
@@ -68,3 +75,15 @@ def test_ingest_preview_accepts_custom_bridge_payload():
     body = response.json()
     assert body["readings"][0]["sensor_id"] == "pump-rpm-01"
     assert body["payloads"][0]["result"] == 1450
+
+
+def test_site_registration_preview_unknown_site_returns_404():
+    response = client.get("/connector/registration-preview/unknown")
+
+    assert response.status_code == 404
+
+
+def test_register_site_unknown_site_returns_404():
+    response = client.post("/connector/register-site/unknown")
+
+    assert response.status_code == 404

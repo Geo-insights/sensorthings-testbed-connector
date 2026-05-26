@@ -3,6 +3,12 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 
 def _load_datastream_map() -> dict[str, str]:
@@ -27,6 +33,7 @@ def _load_float(name: str, default: str) -> float:
 @dataclass(frozen=True)
 class Settings:
     connector_name: str = os.getenv("CONNECTOR_NAME", "UrbanAdapt SensorThings Connector")
+    bridge_payload_path: str = os.getenv("CONNECTOR_BRIDGE_PAYLOAD_PATH", "").strip()
     sensorthings_base_url: str = os.getenv("SENSORTHINGS_BASE_URL", "").rstrip("/")
     things_path: str = os.getenv("SENSORTHINGS_THINGS_PATH", "/Things")
     locations_path: str = os.getenv("SENSORTHINGS_LOCATIONS_PATH", "/Locations")
@@ -35,6 +42,9 @@ class Settings:
     datastreams_path: str = os.getenv("SENSORTHINGS_DATASTREAMS_PATH", "/Datastreams")
     observations_path: str = os.getenv("SENSORTHINGS_OBSERVATIONS_PATH", "/Observations")
     auth_token: str = os.getenv("SENSORTHINGS_AUTH_TOKEN", "")
+    auth_username: str = os.getenv("SENSORTHINGS_AUTH_USERNAME", "")
+    auth_password: str = os.getenv("SENSORTHINGS_AUTH_PASSWORD", "")
+    entity_name_prefix: str = os.getenv("SENSORTHINGS_ENTITY_NAME_PREFIX", "")
     registered_entities_path: str = os.getenv("SENSORTHINGS_REGISTERED_ENTITIES_PATH", "data/registered_entities.json")
     failed_observations_path: str = os.getenv("SENSORTHINGS_FAILED_OBSERVATIONS_PATH", "data/failed_observations.jsonl")
     request_timeout_seconds: float = field(default_factory=lambda: _load_float("SENSORTHINGS_REQUEST_TIMEOUT_SECONDS", "15"))

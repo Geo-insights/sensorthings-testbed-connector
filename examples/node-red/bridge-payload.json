@@ -1,0 +1,26 @@
+{
+  "readings": [
+    {
+      "sensor_id": "tgv-hitteplein-climate-station",
+      "sensor_name": "Hitteplein climate station",
+      "observed_property": "air_temperature",
+      "unit": "Cel",
+      "value": 24.7,
+      "timestamp": "2026-05-26T10:00:00Z",
+      "quality": "good",
+      "location": "tgv",
+      "thing_name": "Hitteplein"
+    },
+    {
+      "sensor_id": "tgv-hitteplein-climate-station",
+      "sensor_name": "Hitteplein climate station",
+      "observed_property": "relative_humidity",
+      "unit": "%",
+      "value": 56.2,
+      "timestamp": "2026-05-26T10:00:00Z",
+      "quality": "good",
+      "location": "tgv",
+      "thing_name": "Hitteplein"
+    }
+  ]
+}

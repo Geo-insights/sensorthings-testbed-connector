@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
@@ -72,9 +73,25 @@ class SensorThingsClient:
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
-        if settings.auth_token:
+        if settings.auth_username:
+            credentials = f"{settings.auth_username}:{settings.auth_password}"
+            encoded = base64.b64encode(credentials.encode("utf-8")).decode("ascii")
+            headers["Authorization"] = f"Basic {encoded}"
+        elif settings.auth_token:
             headers["Authorization"] = f"Bearer {settings.auth_token}"
         return headers
+
+    def _prefixed_name(self, name: str) -> str:
+        prefix = settings.entity_name_prefix.strip()
+        if not prefix:
+            return name
+        if name.startswith(prefix):
+            return name
+        return f"{prefix}{name}"
+
+    def _entity_sets_for_site(self, site_key: str) -> list[dict[str, Any]]:
+        normalized_site_key = site_key.strip().lower()
+        return [entity_set for entity_set in CLIMATE_ADAPTATION_ENTITY_SETS if entity_set["site_key"] == normalized_site_key]
 
     def _extract_iot_id(self, response: requests.Response) -> str | None:
         try:
@@ -165,7 +182,7 @@ class SensorThingsClient:
 
     def _build_site_registration_preview(self, entity_sets: list[dict[str, Any]]) -> RegistrationPreview:
         thing_preview = {
-            "name": "Climate adaptation sensor network",
+            "name": self._prefixed_name("Climate adaptation sensor network"),
             "description": "Prepared SensorThings model for The Green Village and Diergaarde Blijdorp.",
             "properties": {"connector": settings.connector_name, "status": "stub"},
         }
@@ -175,12 +192,13 @@ class SensorThingsClient:
         seen_properties: set[str] = set()
 
         for site_config in entity_sets:
-            thing_name = site_config["thing"]["name"]
+            thing_name = self._prefixed_name(site_config["thing"]["name"])
             for sensor in site_config["sensors"]:
+                sensor_name = self._prefixed_name(sensor["name"])
                 sensors.append(
                     {
                         "sensor_id": sensor["sensor_id"],
-                        "name": sensor["name"],
+                        "name": sensor_name,
                         "description": sensor["description"],
                         "encodingType": sensor["encodingType"],
                         "metadata": sensor["metadata"],
@@ -204,9 +222,9 @@ class SensorThingsClient:
                     datastreams.append(
                         {
                             "sensor_id": sensor["sensor_id"],
-                            "sensor_name": sensor["name"],
+                            "sensor_name": sensor_name,
                             "observed_property_key": observed_property,
-                            "name": f"{sensor['name']} - {property_payload['name']}",
+                            "name": f"{sensor_name} - {property_payload['name']}",
                             "description": f"{property_payload['name']} observations for {thing_name}",
                             "observationType": "http://www.opengis.net/def/observationType/OGC-OM/2.0/OM_Measurement",
                             "unitOfMeasurement": {
@@ -265,6 +283,12 @@ class SensorThingsClient:
         _ = readings
         return self._build_site_registration_preview(CLIMATE_ADAPTATION_ENTITY_SETS)
 
+    def build_site_registration_preview(self, site_key: str) -> RegistrationPreview | None:
+        entity_sets = self._entity_sets_for_site(site_key)
+        if not entity_sets:
+            return None
+        return self._build_site_registration_preview(entity_sets)
+
     def register_entity_set(self, site_config: dict[str, Any]) -> dict[str, Any]:
         if not settings.sensorthings_base_url:
             return {
@@ -273,7 +297,7 @@ class SensorThingsClient:
                 "preview": self._build_site_registration_preview([site_config]).model_dump(mode="json"),
             }
 
-        thing_name = site_config["thing"]["name"]
+        thing_name = self._prefixed_name(site_config["thing"]["name"])
         thing_payload = {
             "name": thing_name,
             "description": site_config["thing"]["description"],
@@ -289,7 +313,7 @@ class SensorThingsClient:
                 "thing_status": thing_status,
             }
 
-        location_name = site_config["location"]["name"]
+        location_name = self._prefixed_name(site_config["location"]["name"])
         location_payload = {
             "name": location_name,
             "description": site_config["location"]["description"],
@@ -306,18 +330,19 @@ class SensorThingsClient:
         datastream_results: list[dict[str, Any]] = []
 
         for sensor in site_config["sensors"]:
+            sensor_name = self._prefixed_name(sensor["name"])
             sensor_payload = {
-                "name": sensor["name"],
+                "name": sensor_name,
                 "description": sensor["description"],
                 "encodingType": sensor["encodingType"],
                 "metadata": sensor["metadata"],
             }
-            sensor_id, sensor_status = self._get_or_create_entity(settings.sensors_path, sensor["name"], sensor_payload, "sensors")
+            sensor_id, sensor_status = self._get_or_create_entity(settings.sensors_path, sensor_name, sensor_payload, "sensors")
             sensor_ids[sensor["sensor_id"]] = sensor_id
             sensor_results.append(
                 {
                     "sensor_id": sensor["sensor_id"],
-                    "name": sensor["name"],
+                    "name": sensor_name,
                     "status": sensor_status,
                     "@iot.id": sensor_id,
                 }
@@ -340,7 +365,7 @@ class SensorThingsClient:
 
                 datastream_key = self._datastream_key(sensor["sensor_id"], observed_property)
                 datastream_payload = {
-                    "name": f"{sensor['name']} - {property_payload['name']}",
+                    "name": f"{sensor_name} - {property_payload['name']}",
                     "description": f"{property_payload['name']} observations for {thing_name}",
                     "observationType": "http://www.opengis.net/def/observationType/OGC-OM/2.0/OM_Measurement",
                     "unitOfMeasurement": {
@@ -405,6 +430,28 @@ class SensorThingsClient:
         site_results = [self.register_entity_set(site_config) for site_config in CLIMATE_ADAPTATION_ENTITY_SETS]
         return {
             "mode": "live",
+            "site_results": site_results,
+            "datastream_ids": self._datastream_ids,
+            "registered_entities": self._registered_entities,
+        }
+
+    def register_site_entities(self, site_key: str) -> dict[str, Any] | None:
+        entity_sets = self._entity_sets_for_site(site_key)
+        if not entity_sets:
+            return None
+
+        if not settings.sensorthings_base_url:
+            return {
+                "mode": "preview",
+                "site_key": site_key,
+                "message": "No SensorThings server configured. Returning registration payload preview only.",
+                "preview": self._build_site_registration_preview(entity_sets).model_dump(mode="json"),
+            }
+
+        site_results = [self.register_entity_set(site_config) for site_config in entity_sets]
+        return {
+            "mode": "live",
+            "site_key": site_key,
             "site_results": site_results,
             "datastream_ids": self._datastream_ids,
             "registered_entities": self._registered_entities,

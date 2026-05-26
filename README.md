@@ -52,12 +52,14 @@ After startup, open:
 | Endpoint | Purpose |
 | --- | --- |
 | GET /health | Basic health check |
-| GET /connector/preview | Preview stub climate-adaptation observations |
+| GET /connector/preview | Preview bridge payload observations, falling back to demo data |
 | GET /connector/registration-preview | Preview the SensorThings registration payloads |
+| GET /connector/registration-preview/{site_key} | Preview registration payloads for one site (`tgv` or `blijdorp`) |
 | POST /connector/register-demo | Register the default climate-adaptation entity sets |
+| POST /connector/register-site/{site_key} | Register one site at a time (`tgv` or `blijdorp`) |
 | POST /connector/ingest-preview | Validate custom bridge payloads without posting them |
 | POST /connector/ingest | Push supplied readings to the configured SensorThings server |
-| POST /connector/push | Push the built-in stub readings |
+| POST /connector/push | Push bridge payload readings, falling back to demo data |
 | POST /connector/replay-failed | Replay observations stored in the dead-letter queue |
 | GET /frost/status | Check FROST connectivity, response time, and Thing count |
 
@@ -68,6 +70,7 @@ Copy `.env.example` to `.env` and adjust the values for the live testbed environ
 | Variable | Purpose |
 | --- | --- |
 | `CONNECTOR_NAME` | Friendly service name shown by FastAPI |
+| `CONNECTOR_BRIDGE_PAYLOAD_PATH` | Optional JSON payload file used by `/connector/preview` and `/connector/push` |
 | `SENSORTHINGS_BASE_URL` | FROST root URL, including `/v1.1` |
 | `SENSORTHINGS_THINGS_PATH` | Thing collection path, default `/Things` |
 | `SENSORTHINGS_LOCATIONS_PATH` | Location collection path, default `/Locations` |
@@ -76,6 +79,9 @@ Copy `.env.example` to `.env` and adjust the values for the live testbed environ
 | `SENSORTHINGS_DATASTREAMS_PATH` | Datastream collection path, default `/Datastreams` |
 | `SENSORTHINGS_OBSERVATIONS_PATH` | Observation collection path, default `/Observations` |
 | `SENSORTHINGS_AUTH_TOKEN` | Optional bearer token for authenticated FROST access |
+| `SENSORTHINGS_AUTH_USERNAME` | Optional username for HTTP Basic auth |
+| `SENSORTHINGS_AUTH_PASSWORD` | Optional password for HTTP Basic auth |
+| `SENSORTHINGS_ENTITY_NAME_PREFIX` | Optional prefix applied to Thing, Location, Sensor, and Datastream names |
 | `SENSORTHINGS_DATASTREAM_IDS_JSON` | Optional JSON map for preloaded Datastream IDs |
 | `SENSORTHINGS_REGISTERED_ENTITIES_PATH` | Path for cached `@iot.id` mappings, default `data/registered_entities.json` |
 | `SENSORTHINGS_FAILED_OBSERVATIONS_PATH` | Path for the dead-letter queue, default `data/failed_observations.jsonl` |
@@ -84,12 +90,16 @@ Copy `.env.example` to `.env` and adjust the values for the live testbed environ
 
 If no base URL is configured, the app stays in preview mode and returns payloads locally without posting to FROST.
 
+For the WBD-RD FROST environment, use `SENSORTHINGS_AUTH_USERNAME` and `SENSORTHINGS_AUTH_PASSWORD`; the connector will send HTTP Basic auth automatically.
+
+If `CONNECTOR_BRIDGE_PAYLOAD_PATH` is set, the connector treats that file as the active bridge source for preview and push flows. The file can contain either a top-level `readings` array or a raw array of reading objects.
+
 ## Status
 
 Live now:
 
 - FastAPI app and existing preview endpoints
-- climate-adaptation stub readings for TGV and Blijdorp
+- bridge-payload sourcing for preview and push, with demo fallback
 - FROST connectivity probe at `/frost/status`
 - registration caching in `data/registered_entities.json`
 - dead-letter replay from `data/failed_observations.jsonl`
@@ -105,6 +115,13 @@ Stub-only pending Lindsey confirmation:
 
 - quickstart guide in [docs/NODE_RED_QUICKSTART.md](docs/NODE_RED_QUICKSTART.md)
 - importable flow in [examples/node-red/sensorthings-bridge-flow.json](examples/node-red/sensorthings-bridge-flow.json)
+- sample bridge payload in [examples/node-red/bridge-payload.json](examples/node-red/bridge-payload.json)
+
+## Operations And Handoff
+
+- sensor onboarding checklist in [docs/SENSOR_ONBOARDING_CHECKLIST.md](docs/SENSOR_ONBOARDING_CHECKLIST.md)
+- live FROST inventory in [docs/FROST_LIVE_INVENTORY.md](docs/FROST_LIVE_INVENTORY.md)
+- current hold-point summary in [docs/TESTBED_HOLD_POINT.md](docs/TESTBED_HOLD_POINT.md)
 
 ## Tender-Facing Documentation
 
@@ -115,9 +132,9 @@ Stub-only pending Lindsey confirmation:
 
 ## Recommended Next Steps
 
-- replace the stub source with the live sensor feed once the protocol is confirmed
-- point `SENSORTHINGS_BASE_URL` at the production FROST environment for a connectivity check
-- validate live Datastream registration and observation delivery with a small pilot subset
+- point the bridge or Node-RED export at `CONNECTOR_BRIDGE_PAYLOAD_PATH` for local preview and push runs
+- register sites incrementally with `/connector/register-site/tgv` and `/connector/register-site/blijdorp`
+- validate repeated live observation delivery through `/connector/ingest`
 
 ## Licensing and Publication Terms
 
