@@ -1,7 +1,8 @@
 from fastapi import APIRouter
 from fastapi import HTTPException
+from fastapi import Query
 
-from app.models import IngestRequest
+from app.models import IngestRequest, TaskingTaskCreateRequest, TaskingTaskQuery
 from app.sources.bridge_source import load_bridge_readings
 from app.services.sensorthings_client import client
 
@@ -64,3 +65,34 @@ def replay_failed_observations() -> dict:
 @router.get("/frost/status")
 def frost_status() -> dict:
     return client.check_frost_status()
+
+
+@router.get("/frost/capabilities")
+def frost_capabilities() -> dict:
+    return client.check_capabilities()
+
+
+@router.post("/tasking/register-site/{site_key}")
+def register_site_tasking(site_key: str) -> dict:
+    result = client.register_site_tasking(site_key)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Unknown site key: {site_key}")
+    return result
+
+
+@router.post("/tasking/tasks")
+def create_task(request: TaskingTaskCreateRequest) -> dict:
+    return client.create_task(request)
+
+
+@router.get("/tasking/tasks")
+def list_tasks(
+    site_key: str = Query(..., pattern="^(tgv|blijdorp)$"),
+    capability_key: str | None = None,
+    top: int = Query(20, ge=1, le=200),
+) -> dict:
+    query = TaskingTaskQuery(site_key=site_key, capability_key=capability_key, top=top)
+    result = client.list_tasks(query)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Unknown site key: {site_key}")
+    return result

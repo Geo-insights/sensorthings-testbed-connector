@@ -28,3 +28,46 @@ def test_register_site_returns_result(monkeypatch):
 
     assert response.status_code == 200
     assert response.json() == {"site_key": "tgv", "mode": "live", "site_results": []}
+
+
+def test_register_site_tasking_returns_result(monkeypatch):
+    monkeypatch.setattr(
+        "app.routes.connector.client.register_site_tasking",
+        lambda site_key: {"site_key": site_key, "mode": "live", "capability_ids": {}},
+    )
+
+    response = client.post("/connector/tasking/register-site/tgv")
+
+    assert response.status_code == 200
+    assert response.json() == {"site_key": "tgv", "mode": "live", "capability_ids": {}}
+
+
+def test_create_task_route_returns_result(monkeypatch):
+    monkeypatch.setattr(
+        "app.routes.connector.client.create_task",
+        lambda request: {"ok": True, "site_key": request.site_key, "capability_key": request.capability_key},
+    )
+
+    response = client.post(
+        "/connector/tasking/tasks",
+        json={
+            "site_key": "tgv",
+            "capability_key": "set_reporting_interval",
+            "input": {"interval_seconds": 60},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "site_key": "tgv", "capability_key": "set_reporting_interval"}
+
+
+def test_list_tasks_route_returns_result(monkeypatch):
+    monkeypatch.setattr(
+        "app.routes.connector.client.list_tasks",
+        lambda query: {"site_key": query.site_key, "tasks": []},
+    )
+
+    response = client.get("/connector/tasking/tasks", params={"site_key": "tgv", "top": 5})
+
+    assert response.status_code == 200
+    assert response.json() == {"site_key": "tgv", "tasks": []}

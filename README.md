@@ -61,7 +61,11 @@ After startup, open:
 | POST /connector/ingest | Push supplied readings to the configured SensorThings server |
 | POST /connector/push | Push bridge payload readings, falling back to demo data |
 | POST /connector/replay-failed | Replay observations stored in the dead-letter queue |
+| POST /connector/tasking/register-site/{site_key} | Register per-site Actuators and TaskingCapabilities |
+| POST /connector/tasking/tasks | Create a Task for a per-site capability |
+| GET /connector/tasking/tasks | List Tasks for a site, optionally filtered by capability key |
 | GET /frost/status | Check FROST connectivity, response time, and Thing count |
+| GET /frost/capabilities | Report the FROST root collections, conformance, and detected extensions (Projects, Tasking, OpenCitySense) |
 
 ## Configuration
 
@@ -72,12 +76,24 @@ Copy `.env.example` to `.env` and adjust the values for the live testbed environ
 | `CONNECTOR_NAME` | Friendly service name shown by FastAPI |
 | `CONNECTOR_BRIDGE_PAYLOAD_PATH` | Optional JSON payload file used by `/connector/preview` and `/connector/push` |
 | `SENSORTHINGS_BASE_URL` | FROST root URL, including `/v1.1` |
+| `SENSORTHINGS_BASE_URLS` | Optional comma-separated list or JSON array of FROST root URLs; when set, status/capability checks and observation pushes fan out to all configured targets |
 | `SENSORTHINGS_THINGS_PATH` | Thing collection path, default `/Things` |
 | `SENSORTHINGS_LOCATIONS_PATH` | Location collection path, default `/Locations` |
 | `SENSORTHINGS_SENSORS_PATH` | Sensor collection path, default `/Sensors` |
 | `SENSORTHINGS_OBSERVED_PROPERTIES_PATH` | ObservedProperty collection path, default `/ObservedProperties` |
 | `SENSORTHINGS_DATASTREAMS_PATH` | Datastream collection path, default `/Datastreams` |
 | `SENSORTHINGS_OBSERVATIONS_PATH` | Observation collection path, default `/Observations` |
+| `SENSORTHINGS_PROJECTS_PATH` | Projects extension collection path, default `/Projects` |
+| `SENSORTHINGS_ACTUATORS_PATH` | Tasking Actuator collection path, default `/Actuators` |
+| `SENSORTHINGS_TASKING_CAPABILITIES_PATH` | TaskingCapability collection path, default `/TaskingCapabilities` |
+| `SENSORTHINGS_TASKS_PATH` | Tasks collection path, default `/Tasks` |
+| `SENSORTHINGS_DEFAULT_PROJECT_NAME` | Optional Project name; when set, Things, Locations, and Sensors are linked to this Project on registration |
+| `SENSORTHINGS_DEFAULT_PROJECT_ID` | Optional existing Project `@iot.id` to link to instead of creating one by name |
+| `SENSORTHINGS_DEFAULT_PROJECT_DESCRIPTION` | Optional description used when creating the Project |
+| `SENSORTHINGS_DEFAULT_PROJECT_PUBLIC` | Whether a created Project is public, default `true` |
+| `SENSORTHINGS_SITE_PROJECTS_JSON` | Optional JSON map with per-site Project config, for example `{\"tgv\":{\"name\":\"GI-TGV-Fieldlab\"},\"blijdorp\":{\"name\":\"GI-Blijdorp-Fieldlab\"}}`; keys override default Project settings |
+| `SENSORTHINGS_SITE_TASKING_JSON` | Optional JSON map for per-site Tasking Actuator/Capability templates used by `/connector/tasking/register-site/{site_key}` |
+| `SENSORTHINGS_TASKING_ALLOWED_COMMANDS` | Optional comma-separated list or JSON array of allowed capability keys for task creation |
 | `SENSORTHINGS_AUTH_TOKEN` | Optional bearer token for authenticated FROST access |
 | `SENSORTHINGS_AUTH_USERNAME` | Optional username for HTTP Basic auth |
 | `SENSORTHINGS_AUTH_PASSWORD` | Optional password for HTTP Basic auth |
@@ -93,6 +109,14 @@ If no base URL is configured, the app stays in preview mode and returns payloads
 For the WBD-RD FROST environment, use `SENSORTHINGS_AUTH_USERNAME` and `SENSORTHINGS_AUTH_PASSWORD`; the connector will send HTTP Basic auth automatically.
 
 If `CONNECTOR_BRIDGE_PAYLOAD_PATH` is set, the connector treats that file as the active bridge source for preview and push flows. The file can contain either a top-level `readings` array or a raw array of reading objects.
+
+When `SENSORTHINGS_DATASTREAM_IDS_JSON` does not contain a mapping for a reading, the connector now attempts live Datastream lookup with OData filters. The preferred lookup keys are:
+
+- `device_eui` + `stream_key` on the reading payload (mapped to `Thing/properties/deviceEui` and `Datastream/properties/streamKey`)
+- fallback to `thing_name` + `stream_key`
+- fallback to `thing_name` + `observed_property_name`
+
+For deterministic lookup, register Datastreams with a stable `properties.streamKey` value.
 
 ## Status
 

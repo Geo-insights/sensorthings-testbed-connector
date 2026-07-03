@@ -16,6 +16,9 @@ class SensorReading(BaseModel):
     quality: str = "good"
     location: Literal["tgv", "blijdorp"] = "tgv"
     thing_name: str = "Climate adaptation setup"
+    device_eui: str | None = None
+    stream_key: str | None = None
+    observed_property_name: str | None = None
 
 
 class ObservationPayload(BaseModel):
@@ -44,4 +47,18 @@ class RegistrationPreview(BaseModel):
     sensors: list[dict[str, Any]]
     observed_properties: list[dict[str, Any]]
     datastreams: list[dict[str, Any]]
+    project: dict[str, Any] | None = None
     endpoints: dict[str, str | None] = Field(default_factory=dict)
+
+
+class TaskingTaskCreateRequest(BaseModel):
+    site_key: Literal["tgv", "blijdorp"]
+    capability_key: str
+    input: dict[str, Any] = Field(default_factory=dict)
+    execution_time: datetime | None = None
+
+
+class TaskingTaskQuery(BaseModel):
+    site_key: Literal["tgv", "blijdorp"]
+    capability_key: str | None = None
+    top: int = Field(default=20, ge=1, le=200)

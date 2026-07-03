@@ -51,6 +51,20 @@ def test_frost_status_reports_preview_mode_when_unconfigured(monkeypatch):
     assert "preview mode" in body["message"].lower()
 
 
+def test_frost_capabilities_reports_preview_mode_when_unconfigured(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.sensorthings_client.settings",
+        SimpleNamespace(sensorthings_base_url=""),
+    )
+
+    response = client.get("/frost/capabilities")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["mode"] == "preview"
+    assert body["reachable"] is False
+
+
 def test_ingest_preview_accepts_custom_bridge_payload():
     response = client.post(
         "/connector/ingest-preview",

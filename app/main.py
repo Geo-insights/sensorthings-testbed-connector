@@ -18,3 +18,8 @@ app.include_router(connector_router)
 @app.get("/frost/status")
 def frost_status() -> dict:
     return client.check_frost_status()
+
+
+@app.get("/frost/capabilities")
+def frost_capabilities() -> dict:
+    return client.check_capabilities()

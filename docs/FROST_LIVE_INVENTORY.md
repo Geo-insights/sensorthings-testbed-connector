@@ -8,7 +8,7 @@ These records were created before real sensor access was available. Treat them a
 
 ## Summary
 
-- FROST root: `https://frost.wbd-rd.nl/FROST-Server/v1.1`
+- FROST root: `https://sta.wbd-rd.nl/FROST-Server/v1.1`
 - authentication mode: HTTP Basic auth
 - naming prefix used: `GEO_`
 - live write path verified: yes
