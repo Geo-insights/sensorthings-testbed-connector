@@ -501,6 +501,7 @@ class SensorThingsClient:
                         "description": sensor["description"],
                         "encodingType": sensor["encodingType"],
                         "metadata": sensor["metadata"],
+                        "properties": sensor.get("properties"),
                         "thing_name": thing_name,
                         "site_key": site_config["site_key"],
                     }
@@ -657,6 +658,9 @@ class SensorThingsClient:
                 "encodingType": sensor["encodingType"],
                 "metadata": sensor["metadata"],
             }
+            sensor_properties = sensor.get("properties")
+            if isinstance(sensor_properties, dict) and sensor_properties:
+                sensor_payload["properties"] = sensor_properties
             if project_links:
                 sensor_payload["Projects"] = project_links
             sensor_id, sensor_status = self._get_or_create_entity(settings.sensors_path, sensor_name, sensor_payload, "sensors")
@@ -782,6 +786,26 @@ class SensorThingsClient:
             "datastream_ids": self._datastream_ids,
             "registered_entities": self._registered_entities,
         }
+
+    def patch_sensor_properties(self, sensor_name: str, properties: dict[str, Any]) -> dict[str, Any]:
+        """PATCH the properties field of an existing Sensor entity on FROST."""
+        prefixed = self._prefixed_name(sensor_name)
+        iot_id = self._registered_entities.get("sensors", {}).get(prefixed)
+        if not iot_id:
+            return {"ok": False, "message": f"Sensor '{prefixed}' not registered; register first."}
+        endpoint = self._endpoint(f"{settings.sensors_path}({iot_id})")
+        if not endpoint:
+            return {"ok": False, "message": "No FROST server configured."}
+        try:
+            response = requests.patch(
+                endpoint,
+                json={"properties": properties},
+                headers=self._headers(),
+                timeout=self._request_timeout(),
+            )
+            return {"ok": response.ok, "status_code": response.status_code, "@iot.id": iot_id}
+        except requests.RequestException as exc:
+            return {"ok": False, "message": str(exc)}
 
     def register_site_tasking(self, site_key: str) -> dict[str, Any] | None:
         entity_sets = self._entity_sets_for_site(site_key)
