@@ -186,6 +186,13 @@ class KafkaTGVConsumer:
 
     @staticmethod
     def _on_assign(consumer: Consumer, partitions: list) -> None:
-        # Use str() explicitly to avoid Python 3.14 format-string issues
-        # with confluent-kafka's TopicPartition __repr__.
-        logger.debug("Kafka partition assignment: %s", str(partitions))
+        # Build partition summary without calling repr() on TopicPartition objects
+        # to avoid a Python 3.14 SystemError in confluent-kafka's __repr__ format string.
+        try:
+            summary = ", ".join(
+                f"{getattr(p, 'topic', '?')}[{getattr(p, 'partition', '?')}]"
+                for p in partitions
+            )
+        except Exception:
+            summary = f"<{len(partitions)} partition(s)>"
+        logger.debug("Kafka partition assignment: %s", summary)
