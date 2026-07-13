@@ -402,6 +402,65 @@ CLIMATE_ADAPTATION_ENTITY_SETS: list[dict[str, Any]] = [
         },
     },
     {
+        "site_key": "tgv",
+        "site_name": "The Green Village",
+        "thing": {
+            "name": "TGV Office Lab",
+            "description": "Indoor climate monitoring at The Green Village office laboratory, fed from Confluent Cloud Kafka.",
+            "properties": {
+                "site": "tgv",
+                "campus": "TU Delft",
+                "source": "kafka",
+                "topic": "tud_gv_officelab-climate",
+            },
+        },
+        "location": {
+            "name": "TGV Office Lab location",
+            "description": "Weather station at The Green Village office laboratory, TU Delft campus. Height: 5 m above ground.",
+            "encodingType": "application/geo+json",
+            "location": {"type": "Point", "coordinates": [4.377633926937161, 51.99658144237765]},
+            "properties": {"altitude_m": 5},
+        },
+        "sensors": [
+            {
+                "sensor_id": "tgv-officelab-climate",
+                "name": "TGV Office Lab climate sensor",
+                "description": "Multi-parameter indoor climate sensor in the TGV office lab.",
+                "encodingType": "application/json",
+                "metadata": "https://thegreenvillage.org",
+                # Keys must match measurement_id values in the Kafka topic.
+                # Confirm by running deserializing-consumer-example/ against the live topic.
+                "observed_properties": ["temperature", "humidity", "co2", "pressure"],
+            }
+        ],
+        "observed_properties": {
+            "temperature": {
+                "name": "Air temperature",
+                "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#air_temperature",
+                "description": "Indoor air temperature.",
+                "unit": "Cel",
+            },
+            "humidity": {
+                "name": "Relative humidity",
+                "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#relative_humidity",
+                "description": "Indoor relative humidity.",
+                "unit": "%",
+            },
+            "co2": {
+                "name": "CO2 concentration",
+                "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#mole_fraction_of_carbon_dioxide_in_air",
+                "description": "Indoor CO2 concentration.",
+                "unit": "ppm",
+            },
+            "pressure": {
+                "name": "Air pressure",
+                "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#air_pressure",
+                "description": "Indoor air pressure.",
+                "unit": "hPa",
+            },
+        },
+    },
+    {
         "site_key": "blijdorp",
         "site_name": "Diergaarde Blijdorp",
         "thing": {
@@ -439,6 +498,10 @@ CLIMATE_ADAPTATION_ENTITY_SETS: list[dict[str, Any]] = [
 
 def _build_value(observed_property: str, rng: random.Random) -> float:
     ranges = {
+        "temperature": (15.0, 30.0),
+        "humidity": (30.0, 80.0),
+        "co2": (400.0, 1200.0),
+        "pressure": (980.0, 1045.0),
         "air_temperature": (5.0, 35.0),
         "relative_humidity": (35.0, 98.0),
         "solar_radiation": (0.0, 950.0),

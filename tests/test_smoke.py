@@ -91,6 +91,32 @@ def test_ingest_preview_accepts_custom_bridge_payload():
     assert body["payloads"][0]["result"] == 1450
 
 
+def test_monitoring_mqtt_preview_accepts_custom_bridge_payload():
+    response = client.post(
+        "/connector/monitoring-mqtt-preview",
+        json={
+            "readings": [
+                {
+                    "sensor_id": "pump-rpm-01",
+                    "sensor_name": "Pump RPM Sensor",
+                    "observed_property": "pump_speed",
+                    "unit": "rpm",
+                    "value": 1450,
+                    "timestamp": "2026-04-17T10:00:00Z",
+                    "quality": "good",
+                    "location": "tgv",
+                    "thing_name": "Climate adaptation setup"
+                }
+            ]
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["mode"] in {"preview", "live"}
+    assert "payloads" in body
+
+
 def test_site_registration_preview_unknown_site_returns_404():
     response = client.get("/connector/registration-preview/unknown")
 

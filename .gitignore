@@ -7,3 +7,5 @@ coverage.xml
 htmlcov/
 data/*.json
 data/*.jsonl
+deserializing-consumer-example/projectsecrets.py
+.claude/

@@ -36,6 +36,22 @@ class ConnectorPreview(BaseModel):
     payloads: list[ObservationPayload]
 
 
+class MonitoringMqttPayload(BaseModel):
+    server_url: str
+    datastream_id: str
+    value: float
+    timestamp: datetime
+    quality: str = "good"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class MonitoringMqttPreview(BaseModel):
+    connector: str
+    mode: str
+    topic: str | None = None
+    payloads: list[MonitoringMqttPayload]
+
+
 class IngestRequest(BaseModel):
     readings: list[SensorReading]
 

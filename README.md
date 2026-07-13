@@ -60,6 +60,9 @@ After startup, open:
 | POST /connector/ingest-preview | Validate custom bridge payloads without posting them |
 | POST /connector/ingest | Push supplied readings to the configured SensorThings server |
 | POST /connector/push | Push bridge payload readings, falling back to demo data |
+| GET /connector/monitoring-mqtt-preview | Resolve bridge readings into Monitoring MQTT payloads |
+| POST /connector/monitoring-mqtt-preview | Preview Monitoring MQTT payloads for custom bridge readings |
+| POST /connector/monitoring-mqtt-push | Publish bridge readings to Monitoring via MQTT |
 | POST /connector/replay-failed | Replay observations stored in the dead-letter queue |
 | POST /connector/tasking/register-site/{site_key} | Register per-site Actuators and TaskingCapabilities |
 | POST /connector/tasking/tasks | Create a Task for a per-site capability |
@@ -102,6 +105,13 @@ Copy `.env.example` to `.env` and adjust the values for the live testbed environ
 | `SENSORTHINGS_REGISTERED_ENTITIES_PATH` | Path for cached `@iot.id` mappings, default `data/registered_entities.json` |
 | `SENSORTHINGS_FAILED_OBSERVATIONS_PATH` | Path for the dead-letter queue, default `data/failed_observations.jsonl` |
 | `SENSORTHINGS_REQUEST_TIMEOUT_SECONDS` | HTTP timeout used for FROST requests |
+| `MONITORING_MQTT_ENABLED` | Enable Monitoring MQTT bridge publishing |
+| `MONITORING_MQTT_HOST` | MQTT broker host used by the Monitoring bridge |
+| `MONITORING_MQTT_PORT` | MQTT broker port, default `1883` |
+| `MONITORING_MQTT_TOPIC` | Topic to publish Monitoring bridge payloads to |
+| `MONITORING_MQTT_USERNAME` | Optional MQTT username |
+| `MONITORING_MQTT_PASSWORD` | Optional MQTT password |
+| `MONITORING_MQTT_TLS` | Enable TLS for the Monitoring MQTT bridge |
 | `DEBUG` | Enable debug mode |
 
 If no base URL is configured, the app stays in preview mode and returns payloads locally without posting to FROST.
@@ -159,6 +169,8 @@ Stub-only pending Lindsey confirmation:
 - point the bridge or Node-RED export at `CONNECTOR_BRIDGE_PAYLOAD_PATH` for local preview and push runs
 - register sites incrementally with `/connector/register-site/tgv` and `/connector/register-site/blijdorp`
 - validate repeated live observation delivery through `/connector/ingest`
+- preview Monitoring push payloads through `/connector/monitoring-mqtt-preview`
+- publish resolved `server_url` + `datastream_id` MQTT payloads through `/connector/monitoring-mqtt-push`
 
 ## Licensing and Publication Terms
 

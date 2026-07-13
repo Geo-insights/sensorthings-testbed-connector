@@ -1,0 +1,13 @@
+#!/bin/bash
+export KAFKA_TGV_BOOTSTRAP_SERVERS=pkc-e8mp5.eu-west-1.aws.confluent.cloud:9092
+export KAFKA_TGV_SCHEMA_REGISTRY_URL=https://psrc-1w11j.eu-central-1.aws.confluent.cloud
+export KAFKA_TGV_REST_PROXY_URL=https://pkc-e8mp5.eu-west-1.aws.confluent.cloud:443
+export KAFKA_TGV_CLUSTER=
+export KAFKA_TGV_API_KEY=
+export KAFKA_TGV_API_PASSWORD=
+export KAFKA_TGV_SCHEMA_REGISTRY_USERNAME=
+export KAFKA_TGV_SCHEMA_REGISTRY_PASSWORD=
+export KAFKA_TGV_TOPIC=tud_gv_test
+export KAFKA_TGV_CONSUMER_GROUP=
+
+. venv/bin/activate

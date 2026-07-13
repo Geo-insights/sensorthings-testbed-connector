@@ -1,0 +1,8 @@
+*~
+client.properties
+message.json
+venv
+__pycache__/
+env/
+projectsecrets.py
+init.sh

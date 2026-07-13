@@ -1,0 +1,176 @@
+{
+  "name": "GreenVillageRecord",
+  "namespace": "thegreenvillage",
+  "type": "record",
+  "fields": [
+    {
+      "name": "project_id",
+      "doc": "Globally unique id for the project.",
+      "type": "string"
+    },
+    {
+      "name": "application_id",
+      "doc": "Unique id for the application/use case.",
+      "type": "string"
+    },
+    {
+      "name": "device_id",
+      "doc": "Unique id for the device.",
+      "type": "string"
+    },
+    {
+      "name": "timestamp",
+      "doc": "Timestamp (milliseconds since unix epoch) of the measurement.",
+      "type": "long"
+    },
+    {
+      "name": "measurements",
+      "doc": "Array of measurements.",
+      "type": {
+        "type": "array",
+        "items": {
+          "name": "measurement",
+          "namespace": "thegreenvillage",
+          "type": "record",
+          "fields": [
+            {
+              "name": "measurement_id",
+              "doc": "Unique id for the measurement.",
+              "type": "string"
+            },
+            {
+              "name": "value",
+              "doc": "Measured value.",
+              "type": [
+                "null",
+                "boolean",
+                "int",
+                "long",
+                "float",
+                "double",
+                "string"
+              ]
+            },
+            {
+              "name": "unit",
+              "doc": "Unit of the measurement.",
+              "type": [
+                "null",
+                "string"
+              ],
+              "default": null
+            },
+            {
+              "name": "measurement_description",
+              "doc": "Measurement description.",
+              "type": [
+                "null",
+                "string"
+              ],
+              "default": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "project_description",
+      "doc": "Project description.",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "application_description",
+      "doc": "Application/use case description.",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "device_description",
+      "doc": "Device description.",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "device_manufacturer",
+      "doc": "Device manufacturer.",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "device_type",
+      "doc": "Device type.",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "device_serial",
+      "doc": "Device serial number.",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "location_id",
+      "doc": "Unique id for the location.",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "location_description",
+      "doc": "Location description.",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "latitude",
+      "doc": "Latitude in decimal degrees of the device location (GPS coordinates).",
+      "type": [
+        "null",
+        "float"
+      ],
+      "default": null
+    },
+    {
+      "name": "longitude",
+      "doc": "Longitude in decimal degrees of the device location (GPS coordinates).",
+      "type": [
+        "null",
+        "float"
+      ],
+      "default": null
+    },
+    {
+      "name": "altitude",
+      "doc": "Altitude in meters above the mean sea level.",
+      "type": [
+        "null",
+        "float"
+      ],
+      "default": null
+    }
+  ]
+}

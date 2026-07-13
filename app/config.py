@@ -86,6 +86,17 @@ def _load_tasking_allowed_commands() -> set[str]:
     return {item.strip() for item in raw.split(",") if item.strip()}
 
 
+def _load_tgv_device_mapping() -> dict[str, dict[str, str]]:
+    raw = os.getenv("KAFKA_TGV_DEVICE_MAPPING_JSON", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return {str(k): dict(v) for k, v in data.items() if isinstance(v, dict)}
+
+
 def _load_float(name: str, default: str) -> float:
     raw = os.getenv(name, default).strip()
     try:
@@ -131,6 +142,13 @@ def _load_base_urls() -> tuple[str, ...]:
 class Settings:
     connector_name: str = os.getenv("CONNECTOR_NAME", "UrbanAdapt SensorThings Connector")
     bridge_payload_path: str = os.getenv("CONNECTOR_BRIDGE_PAYLOAD_PATH", "").strip()
+    monitoring_mqtt_enabled: bool = os.getenv("MONITORING_MQTT_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    monitoring_mqtt_host: str = os.getenv("MONITORING_MQTT_HOST", "").strip()
+    monitoring_mqtt_port: int = int(os.getenv("MONITORING_MQTT_PORT", "1883"))
+    monitoring_mqtt_topic: str = os.getenv("MONITORING_MQTT_TOPIC", "monitoring/readings/bridge")
+    monitoring_mqtt_username: str = os.getenv("MONITORING_MQTT_USERNAME", "")
+    monitoring_mqtt_password: str = os.getenv("MONITORING_MQTT_PASSWORD", "")
+    monitoring_mqtt_tls: bool = os.getenv("MONITORING_MQTT_TLS", "false").lower() in {"1", "true", "yes", "on"}
     sensorthings_base_url: str = os.getenv("SENSORTHINGS_BASE_URL", "").rstrip("/")
     sensorthings_base_urls: tuple[str, ...] = field(default_factory=_load_base_urls)
     things_path: str = os.getenv("SENSORTHINGS_THINGS_PATH", "/Things")
@@ -159,6 +177,18 @@ class Settings:
     request_timeout_seconds: float = field(default_factory=lambda: _load_float("SENSORTHINGS_REQUEST_TIMEOUT_SECONDS", "15"))
     datastream_ids: dict[str, str] = field(default_factory=_load_datastream_map)
     debug: bool = os.getenv("DEBUG", "false").lower() in {"1", "true", "yes", "on"}
+    # --- Kafka / TGV source ---
+    kafka_tgv_enabled: bool = os.getenv("KAFKA_TGV_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    kafka_tgv_bootstrap_servers: str = os.getenv("KAFKA_TGV_BOOTSTRAP_SERVERS", "").strip()
+    kafka_tgv_api_key: str = os.getenv("KAFKA_TGV_API_KEY", "").strip()
+    kafka_tgv_api_password: str = os.getenv("KAFKA_TGV_API_PASSWORD", "").strip()
+    kafka_tgv_schema_registry_url: str = os.getenv("KAFKA_TGV_SCHEMA_REGISTRY_URL", "").strip()
+    kafka_tgv_schema_registry_username: str = os.getenv("KAFKA_TGV_SCHEMA_REGISTRY_USERNAME", "").strip()
+    kafka_tgv_schema_registry_password: str = os.getenv("KAFKA_TGV_SCHEMA_REGISTRY_PASSWORD", "").strip()
+    kafka_tgv_consumer_group: str = os.getenv("KAFKA_TGV_CONSUMER_GROUP", "gv_sa-j3r03zm_mathis_van_der_voordt").strip()
+    kafka_tgv_client_id: str = os.getenv("KAFKA_TGV_CLIENT_ID_CONSUMER", "geo-insights-consumer").strip()
+    kafka_tgv_topic: str = os.getenv("KAFKA_TGV_TOPIC", "tud_gv_officelab-climate").strip()
+    kafka_tgv_device_mapping: dict[str, dict[str, str]] = field(default_factory=_load_tgv_device_mapping)
 
 
 settings = Settings()

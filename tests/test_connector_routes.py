@@ -71,3 +71,52 @@ def test_list_tasks_route_returns_result(monkeypatch):
 
     assert response.status_code == 200
     assert response.json() == {"site_key": "tgv", "tasks": []}
+
+
+def test_monitoring_mqtt_preview_route_returns_result(monkeypatch):
+    monkeypatch.setattr(
+        "app.routes.connector.build_monitoring_mqtt_preview",
+        lambda readings: type(
+            "Preview",
+            (),
+            {"model_dump": lambda self, mode: {"mode": "preview", "payloads": [{"datastream_id": "1"}]}}
+        )(),
+    )
+    monkeypatch.setattr(
+        "app.routes.connector.load_bridge_readings",
+        lambda: [],
+    )
+
+    response = client.get("/connector/monitoring-mqtt-preview")
+
+    assert response.status_code == 200
+    assert response.json()["payloads"][0]["datastream_id"] == "1"
+
+
+def test_monitoring_mqtt_push_route_returns_result(monkeypatch):
+    monkeypatch.setattr(
+        "app.routes.connector.publish_monitoring_mqtt",
+        lambda readings: {"mode": "live", "published": len(readings)},
+    )
+
+    response = client.post(
+        "/connector/monitoring-mqtt-push",
+        json={
+            "readings": [
+                {
+                    "sensor_id": "pump-rpm-01",
+                    "sensor_name": "Pump RPM Sensor",
+                    "observed_property": "pump_speed",
+                    "unit": "rpm",
+                    "value": 1450,
+                    "timestamp": "2026-04-17T10:00:00Z",
+                    "quality": "good",
+                    "location": "tgv",
+                    "thing_name": "Climate adaptation setup"
+                }
+            ]
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"mode": "live", "published": 1}
