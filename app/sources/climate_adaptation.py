@@ -37,6 +37,11 @@ CLIMATE_ADAPTATION_ENTITY_SETS: list[dict[str, Any]] = [
                 "metadata": "https://thegreenvillage.org",
                 # Keys must match measurement_id values in the Kafka topic.
                 "observed_properties": ["temperature", "humidity", "co2", "pressure"],
+                "properties": {
+                    "long_description": "Bosch BME680 multi-parameter sensor measuring temperature, humidity, CO2, and barometric pressure. Mounted at desk height (1.2 m) in the TGV office laboratory for indoor climate monitoring.",
+                    "image_url": None,
+                    "installation_notes": "Wall-mounted near the east window, powered via USB.",
+                },
             }
         ],
         "observed_properties": {

@@ -1,8 +1,10 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
 from app.config import settings
@@ -60,6 +62,10 @@ app = FastAPI(
     description="Climate-adaptation proof of concept for connecting TGV and Blijdorp sensors to a central OGC SensorThings API server.",
     lifespan=lifespan,
 )
+
+SENSOR_IMAGES_DIR = Path("data/sensor_images")
+SENSOR_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/static/sensor-images", StaticFiles(directory=str(SENSOR_IMAGES_DIR)), name="sensor-images")
 
 app.include_router(health_router)
 app.include_router(connector_router)

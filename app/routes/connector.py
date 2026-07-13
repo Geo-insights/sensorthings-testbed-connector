@@ -1,6 +1,9 @@
+from pathlib import Path
+
 from fastapi import APIRouter
 from fastapi import HTTPException
 from fastapi import Query
+from fastapi import UploadFile
 
 from app.config import settings
 from app.models import IngestRequest, TaskingTaskCreateRequest, TaskingTaskQuery
@@ -184,4 +187,82 @@ def kafka_push(
         "pushed": pushed,
         "failed": failed,
         "detail": push_result,
+    }
+
+
+# --- Sensor metadata & image endpoints ---
+
+_ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+_MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10 MB
+_SENSOR_IMAGES_DIR = Path("data/sensor_images")
+
+
+def _find_sensor_config(sensor_id: str) -> tuple[dict, dict] | None:
+    """Return (sensor_dict, entity_set) for *sensor_id*, or None."""
+    from app.sources.climate_adaptation import CLIMATE_ADAPTATION_ENTITY_SETS
+
+    for entity_set in CLIMATE_ADAPTATION_ENTITY_SETS:
+        for sensor in entity_set["sensors"]:
+            if sensor["sensor_id"] == sensor_id:
+                return sensor, entity_set
+    return None
+
+
+@router.get("/sensors/{sensor_id}")
+def get_sensor_info(sensor_id: str) -> dict:
+    """Return the sensor config including properties and FROST registration id."""
+    result = _find_sensor_config(sensor_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Unknown sensor_id: {sensor_id}")
+    sensor, entity_set = result
+    sensor_name = client._prefixed_name(sensor["name"])
+    iot_id = client._registered_entities.get("sensors", {}).get(sensor_name)
+    return {
+        **sensor,
+        "prefixed_name": sensor_name,
+        "@iot.id": iot_id,
+        "site_key": entity_set["site_key"],
+        "thing_name": entity_set["thing"]["name"],
+    }
+
+
+@router.post("/sensors/{sensor_id}/image")
+async def upload_sensor_image(
+    sensor_id: str,
+    file: UploadFile,
+    patch_frost: bool = Query(default=False),
+) -> dict:
+    """Upload an installation photo for a sensor."""
+    result = _find_sensor_config(sensor_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Unknown sensor_id: {sensor_id}")
+    sensor, _ = result
+
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in _ALLOWED_IMAGE_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File type '{suffix}' not allowed. Use: {', '.join(sorted(_ALLOWED_IMAGE_EXTENSIONS))}",
+        )
+
+    contents = await file.read()
+    if len(contents) > _MAX_IMAGE_SIZE:
+        raise HTTPException(status_code=400, detail=f"File too large (max {_MAX_IMAGE_SIZE // (1024 * 1024)} MB).")
+
+    dest = _SENSOR_IMAGES_DIR / f"{sensor_id}{suffix}"
+    dest.write_bytes(contents)
+
+    image_url = f"{settings.public_base_url}/static/sensor-images/{sensor_id}{suffix}"
+
+    frost_patched = False
+    if patch_frost:
+        existing_props = dict(sensor.get("properties") or {})
+        existing_props["image_url"] = image_url
+        patch_result = client.patch_sensor_properties(sensor["name"], existing_props)
+        frost_patched = patch_result.get("ok", False)
+
+    return {
+        "sensor_id": sensor_id,
+        "image_url": image_url,
+        "frost_patched": frost_patched,
     }

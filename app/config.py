@@ -176,6 +176,7 @@ class Settings:
     failed_observations_path: str = os.getenv("SENSORTHINGS_FAILED_OBSERVATIONS_PATH", "data/failed_observations.jsonl")
     request_timeout_seconds: float = field(default_factory=lambda: _load_float("SENSORTHINGS_REQUEST_TIMEOUT_SECONDS", "15"))
     datastream_ids: dict[str, str] = field(default_factory=_load_datastream_map)
+    public_base_url: str = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
     debug: bool = os.getenv("DEBUG", "false").lower() in {"1", "true", "yes", "on"}
     # --- Kafka / TGV source ---
     kafka_tgv_enabled: bool = os.getenv("KAFKA_TGV_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
