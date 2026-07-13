@@ -1392,7 +1392,11 @@ class SensorThingsClient:
             results: list[dict[str, Any]] = []
             sent = 0
             for reading in readings:
-                datastream_id = datastream_ids.get(self._datastream_key(reading.sensor_id, reading.observed_property)) or datastream_ids.get(reading.sensor_id)
+                datastream_id = (
+                    datastream_ids.get(self._datastream_key(reading.sensor_id, reading.observed_property))
+                    or datastream_ids.get(getattr(reading, "stream_key", "") or "")
+                    or datastream_ids.get(reading.sensor_id)
+                )
                 if not datastream_id:
                     datastream_id = self._resolve_datastream_id_live(base_url, reading)
                 if not datastream_id:
