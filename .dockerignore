@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.venv
+venv
+data/sensor_images/*
+data/failed_observations.jsonl
+data/registered_entities.json
+deserializing-consumer-example
+*.md
+LICENSE
