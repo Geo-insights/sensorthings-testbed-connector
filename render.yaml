@@ -1,0 +1,41 @@
+services:
+  - type: web
+    name: sensorthings-testbed-connector
+    runtime: docker
+    plan: starter  # $7/mo, always-on (free tier spins down after 15min idle)
+    envVars:
+      - key: KAFKA_TGV_ENABLED
+        value: "true"
+      - key: KAFKA_TGV_POLL_SECONDS
+        value: "300"
+      - key: KAFKA_TGV_BOOTSTRAP_SERVERS
+        value: "pkc-e8mp5.eu-west-1.aws.confluent.cloud:9092"
+      - key: KAFKA_TGV_TOPIC
+        value: "tud_gv_officelab-climate"
+      - key: KAFKA_TGV_CONSUMER_GROUP
+        value: "gv_sa-j3r03zm_mathis_van_der_voordt"
+      - key: KAFKA_TGV_CLIENT_ID_CONSUMER
+        value: "geo-insights-consumer"
+      # Secrets — set these in the Render dashboard, not here
+      - key: KAFKA_TGV_API_KEY
+        sync: false
+      - key: KAFKA_TGV_API_PASSWORD
+        sync: false
+      - key: KAFKA_TGV_SCHEMA_REGISTRY_URL
+        sync: false
+      - key: KAFKA_TGV_SCHEMA_REGISTRY_USERNAME
+        sync: false
+      - key: KAFKA_TGV_SCHEMA_REGISTRY_PASSWORD
+        sync: false
+      - key: SENSORTHINGS_BASE_URL
+        sync: false
+      - key: SENSORTHINGS_BASE_URLS
+        sync: false
+      - key: SENSORTHINGS_DATASTREAM_IDS_JSON
+        sync: false
+      - key: SENSORTHINGS_AUTH_TOKEN
+        sync: false
+      - key: SENSORTHINGS_AUTH_USERNAME
+        sync: false
+      - key: SENSORTHINGS_AUTH_PASSWORD
+        sync: false
