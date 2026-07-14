@@ -71,6 +71,150 @@ CLIMATE_ADAPTATION_ENTITY_SETS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "site_key": "tgv",
+        "site_name": "The Green Village",
+        "thing": {
+            "name": "Climate Davis",
+            "description": "Davis Vantage Pro2 outdoor weather station at The Green Village, TU Delft campus.",
+            "properties": {
+                "site": "tgv",
+                "campus": "TU Delft",
+                "source": "kafka",
+                "topic": "tud_gv_officelab-climate",
+            },
+        },
+        "location": {
+            "name": "Climate Davis location",
+            "description": "Davis weather station at The Green Village, TU Delft campus. Height: 10 m above ground.",
+            "encodingType": "application/geo+json",
+            "location": {"type": "Point", "coordinates": [4.377633926937161, 51.99658144237765]},
+            "properties": {"altitude_m": 10},
+        },
+        "sensors": [
+            {
+                "sensor_id": "tgv-climate-davis-weather-station",
+                "name": "Davis weather station",
+                "description": "Davis Vantage Pro2 outdoor weather station measuring air temperature, wind, and precipitation.",
+                "encodingType": "application/json",
+                "metadata": "https://thegreenvillage.org",
+                "observed_properties": ["air_temperature", "wind_speed", "wind_direction", "precipitation"],
+                "properties": {},
+            }
+        ],
+        "observed_properties": {
+            "air_temperature": {
+                "name": "Air temperature",
+                "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#air_temperature",
+                "description": "Outdoor air temperature.",
+                "unit": "Cel",
+            },
+            "wind_speed": {
+                "name": "Wind speed",
+                "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#wind_speed",
+                "description": "Wind speed.",
+                "unit": "km/h",
+            },
+            "wind_direction": {
+                "name": "Wind direction",
+                "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#wind_from_direction",
+                "description": "Wind direction in degrees from north.",
+                "unit": "degrees",
+            },
+            "precipitation": {
+                "name": "Precipitation",
+                "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#precipitation_amount",
+                "description": "Daily rainfall.",
+                "unit": "mm",
+            },
+        },
+    },
+    {
+        "site_key": "tgv",
+        "site_name": "The Green Village",
+        "thing": {
+            "name": "Weather Climatics",
+            "description": "Climatics rooftop weather station at The Green Village, TU Delft campus.",
+            "properties": {
+                "site": "tgv",
+                "campus": "TU Delft",
+                "source": "kafka",
+                "topic": "tud_gv_officelab-climate",
+            },
+        },
+        "location": {
+            "name": "Weather Climatics location",
+            "description": "Climatics rooftop station at The Green Village, TU Delft campus.",
+            "encodingType": "application/geo+json",
+            "location": {"type": "Point", "coordinates": [4.377633926937161, 51.99658144237765]},
+            "properties": {},
+        },
+        "sensors": [
+            {
+                "sensor_id": "tgv-weather-climatics-rooftop-station",
+                "name": "Climatics rooftop station",
+                "description": "Climatics rooftop weather station measuring air pressure.",
+                "encodingType": "application/json",
+                "metadata": "https://thegreenvillage.org",
+                "observed_properties": ["air_pressure"],
+                "properties": {},
+            }
+        ],
+        "observed_properties": {
+            "air_pressure": {
+                "name": "Air pressure",
+                "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#air_pressure",
+                "description": "Atmospheric air pressure.",
+                "unit": "hPa",
+            },
+        },
+    },
+    {
+        "site_key": "tgv",
+        "site_name": "The Green Village",
+        "thing": {
+            "name": "Hitteplein",
+            "description": "Hitteplein climate station at The Green Village, TU Delft campus.",
+            "properties": {
+                "site": "tgv",
+                "campus": "TU Delft",
+                "source": "kafka",
+                "topic": "tud_gv_officelab-climate",
+            },
+        },
+        "location": {
+            "name": "Hitteplein location",
+            "description": "Hitteplein climate station at The Green Village, TU Delft campus.",
+            "encodingType": "application/geo+json",
+            "location": {"type": "Point", "coordinates": [4.377633926937161, 51.99658144237765]},
+            "properties": {},
+        },
+        "sensors": [
+            {
+                "sensor_id": "tgv-hitteplein-climate-station",
+                "name": "Hitteplein climate station",
+                "description": "Hitteplein climate station measuring solar radiation and relative humidity.",
+                "encodingType": "application/json",
+                "metadata": "https://thegreenvillage.org",
+                "observed_properties": ["solar_radiation", "relative_humidity"],
+                "properties": {},
+            }
+        ],
+        "observed_properties": {
+            "solar_radiation": {
+                "name": "Solar radiation",
+                "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#surface_downwelling_shortwave_flux_in_air",
+                "description": "Solar radiation.",
+                "unit": "W/m2",
+            },
+            "relative_humidity": {
+                "name": "Relative humidity",
+                "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#relative_humidity",
+                "description": "Outdoor relative humidity.",
+                "unit": "%",
+            },
+        },
+    },
 ]
 
 
@@ -82,6 +226,13 @@ def generate_demo_readings() -> list[SensorReading]:
         "humidity": (30.0, 80.0),
         "co2": (400.0, 1200.0),
         "pressure": (980.0, 1045.0),
+        "air_temperature": (5.0, 35.0),
+        "wind_speed": (0.0, 50.0),
+        "wind_direction": (0.0, 360.0),
+        "precipitation": (0.0, 20.0),
+        "air_pressure": (980.0, 1045.0),
+        "solar_radiation": (0.0, 1000.0),
+        "relative_humidity": (30.0, 80.0),
     }
     readings: list[SensorReading] = []
     for entity_set in CLIMATE_ADAPTATION_ENTITY_SETS:
