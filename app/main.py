@@ -8,11 +8,13 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
 from app.config import settings
+from app.logging_config import setup_logging
 from app.routes.connector import router as connector_router
 from app.routes.health import router as health_router
 from app.services.sensorthings_client import client
 
-logger = logging.getLogger("connector.kafka")
+setup_logging(debug=settings.debug)
+logger = logging.getLogger("connector.events")
 
 
 def _kafka_push_cycle(max_messages: int = 500, timeout: float = 5.0) -> dict:

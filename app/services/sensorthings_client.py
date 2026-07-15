@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import base64
 import json
 import logging
-import re
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,6 +10,12 @@ from typing import Any
 import requests
 
 from app.config import settings
+from app.exceptions import (
+    ObservationUploadError,
+)
+from app.frost.cache import EntityCache
+from app.frost.entity_manager import EntityManager
+from app.frost.http_client import FrostHTTPClient
 from app.models import (
     ConnectorPreview,
     ObservationPayload,
@@ -20,6 +24,7 @@ from app.models import (
     TaskingTaskCreateRequest,
     TaskingTaskQuery,
 )
+from app.services.health_monitor import health_monitor
 from app.sources.climate_adaptation import CLIMATE_ADAPTATION_ENTITY_SETS
 
 
@@ -28,14 +33,34 @@ logger = logging.getLogger(__name__)
 
 class SensorThingsClient:
     def __init__(self) -> None:
-        self._registered_entities_path = Path(settings.registered_entities_path)
         self._failed_observations_path = Path(settings.failed_observations_path)
-        self._registered_entities = self._load_registered_entities()
+
+        # FROST layer components
+        self._http = FrostHTTPClient(
+            base_urls=self._load_base_urls(),
+            auth_username=settings.auth_username,
+            auth_password=settings.auth_password,
+            auth_token=settings.auth_token,
+            timeout=settings.request_timeout_seconds,
+        )
+        self._cache = EntityCache(Path(settings.registered_entities_path))
+        self._entity_manager = EntityManager(self._http, self._cache)
+
+        # Backward-compat property alias
+        self._registered_entities = self._cache.all()
         self._datastream_ids: dict[str, str] = dict(settings.datastream_ids)
-        self._datastream_ids.update(self._registered_entities.get("datastreams", {}))
+        self._datastream_ids.update(self._cache.collection("datastreams"))
         self._live_datastream_lookup_cache: dict[str, str] = {}
         self._observed_property_names: dict[str, str] = self._build_observed_property_name_map()
-        self._tasking_capability_ids: dict[str, str] = dict(self._registered_entities.get("tasking_capabilities", {}))
+        self._tasking_capability_ids: dict[str, str] = dict(self._cache.collection("tasking_capabilities"))
+
+    @staticmethod
+    def _load_base_urls() -> list[str]:
+        configured = getattr(settings, "sensorthings_base_urls", ())
+        if configured:
+            return [str(url).rstrip("/") for url in configured if str(url).strip()]
+        fallback = str(getattr(settings, "sensorthings_base_url", "")).strip().rstrip("/")
+        return [fallback] if fallback else []
 
     def _build_observed_property_name_map(self) -> dict[str, str]:
         names: dict[str, str] = {}
@@ -52,50 +77,16 @@ class SensorThingsClient:
                     names[key_name] = property_name
         return names
 
-    def _load_registered_entities(self) -> dict[str, dict[str, str]]:
-        default_state: dict[str, dict[str, str]] = {
-            "things": {},
-            "locations": {},
-            "sensors": {},
-            "observed_properties": {},
-            "datastreams": {},
-            "projects": {},
-            "actuators": {},
-            "tasking_capabilities": {},
-        }
-        if not self._registered_entities_path.exists():
-            return default_state
-
-        try:
-            data = json.loads(self._registered_entities_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return default_state
-
-        if not isinstance(data, dict):
-            return default_state
-
-        for key in default_state:
-            entries = data.get(key)
-            if isinstance(entries, dict):
-                default_state[key] = {str(name): str(entity_id) for name, entity_id in entries.items()}
-        return default_state
-
-    def _persist_registered_entities(self) -> None:
-        self._registered_entities_path.parent.mkdir(parents=True, exist_ok=True)
-        self._registered_entities_path.write_text(
-            json.dumps(self._registered_entities, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+    # -- Cache delegation (backward-compat) --------------------------------
 
     def _cache_entity_id(self, collection: str, name: str, entity_id: str) -> None:
-        self._registered_entities.setdefault(collection, {})[name] = entity_id
-        self._persist_registered_entities()
+        self._cache.put(collection, name, entity_id)
 
     def _drop_cached_entity_id(self, collection: str, name: str) -> None:
-        entries = self._registered_entities.get(collection, {})
-        if name in entries:
-            del entries[name]
-            self._persist_registered_entities()
+        self._cache.drop(collection, name)
+
+    def _persist_registered_entities(self) -> None:
+        self._cache._persist()
 
     def _datastream_key(self, sensor_id: str, observed_property: str) -> str:
         return f"{sensor_id}::{observed_property}"
@@ -107,6 +98,7 @@ class SensorThingsClient:
         return f"{base_url}{path}"
 
     def _base_urls(self) -> list[str]:
+        # Read from settings at runtime so monkeypatching works for tests/hot-reload.
         configured = getattr(settings, "sensorthings_base_urls", ())
         if configured:
             return [str(url).rstrip("/") for url in configured if str(url).strip()]
@@ -121,17 +113,10 @@ class SensorThingsClient:
         return bool(self._base_urls())
 
     def _endpoint_for_base_url(self, base_url: str, path: str) -> str:
-        return f"{base_url.rstrip('/')}" + path
+        return f"{base_url.rstrip('/')}{path}"
 
     def _headers(self) -> dict[str, str]:
-        headers = {"Content-Type": "application/json"}
-        if settings.auth_username:
-            credentials = f"{settings.auth_username}:{settings.auth_password}"
-            encoded = base64.b64encode(credentials.encode("utf-8")).decode("ascii")
-            headers["Authorization"] = f"Basic {encoded}"
-        elif settings.auth_token:
-            headers["Authorization"] = f"Bearer {settings.auth_token}"
-        return headers
+        return self._http.headers()
 
     def _prefixed_name(self, name: str) -> str:
         prefix = settings.entity_name_prefix.strip()
@@ -245,140 +230,39 @@ class SensorThingsClient:
 
     def _resolve_thing_id(self, thing_name: str) -> str | None:
         resolved_name = self._prefixed_name(thing_name)
-        cached_id = self._registered_entities.get("things", {}).get(resolved_name)
-        if cached_id and self._cached_entity_id_matches(settings.things_path, cached_id, resolved_name):
+        cached_id = self._cache.get("things", resolved_name)
+        if cached_id and self._entity_manager.cached_id_matches(settings.things_path, cached_id, resolved_name):
             return cached_id
         if cached_id:
-            self._drop_cached_entity_id("things", resolved_name)
-        thing_id = self._find_entity_id_by_name(settings.things_path, resolved_name)
+            self._cache.drop("things", resolved_name)
+        thing_id = self._entity_manager.find_by_name(settings.things_path, resolved_name)
         if thing_id:
-            self._cache_entity_id("things", resolved_name, thing_id)
+            self._cache.put("things", resolved_name, thing_id)
         return thing_id
 
     def _extract_iot_id(self, response: requests.Response) -> str | None:
-        try:
-            body = response.json()
-            if isinstance(body, dict):
-                if body.get("@iot.id") is not None:
-                    return str(body["@iot.id"])
-                if body.get("id") is not None:
-                    return str(body["id"])
-        except ValueError:
-            pass
-
-        location = response.headers.get("Location", "")
-        match = re.search(r"\(([^)]+)\)$", location)
-        if match:
-            return match.group(1).strip("'")
-        return None
+        return FrostHTTPClient.extract_iot_id(response)
 
     def _request_timeout(self) -> float:
         return settings.request_timeout_seconds
 
     def _fetch_entity_by_id(self, path: str, entity_id: str) -> dict[str, Any] | None:
-        endpoint = self._endpoint(f"{path}({entity_id})")
-        if not endpoint:
-            return None
-
-        try:
-            response = requests.get(endpoint, headers=self._headers(), timeout=self._request_timeout())
-        except requests.RequestException:
-            return None
-
-        if not response.ok:
-            return None
-
-        try:
-            body = response.json()
-        except ValueError:
-            return None
-
-        return body if isinstance(body, dict) else None
+        return self._entity_manager.fetch_by_id(path, entity_id)
 
     def _cached_entity_id_matches(self, path: str, entity_id: str, expected_name: str | None) -> bool:
-        if not expected_name:
-            return True
-
-        entity = self._fetch_entity_by_id(path, entity_id)
-        if not entity:
-            return False
-
-        return str(entity.get("name", "")).strip() == expected_name.strip()
+        return self._entity_manager.cached_id_matches(path, entity_id, expected_name)
 
     def _find_entity_id_by_name(self, path: str, name: str) -> str | None:
-        endpoint = self._endpoint(path)
-        if not endpoint:
-            return None
-
-        # [VERIFY against live server] FROST v1.1 should support $filter=name eq '...'.
-        response = requests.get(
-            endpoint,
-            params={"$filter": f"name eq '{name}'", "$top": 1},
-            headers=self._headers(),
-            timeout=self._request_timeout(),
-        )
-        if not response.ok:
-            return None
-
-        try:
-            body = response.json()
-        except ValueError:
-            return None
-
-        candidates: list[dict[str, Any]] = []
-        if isinstance(body, dict):
-            if isinstance(body.get("value"), list):
-                candidates = [item for item in body["value"] if isinstance(item, dict)]
-            elif body.get("@iot.id") is not None:
-                return str(body["@iot.id"])
-
-        if not candidates:
-            return None
-
-        candidate = candidates[0]
-        if candidate.get("@iot.id") is not None:
-            return str(candidate["@iot.id"])
-        if candidate.get("id") is not None:
-            return str(candidate["id"])
-        return None
+        return self._entity_manager.find_by_name(path, name)
 
     def _escape_odata_literal(self, value: str) -> str:
         return value.replace("'", "''")
 
     def _extract_first_iot_id(self, body: Any) -> str | None:
-        if isinstance(body, dict):
-            if body.get("@iot.id") is not None:
-                return str(body.get("@iot.id"))
-            value = body.get("value")
-            if isinstance(value, list) and value:
-                first = value[0]
-                if isinstance(first, dict):
-                    if first.get("@iot.id") is not None:
-                        return str(first.get("@iot.id"))
-                    if first.get("id") is not None:
-                        return str(first.get("id"))
-        return None
+        return FrostHTTPClient.extract_first_iot_id(body)
 
     def _fetch_datastream_id_by_filter(self, datastreams_endpoint: str, odata_filter: str) -> str | None:
-        try:
-            response = requests.get(
-                datastreams_endpoint,
-                params={"$filter": odata_filter, "$top": "1"},
-                headers=self._headers(),
-                timeout=self._request_timeout(),
-            )
-        except requests.RequestException:
-            return None
-
-        if not response.ok:
-            return None
-
-        try:
-            body = response.json()
-        except ValueError:
-            return None
-
-        return self._extract_first_iot_id(body)
+        return self._entity_manager.find_by_filter(datastreams_endpoint, odata_filter)
 
     def _resolve_datastream_id_live(self, base_url: str, reading: SensorReading) -> str | None:
         datastreams_endpoint = self._endpoint_for_base_url(base_url, settings.datastreams_path)
@@ -447,8 +331,9 @@ class SensorThingsClient:
         return None
 
     def _create_entity(self, path: str, payload: dict[str, Any]) -> tuple[str | None, requests.Response]:
+        endpoint = self._endpoint(path)
         response = requests.post(
-            self._endpoint(path),
+            endpoint,
             json=payload,
             headers=self._headers(),
             timeout=self._request_timeout(),
@@ -462,22 +347,7 @@ class SensorThingsClient:
         payload: dict[str, Any],
         collection: str,
     ) -> tuple[str | None, str]:
-        cached_id = self._registered_entities.get(collection, {}).get(name)
-        if cached_id:
-            expected_name = str(payload.get("name", "")).strip() or None
-            if self._cached_entity_id_matches(path, cached_id, expected_name):
-                return cached_id, "cached"
-            self._drop_cached_entity_id(collection, name)
-
-        existing_id = self._find_entity_id_by_name(path, name)
-        if existing_id:
-            self._cache_entity_id(collection, name, existing_id)
-            return existing_id, "existing"
-
-        entity_id, response = self._create_entity(path, payload)
-        if entity_id:
-            self._cache_entity_id(collection, name, entity_id)
-        return entity_id, f"created:{response.status_code}"
+        return self._entity_manager.get_or_create(path, name, payload, collection)
 
     def _build_site_registration_preview(self, entity_sets: list[dict[str, Any]]) -> RegistrationPreview:
         thing_preview = {
@@ -1145,45 +1015,7 @@ class SensorThingsClient:
         }
 
     def _post_observation(self, endpoint: str, payload: dict[str, Any], datastream_id: str) -> requests.Response:
-        attempts = 3
-        current_wait = 2.0
-        last_response: requests.Response | None = None
-
-        for attempt in range(1, attempts + 1):
-            try:
-                response = requests.post(endpoint, json=payload, headers=self._headers(), timeout=self._request_timeout())
-                last_response = response
-                if response.ok:
-                    return response
-
-                logger.warning(
-                    "Observation push failed",
-                    extra={
-                        "timestamp": datetime.now(UTC).isoformat(),
-                        "datastream_id": datastream_id,
-                        "status_code": response.status_code,
-                        "attempt": attempt,
-                    },
-                )
-            except requests.RequestException as exc:
-                logger.warning(
-                    "Observation push raised an exception",
-                    extra={
-                        "timestamp": datetime.now(UTC).isoformat(),
-                        "datastream_id": datastream_id,
-                        "status_code": getattr(getattr(exc, "response", None), "status_code", None),
-                        "attempt": attempt,
-                    },
-                )
-                last_response = None
-
-            if attempt < attempts:
-                time.sleep(current_wait)
-                current_wait *= 2
-
-        if last_response is None:
-            raise requests.RequestException("Observation push failed after retries without a response.")
-        return last_response
+        return self._http.post_with_retry(endpoint, payload, datastream_id)
 
     def _write_failed_observation(self, record: dict[str, Any]) -> None:
         self._failed_observations_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1451,14 +1283,15 @@ class SensorThingsClient:
                 }
                 try:
                     response = self._post_observation(endpoint, payload, datastream_id)
-                except requests.RequestException as exc:
-                    response = getattr(exc, "response", None)
+                except (ObservationUploadError, requests.RequestException) as exc:
+                    last_status = getattr(exc, "last_status", None) or getattr(getattr(exc, "response", None), "status_code", None)
+                    health_monitor.record_failure(datastream_id, str(exc))
                     logger.error(
                         "Final observation push failure",
                         extra={
                             "timestamp": datetime.now(UTC).isoformat(),
                             "datastream_id": datastream_id,
-                            "status_code": getattr(response, "status_code", None),
+                            "status_code": last_status,
                         },
                     )
                     self._write_failed_observation(
@@ -1467,7 +1300,7 @@ class SensorThingsClient:
                             "datastream_id": datastream_id,
                             "endpoint": endpoint,
                             "payload": payload,
-                            "status_code": getattr(response, "status_code", None),
+                            "status_code": last_status,
                             "error": str(exc),
                         }
                     )
@@ -1475,7 +1308,7 @@ class SensorThingsClient:
                         {
                             "sensor_id": reading.sensor_id,
                             "datastream_id": datastream_id,
-                            "status_code": getattr(response, "status_code", None),
+                            "status_code": last_status,
                             "ok": False,
                             "error": str(exc),
                         }
@@ -1483,6 +1316,8 @@ class SensorThingsClient:
                     continue
 
                 sent += 1
+                if response.ok:
+                    health_monitor.record_success(datastream_id)
                 results.append(
                     {
                         "sensor_id": reading.sensor_id,

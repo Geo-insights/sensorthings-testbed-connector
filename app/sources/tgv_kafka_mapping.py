@@ -174,5 +174,9 @@ def avro_batch_to_sensor_readings(
         try:
             result.extend(avro_record_to_sensor_readings(record, override_mapping))
         except Exception as exc:
+            from app.exceptions import PayloadTransformError
+
             logger.warning("Failed to map Avro record: %s", exc, exc_info=True)
+            if not isinstance(exc, PayloadTransformError):
+                logger.debug("Wrapping as PayloadTransformError for traceability")
     return result

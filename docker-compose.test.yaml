@@ -1,0 +1,36 @@
+# Ephemeral FROST-Server + PostGIS for integration tests.
+# Usage: docker compose -f docker-compose.test.yaml up -d
+# No volumes — data is discarded when containers stop.
+
+services:
+  frost-db:
+    image: postgis/postgis:16-3.4-alpine
+    environment:
+      POSTGRES_DB: sensorthings
+      POSTGRES_USER: sensorthings
+      POSTGRES_PASSWORD: sensorthings
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sensorthings"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  frost-server:
+    image: fraunhoferiosb/frost-server:latest
+    depends_on:
+      frost-db:
+        condition: service_healthy
+    environment:
+      serviceRootUrl: http://localhost:${FROST_PORT:-18080}/FROST-Server
+      persistence_db_driver: org.postgresql.Driver
+      persistence_db_url: jdbc:postgresql://frost-db:5432/sensorthings
+      persistence_db_username: sensorthings
+      persistence_db_password: sensorthings
+      persistence_autoUpdateDatabase: "true"
+    ports:
+      - "${FROST_PORT:-18080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/FROST-Server/v1.1/ || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30

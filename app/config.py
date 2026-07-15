@@ -177,6 +177,9 @@ class Settings:
     request_timeout_seconds: float = field(default_factory=lambda: _load_float("SENSORTHINGS_REQUEST_TIMEOUT_SECONDS", "15"))
     datastream_ids: dict[str, str] = field(default_factory=_load_datastream_map)
     public_base_url: str = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
+    frost_public_base_url: str = os.getenv("FROST_PUBLIC_BASE_URL", "").strip()
+    frost_internal_base_url: str = os.getenv("FROST_INTERNAL_BASE_URL", "").strip()
+    sensor_config_dir: str = os.getenv("SENSOR_CONFIG_DIR", "config/sites")
     debug: bool = os.getenv("DEBUG", "false").lower() in {"1", "true", "yes", "on"}
     # --- Kafka / TGV source ---
     kafka_tgv_enabled: bool = os.getenv("KAFKA_TGV_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
