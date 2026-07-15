@@ -262,11 +262,11 @@ def test_get_or_create_entity_drops_stale_cached_id(monkeypatch, tmp_path):
     client._registered_entities["things"] = {"GEO_Hitteplein": "3"}
 
     monkeypatch.setattr(
-        client,
-        "_fetch_entity_by_id",
+        client._entity_manager,
+        "fetch_by_id",
         lambda path, entity_id: {"name": "Wrong Thing"},
     )
-    monkeypatch.setattr(client, "_find_entity_id_by_name", lambda path, name: "42")
+    monkeypatch.setattr(client._entity_manager, "find_by_name", lambda path, name: "42")
 
     entity_id, status = client._get_or_create_entity(
         "/Things",

@@ -5,6 +5,14 @@ from datetime import UTC, datetime
 from typing import Any
 
 from app.models import SensorReading
+from app.sta.models import (
+    STADatastream,
+    STALocation,
+    STAObservedProperty,
+    STASensor,
+    STAThing,
+    UnitOfMeasurement,
+)
 
 
 CLIMATE_ADAPTATION_ENTITY_SETS: list[dict[str, Any]] = [
@@ -216,6 +224,67 @@ CLIMATE_ADAPTATION_ENTITY_SETS: list[dict[str, Any]] = [
         },
     },
 ]
+
+
+def entity_set_to_sta_models(
+    entity_set: dict[str, Any],
+) -> tuple[STAThing, STALocation, list[STASensor], dict[str, STAObservedProperty], list[STADatastream]]:
+    """Convert a raw entity-set dict into typed STA domain models.
+
+    Returns (thing, location, sensors, observed_properties, datastreams).
+    Datastreams don't have linked IDs set — those are resolved at registration time.
+    """
+    thing = STAThing(
+        name=entity_set["thing"]["name"],
+        description=entity_set["thing"]["description"],
+        properties=entity_set["thing"].get("properties", {}),
+    )
+
+    location = STALocation(
+        name=entity_set["location"]["name"],
+        description=entity_set["location"]["description"],
+        encodingType=entity_set["location"].get("encodingType", "application/geo+json"),
+        location=entity_set["location"]["location"],
+        properties=entity_set["location"].get("properties", {}),
+    )
+
+    sensors: list[STASensor] = []
+    observed_properties: dict[str, STAObservedProperty] = {}
+    datastreams: list[STADatastream] = []
+
+    for sensor_def in entity_set["sensors"]:
+        sensor = STASensor(
+            name=sensor_def["name"],
+            description=sensor_def["description"],
+            encodingType=sensor_def.get("encodingType", "application/json"),
+            metadata=sensor_def.get("metadata", ""),
+            properties=sensor_def.get("properties", {}),
+        )
+        sensors.append(sensor)
+
+        for op_key in sensor_def["observed_properties"]:
+            if op_key not in observed_properties:
+                op_def = entity_set["observed_properties"][op_key]
+                observed_properties[op_key] = STAObservedProperty(
+                    name=op_def["name"],
+                    definition=op_def["definition"],
+                    description=op_def["description"],
+                )
+
+            op_def = entity_set["observed_properties"][op_key]
+            datastreams.append(
+                STADatastream(
+                    name=f"{sensor_def['name']} - {op_def['name']}",
+                    description=f"{op_def['name']} observations for {entity_set['thing']['name']}",
+                    unitOfMeasurement=UnitOfMeasurement(
+                        name=op_def["name"],
+                        symbol=op_def["unit"],
+                        definition=op_def["definition"],
+                    ),
+                )
+            )
+
+    return thing, location, sensors, observed_properties, datastreams
 
 
 def generate_demo_readings() -> list[SensorReading]:

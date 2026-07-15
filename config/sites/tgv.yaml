@@ -1,0 +1,178 @@
+# The Green Village sensor configuration
+# Each document in this file defines one Thing with its Location,
+# Sensors, ObservedProperties, and Datastreams.
+
+- site_key: tgv
+  site_name: The Green Village
+  thing:
+    name: TGV Office Lab
+    description: Indoor climate monitoring at The Green Village office laboratory, fed from Confluent Cloud Kafka.
+    properties:
+      site: tgv
+      campus: TU Delft
+      source: kafka
+      topic: tud_gv_officelab-climate
+  location:
+    name: TGV Office Lab location
+    description: Weather station at The Green Village office laboratory, TU Delft campus. Height 5 m above ground.
+    encodingType: application/geo+json
+    location:
+      type: Point
+      coordinates: [4.377633926937161, 51.99658144237765]
+    properties:
+      altitude_m: 5
+  sensors:
+    - sensor_id: tgv-officelab-climate
+      name: TGV Office Lab climate sensor
+      description: Multi-parameter indoor climate sensor in the TGV office lab.
+      encodingType: application/json
+      metadata: https://thegreenvillage.org
+      observed_properties: [temperature, humidity, co2, pressure]
+      properties:
+        long_description: >-
+          Bosch BME680 multi-parameter sensor measuring temperature, humidity, CO2,
+          and barometric pressure. Mounted at desk height (1.2 m) in the TGV office
+          laboratory for indoor climate monitoring.
+        image_url: null
+        installation_notes: Wall-mounted near the east window, powered via USB.
+  observed_properties:
+    temperature:
+      name: Air temperature
+      definition: https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#air_temperature
+      description: Indoor air temperature.
+      unit: Cel
+    humidity:
+      name: Relative humidity
+      definition: https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#relative_humidity
+      description: Indoor relative humidity.
+      unit: "%"
+    co2:
+      name: CO2 concentration
+      definition: https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#mole_fraction_of_carbon_dioxide_in_air
+      description: Indoor CO2 concentration.
+      unit: ppm
+    pressure:
+      name: Air pressure
+      definition: https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#air_pressure
+      description: Indoor air pressure.
+      unit: hPa
+
+- site_key: tgv
+  site_name: The Green Village
+  thing:
+    name: Climate Davis
+    description: Davis Vantage Pro2 outdoor weather station at The Green Village, TU Delft campus.
+    properties:
+      site: tgv
+      campus: TU Delft
+      source: kafka
+      topic: tud_gv_officelab-climate
+  location:
+    name: Climate Davis location
+    description: Davis weather station at The Green Village, TU Delft campus. Height 10 m above ground.
+    encodingType: application/geo+json
+    location:
+      type: Point
+      coordinates: [4.377633926937161, 51.99658144237765]
+    properties:
+      altitude_m: 10
+  sensors:
+    - sensor_id: tgv-climate-davis-weather-station
+      name: Davis weather station
+      description: Davis Vantage Pro2 outdoor weather station measuring air temperature, wind, and precipitation.
+      encodingType: application/json
+      metadata: https://thegreenvillage.org
+      observed_properties: [air_temperature, wind_speed, wind_direction, precipitation]
+      properties: {}
+  observed_properties:
+    air_temperature:
+      name: Air temperature
+      definition: https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#air_temperature
+      description: Outdoor air temperature.
+      unit: Cel
+    wind_speed:
+      name: Wind speed
+      definition: https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#wind_speed
+      description: Wind speed.
+      unit: km/h
+    wind_direction:
+      name: Wind direction
+      definition: https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#wind_from_direction
+      description: Wind direction in degrees from north.
+      unit: degrees
+    precipitation:
+      name: Precipitation
+      definition: https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#precipitation_amount
+      description: Daily rainfall.
+      unit: mm
+
+- site_key: tgv
+  site_name: The Green Village
+  thing:
+    name: Weather Climatics
+    description: Climatics rooftop weather station at The Green Village, TU Delft campus.
+    properties:
+      site: tgv
+      campus: TU Delft
+      source: kafka
+      topic: tud_gv_officelab-climate
+  location:
+    name: Weather Climatics location
+    description: Climatics rooftop station at The Green Village, TU Delft campus.
+    encodingType: application/geo+json
+    location:
+      type: Point
+      coordinates: [4.377633926937161, 51.99658144237765]
+    properties: {}
+  sensors:
+    - sensor_id: tgv-weather-climatics-rooftop-station
+      name: Climatics rooftop station
+      description: Climatics rooftop weather station measuring air pressure.
+      encodingType: application/json
+      metadata: https://thegreenvillage.org
+      observed_properties: [air_pressure]
+      properties: {}
+  observed_properties:
+    air_pressure:
+      name: Air pressure
+      definition: https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#air_pressure
+      description: Atmospheric air pressure.
+      unit: hPa
+
+- site_key: tgv
+  site_name: The Green Village
+  thing:
+    name: Hitteplein
+    description: Hitteplein climate station at The Green Village, TU Delft campus.
+    properties:
+      site: tgv
+      campus: TU Delft
+      source: kafka
+      topic: tud_gv_officelab-climate
+  location:
+    name: Hitteplein location
+    description: Hitteplein climate station at The Green Village, TU Delft campus.
+    encodingType: application/geo+json
+    location:
+      type: Point
+      coordinates: [4.377633926937161, 51.99658144237765]
+    properties: {}
+  sensors:
+    - sensor_id: tgv-hitteplein-climate-station
+      name: Hitteplein climate station
+      description: Hitteplein climate station measuring solar radiation and relative humidity.
+      encodingType: application/json
+      metadata: https://thegreenvillage.org
+      observed_properties: [solar_radiation, relative_humidity]
+      properties: {}
+  observed_properties:
+    solar_radiation:
+      name: Solar radiation
+      definition: https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#surface_downwelling_shortwave_flux_in_air
+      description: Solar radiation.
+      unit: W/m2
+    relative_humidity:
+      name: Relative humidity
+      definition: https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#relative_humidity
+      description: Outdoor relative humidity.
+      unit: "%"

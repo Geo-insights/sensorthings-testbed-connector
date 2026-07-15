@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+markers = [
+    "integration: requires Docker with FROST-Server + PostGIS (deselect with '-m \"not integration\"')",
+]
+# Exclude integration tests from default runs
+addopts = "-m 'not integration'"
