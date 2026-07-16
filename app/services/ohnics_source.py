@@ -68,8 +68,8 @@ class OhnicsPollingSource(PollingSource):
             # Cache sensor metadata for entity registration
             if name not in self._discovered_sensors:
                 lat = sensor_data.get("Lat", sensor_data.get("lat", 0.0))
-                lon = sensor_data.get("Lon", sensor_data.get("lon", 0.0))
-                self._discovered_sensors[name] = {"lat": lat, "lon": lon, "properties": ["pm25"]}
+                lon = sensor_data.get("Long", sensor_data.get("Lon", sensor_data.get("lon", 0.0)))
+                self._discovered_sensors[name] = {"lat": lat, "lon": lon, "properties": ["pm25", "air_temperature"]}
                 logger.info("Discovered Ohnics sensor: %s (lat=%s, lon=%s)", name, lat, lon)
 
             readings = parse_sensor_readings(sensor_data)
