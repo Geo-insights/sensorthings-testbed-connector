@@ -190,6 +190,47 @@ def kafka_push(
     }
 
 
+# --- Polling source manual triggers ---
+
+
+@router.post("/ohnics-push")
+async def ohnics_push() -> dict:
+    """Manually trigger one Ohnics fetch-and-push cycle.
+
+    Requires OHNICS_ENABLED=true in .env.
+    """
+    if not settings.ohnics_enabled:
+        raise HTTPException(status_code=503, detail="Ohnics source is disabled. Set OHNICS_ENABLED=true.")
+
+    from app.services.ohnics_source import OhnicsPollingSource
+
+    source = OhnicsPollingSource()
+    readings = await source.fetch_readings()
+    if not readings:
+        return {"source": "ohnics", "readings": 0, "pushed": 0, "message": "No readings fetched."}
+    result = client.push_observations(readings)
+    return {"source": "ohnics", "readings": len(readings), "pushed": result.get("total_sent", 0), "detail": result}
+
+
+@router.post("/levellog-push")
+async def levellog_push() -> dict:
+    """Manually trigger one Levellog fetch-and-push cycle.
+
+    Requires LEVELLOG_ENABLED=true and LEVELLOG_INSTALLATION_IDS in .env.
+    """
+    if not settings.levellog_enabled:
+        raise HTTPException(status_code=503, detail="Levellog source is disabled. Set LEVELLOG_ENABLED=true.")
+
+    from app.services.levellog_source import LevellogPollingSource
+
+    source = LevellogPollingSource()
+    readings = await source.fetch_readings()
+    if not readings:
+        return {"source": "levellog", "readings": 0, "pushed": 0, "message": "No readings fetched."}
+    result = client.push_observations(readings)
+    return {"source": "levellog", "readings": len(readings), "pushed": result.get("total_sent", 0), "detail": result}
+
+
 # --- Sensor metadata & image endpoints ---
 
 _ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
