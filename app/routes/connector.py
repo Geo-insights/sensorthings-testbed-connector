@@ -225,6 +225,7 @@ async def ohnics_probe() -> dict:
 async def ohnics_push() -> dict:
     """Manually trigger one Ohnics fetch-and-push cycle.
 
+    Registers discovered sensor entities in FROST before pushing observations.
     Requires OHNICS_ENABLED=true in .env.
     """
     if not settings.ohnics_enabled:
@@ -236,14 +237,28 @@ async def ohnics_push() -> dict:
     readings = await source.fetch_readings()
     if not readings:
         return {"source": "ohnics", "readings": 0, "pushed": 0, "message": "No readings fetched."}
+
+    # Register entity sets for discovered sensors before pushing
+    entity_sets = source.entity_sets()
+    reg_results = []
+    for entity_set in entity_sets:
+        reg_results.append(client.register_entity_set(entity_set))
+
     result = client.push_observations(readings)
-    return {"source": "ohnics", "readings": len(readings), "pushed": result.get("total_sent", 0), "detail": result}
+    return {
+        "source": "ohnics",
+        "readings": len(readings),
+        "sensors_registered": len(reg_results),
+        "pushed": result.get("total_sent", 0),
+        "detail": result,
+    }
 
 
 @router.post("/levellog-push")
 async def levellog_push() -> dict:
     """Manually trigger one Levellog fetch-and-push cycle.
 
+    Registers entity sets in FROST before pushing observations.
     Requires LEVELLOG_ENABLED=true and LEVELLOG_INSTALLATION_IDS in .env.
     """
     if not settings.levellog_enabled:
@@ -255,6 +270,11 @@ async def levellog_push() -> dict:
     readings = await source.fetch_readings()
     if not readings:
         return {"source": "levellog", "readings": 0, "pushed": 0, "message": "No readings fetched."}
+
+    entity_sets = source.entity_sets()
+    for entity_set in entity_sets:
+        client.register_entity_set(entity_set)
+
     result = client.push_observations(readings)
     return {"source": "levellog", "readings": len(readings), "pushed": result.get("total_sent", 0), "detail": result}
 
