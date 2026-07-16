@@ -48,11 +48,54 @@ async def _kafka_ingest_loop():
         await asyncio.sleep(poll_seconds)
 
 
+async def _polling_ingest_loop(source):
+    """Background loop for a REST API polling source."""
+    from app.services.polling_source import PollingSource
+
+    poll_seconds = source.poll_interval()
+    logger.info("Polling loop started for %s (every %ds)", source.source_name, poll_seconds)
+    while True:
+        try:
+            readings = await source.fetch_readings()
+            if readings:
+                result = await run_in_threadpool(client.push_observations, readings)
+                logger.info(
+                    "%s push: readings=%d pushed=%s",
+                    source.source_name,
+                    len(readings),
+                    result.get("total_sent", 0),
+                )
+        except Exception:
+            logger.exception("%s polling cycle failed", source.source_name)
+        await asyncio.sleep(poll_seconds)
+
+
+def _get_enabled_polling_sources():
+    """Instantiate and return all enabled polling sources."""
+    sources = []
+
+    from app.services.ohnics_source import OhnicsPollingSource
+    ohnics = OhnicsPollingSource()
+    if ohnics.is_enabled():
+        sources.append(ohnics)
+
+    from app.services.levellog_source import LevellogPollingSource
+    levellog = LevellogPollingSource()
+    if levellog.is_enabled():
+        sources.append(levellog)
+
+    return sources
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     tasks = []
     if settings.kafka_tgv_enabled:
         tasks.append(asyncio.create_task(_kafka_ingest_loop()))
+
+    for source in _get_enabled_polling_sources():
+        tasks.append(asyncio.create_task(_polling_ingest_loop(source)))
+
     yield
     for t in tasks:
         t.cancel()

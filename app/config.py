@@ -194,6 +194,19 @@ class Settings:
     kafka_tgv_topic: str = os.getenv("KAFKA_TGV_TOPIC", "tud_gv_officelab-climate").strip()
     kafka_tgv_poll_seconds: int = int(os.getenv("KAFKA_TGV_POLL_SECONDS", "300"))
     kafka_tgv_device_mapping: dict[str, dict[str, str]] = field(default_factory=_load_tgv_device_mapping)
+    # --- Ohnics air quality source ---
+    ohnics_enabled: bool = os.getenv("OHNICS_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    ohnics_api_url: str = os.getenv("OHNICS_API_URL", "https://ohnics.online/5min.json").strip()
+    ohnics_poll_seconds: int = int(os.getenv("OHNICS_POLL_SECONDS", "300"))
+    ohnics_sensor_prefix: str = os.getenv("OHNICS_SENSOR_PREFIX", "de-").strip()
+    # --- Levellog / CARS Online groundwater source ---
+    levellog_enabled: bool = os.getenv("LEVELLOG_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    levellog_api_url: str = os.getenv("LEVELLOG_API_URL", "https://cars-api.carsonline.eu").strip().rstrip("/")
+    levellog_token_url: str = os.getenv("LEVELLOG_TOKEN_URL", "https://cars-api.carsonline.eu/token").strip()
+    levellog_client_id: str = os.getenv("LEVELLOG_CLIENT_ID", "").strip()
+    levellog_client_secret: str = os.getenv("LEVELLOG_CLIENT_SECRET", "").strip()
+    levellog_installation_ids: str = os.getenv("LEVELLOG_INSTALLATION_IDS", "").strip()
+    levellog_poll_seconds: int = int(os.getenv("LEVELLOG_POLL_SECONDS", "900"))
 
 
 settings = Settings()

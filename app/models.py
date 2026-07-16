@@ -14,7 +14,7 @@ class SensorReading(BaseModel):
     value: float
     timestamp: datetime
     quality: str = "good"
-    location: Literal["tgv", "blijdorp"] = "tgv"
+    location: str = "tgv"
     thing_name: str = "Climate adaptation setup"
     device_eui: str | None = None
     stream_key: str | None = None
