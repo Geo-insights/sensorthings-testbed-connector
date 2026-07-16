@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -48,6 +49,29 @@ async def _kafka_ingest_loop():
         await asyncio.sleep(poll_seconds)
 
 
+def _dedup_readings(
+    readings: list,
+    last_timestamps: dict[str, datetime],
+) -> list:
+    """Filter out readings whose timestamp matches the last-pushed value."""
+    new = []
+    for r in readings:
+        key = f"{r.sensor_id}::{r.observed_property}"
+        if r.timestamp != last_timestamps.get(key):
+            new.append(r)
+    return new
+
+
+def _update_timestamps(
+    readings: list,
+    last_timestamps: dict[str, datetime],
+) -> None:
+    """Record the latest pushed timestamp per sensor+property."""
+    for r in readings:
+        key = f"{r.sensor_id}::{r.observed_property}"
+        last_timestamps[key] = r.timestamp
+
+
 async def _polling_ingest_loop(source):
     """Background loop for a REST API polling source."""
     from app.services.polling_source import PollingSource
@@ -55,6 +79,7 @@ async def _polling_ingest_loop(source):
     poll_seconds = source.poll_interval()
     logger.info("Polling loop started for %s (every %ds)", source.source_name, poll_seconds)
     entities_registered = False
+    last_timestamps: dict[str, datetime] = {}
     while True:
         try:
             readings = await source.fetch_readings()
@@ -68,13 +93,20 @@ async def _polling_ingest_loop(source):
                             await run_in_threadpool(client.register_entity_set, entity_set)
                         entities_registered = True
 
-                result = await run_in_threadpool(client.push_observations, readings)
-                logger.info(
-                    "%s push: readings=%d pushed=%s",
-                    source.source_name,
-                    len(readings),
-                    result.get("total_sent", 0),
-                )
+                # Skip readings already pushed in a previous cycle
+                new_readings = _dedup_readings(readings, last_timestamps)
+                if new_readings:
+                    result = await run_in_threadpool(client.push_observations, new_readings)
+                    _update_timestamps(new_readings, last_timestamps)
+                    logger.info(
+                        "%s push: readings=%d new=%d pushed=%s",
+                        source.source_name,
+                        len(readings),
+                        len(new_readings),
+                        result.get("total_sent", 0),
+                    )
+                else:
+                    logger.debug("%s: all %d readings already pushed, skipping", source.source_name, len(readings))
         except Exception:
             logger.exception("%s polling cycle failed", source.source_name)
         await asyncio.sleep(poll_seconds)
