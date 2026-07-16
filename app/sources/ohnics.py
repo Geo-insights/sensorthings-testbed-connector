@@ -19,23 +19,19 @@ OBSERVED_PROPERTIES: dict[str, dict[str, str]] = {
         "description": "Particulate matter concentration (PM2.5) in ambient air.",
         "unit": "ug/m3",
     },
-    "pm10": {
-        "name": "PM10 concentration",
-        "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#mass_concentration_of_pm10_ambient_aerosol_particles_in_air",
-        "description": "Particulate matter concentration (PM10) in ambient air.",
-        "unit": "ug/m3",
+    "air_temperature": {
+        "name": "Air temperature",
+        "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#air_temperature",
+        "description": "Outdoor air temperature at sensor location.",
+        "unit": "Cel",
     },
 }
 
-# Keys in the Ohnics JSON response that map to observed properties above.
-# Updated once the actual response shape is confirmed.
+# Mapping from Ohnics JSON field names to our observed property keys.
+# Confirmed from live API: P2 = PM2.5, T = temperature.
 FIELD_TO_PROPERTY: dict[str, str] = {
-    "PM25": "pm25",
-    "PM2.5": "pm25",
-    "pm25": "pm25",
-    "pm2_5": "pm25",
-    "PM10": "pm10",
-    "pm10": "pm10",
+    "P2": "pm25",
+    "T": "air_temperature",
 }
 
 
@@ -46,7 +42,7 @@ def build_entity_set(
     measured_properties: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build a CLIMATE_ADAPTATION_ENTITY_SETS-format dict for one Ohnics sensor."""
-    props = measured_properties or ["pm25"]
+    props = measured_properties or ["pm25", "air_temperature"]
     return {
         "site_key": "delft",
         "site_name": "Delft",
@@ -94,8 +90,8 @@ def parse_sensor_readings(sensor_data: dict[str, Any]) -> list[SensorReading]:
         return []
 
     # Extract coordinates (optional — used for entity registration, not readings)
-    lat = sensor_data.get("Lat", sensor_data.get("lat", sensor_data.get("Latitude", 0.0)))
-    lon = sensor_data.get("Lon", sensor_data.get("lon", sensor_data.get("Longitude", 0.0)))
+    lat = sensor_data.get("Lat", sensor_data.get("lat", 0.0))
+    lon = sensor_data.get("Long", sensor_data.get("Lon", sensor_data.get("lon", 0.0)))
 
     # Extract timestamp
     ts_raw = sensor_data.get("Timestamp", sensor_data.get("timestamp", sensor_data.get("Time", "")))
