@@ -193,34 +193,6 @@ def kafka_push(
 # --- Polling source manual triggers ---
 
 
-@router.get("/ohnics-probe")
-async def ohnics_probe() -> dict:
-    """Diagnostic: fetch the raw Ohnics API response to inspect the data shape."""
-    import httpx
-
-    url = settings.ohnics_api_url
-    try:
-        async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
-            resp = await client.get(url, headers={"User-Agent": "GeoInsights-Connector/1.0"})
-            resp.raise_for_status()
-            data = resp.json()
-    except Exception as exc:
-        return {"error": str(exc), "url": url}
-
-    if isinstance(data, list):
-        prefix = settings.ohnics_sensor_prefix
-        delft = [s for s in data if isinstance(s, dict) and str(s.get("Name", s.get("name", ""))).startswith(prefix)]
-        return {
-            "url": url,
-            "total_sensors": len(data),
-            "delft_sensors": len(delft),
-            "sample_all": data[:2] if data else [],
-            "delft_sample": delft[:3] if delft else [],
-            "all_keys": sorted({k for s in data[:5] if isinstance(s, dict) for k in s.keys()}) if data else [],
-        }
-    return {"url": url, "type": type(data).__name__, "sample": str(data)[:500]}
-
-
 @router.post("/ohnics-push")
 async def ohnics_push() -> dict:
     """Manually trigger one Ohnics fetch-and-push cycle.
