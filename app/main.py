@@ -54,10 +54,20 @@ async def _polling_ingest_loop(source):
 
     poll_seconds = source.poll_interval()
     logger.info("Polling loop started for %s (every %ds)", source.source_name, poll_seconds)
+    entities_registered = False
     while True:
         try:
             readings = await source.fetch_readings()
             if readings:
+                # Register entities in FROST on first successful fetch
+                if not entities_registered:
+                    entity_sets = source.entity_sets()
+                    if entity_sets:
+                        logger.info("%s: registering %d entity sets in FROST", source.source_name, len(entity_sets))
+                        for entity_set in entity_sets:
+                            await run_in_threadpool(client.register_entity_set, entity_set)
+                        entities_registered = True
+
                 result = await run_in_threadpool(client.push_observations, readings)
                 logger.info(
                     "%s push: readings=%d pushed=%s",
