@@ -190,6 +190,89 @@ def kafka_push(
     }
 
 
+# --- Diagnostics (temporary) ---
+
+
+@router.get("/ohnics-diag")
+def ohnics_diagnostics() -> dict:
+    """Diagnostic: count Ohnics datastreams, check DELETE capability, inspect seed."""
+    import requests as req
+    from app.main import _seed_timestamps_from_frost
+
+    base = client._http.primary_base_url
+    headers = client._headers()
+    prefix = settings.entity_name_prefix
+
+    # 1. Count ALL Ohnics datastreams (paginate)
+    all_ds: list[dict] = []
+    url = f"{base}/Datastreams"
+    params = {
+        "$filter": f"startswith(name,'{prefix}Ohnics')",
+        "$select": "@iot.id,name",
+        "$top": "1000",
+        "$orderby": "@iot.id asc",
+    }
+    try:
+        resp = req.get(url, params=params, headers=headers, timeout=30)
+        resp.raise_for_status()
+        all_ds = resp.json().get("value", [])
+    except Exception as exc:
+        return {"error": f"Failed to list datastreams: {exc}"}
+
+    # Group by name to find duplicates
+    by_name: dict[str, list] = {}
+    for ds in all_ds:
+        name = ds["name"]
+        by_name.setdefault(name, []).append(ds["@iot.id"])
+    duplicates = {name: ids for name, ids in by_name.items() if len(ids) > 1}
+    duplicate_ids = [iot_id for ids in duplicates.values() for iot_id in ids[1:]]  # keep first
+
+    # 2. Try DELETE on one duplicate observation (if any)
+    delete_test = None
+    if duplicate_ids:
+        test_ds_id = duplicate_ids[0]
+        # Find an observation on this duplicate datastream
+        try:
+            obs_resp = req.get(
+                f"{base}/Datastreams({test_ds_id})/Observations",
+                params={"$top": "1", "$select": "@iot.id"},
+                headers=headers, timeout=15,
+            )
+            obs = obs_resp.json().get("value", [])
+            if obs:
+                obs_id = obs[0]["@iot.id"]
+                del_resp = req.delete(f"{base}/Observations({obs_id})", headers=headers, timeout=15)
+                delete_test = {
+                    "observation_id": obs_id,
+                    "status_code": del_resp.status_code,
+                    "response": del_resp.text[:500],
+                }
+            else:
+                # Try deleting the empty duplicate datastream itself
+                del_resp = req.delete(f"{base}/Datastreams({test_ds_id})", headers=headers, timeout=15)
+                delete_test = {
+                    "datastream_id": test_ds_id,
+                    "status_code": del_resp.status_code,
+                    "response": del_resp.text[:500],
+                }
+        except Exception as exc:
+            delete_test = {"error": str(exc)}
+
+    # 3. Seed timestamps
+    seed = _seed_timestamps_from_frost("Ohnics")
+    sample_seeds = {k: v.isoformat() for k, v in list(seed.items())[:5]}
+
+    return {
+        "total_datastreams": len(all_ds),
+        "unique_names": len(by_name),
+        "duplicate_names": len(duplicates),
+        "duplicate_ds_ids_to_remove": duplicate_ids[:20],
+        "delete_test": delete_test,
+        "seed_count": len(seed),
+        "seed_sample": sample_seeds,
+    }
+
+
 # --- Polling source manual triggers ---
 
 
