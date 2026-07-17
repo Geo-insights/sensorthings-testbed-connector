@@ -16,6 +16,8 @@ from app.exceptions import (
 from app.frost.cache import EntityCache
 from app.frost.entity_manager import EntityManager
 from app.frost.http_client import FrostHTTPClient
+from app.frost.target_stack import TargetStack
+from app.frost.v2_adapter import adapt_datastream_payload, adapt_observation_payload, adapt_payload
 from app.models import (
     ConnectorPreview,
     ObservationPayload,
@@ -35,7 +37,13 @@ class SensorThingsClient:
     def __init__(self) -> None:
         self._failed_observations_path = Path(settings.failed_observations_path)
 
-        # FROST layer components
+        # Build per-target stacks from config
+        cache_dir = Path(settings.registered_entities_path).parent
+        self._target_stacks: list[TargetStack] = [
+            TargetStack(target, cache_dir) for target in settings.frost_targets
+        ]
+
+        # Primary FROST layer components (backward-compat: first target or global config)
         self._http = FrostHTTPClient(
             base_urls=self._load_base_urls(),
             auth_username=settings.auth_username,
@@ -601,7 +609,10 @@ class SensorThingsClient:
         self._registered_entities["datastreams"].update({key: value for key, value in datastream_ids.items() if value})
         self._persist_registered_entities()
 
-        return {
+        # Register on additional target stacks (v1.1 and v2.0)
+        extra_target_results = self._register_entity_set_on_extra_targets(site_config)
+
+        result: dict[str, Any] = {
             "mode": "live",
             "site_key": site_config["site_key"],
             "project_id": project_id,
@@ -617,6 +628,162 @@ class SensorThingsClient:
             "sensor_results": sensor_results,
             "datastream_results": datastream_results,
         }
+        if extra_target_results:
+            result["extra_targets"] = extra_target_results
+        return result
+
+    def _register_entity_set_on_stack(
+        self, stack: TargetStack, site_config: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Register a full entity set on a single target stack.
+
+        Builds v1.1 payloads and adapts them for the target's API version.
+        Skips Projects/Tasking extensions for v2.0 targets.
+        """
+        em = stack.entity_manager
+        is_v2 = stack.is_v2
+
+        thing_name = self._prefixed_name(site_config["thing"]["name"])
+        thing_payload: dict[str, Any] = {
+            "name": thing_name,
+            "description": site_config["thing"]["description"],
+            "properties": site_config["thing"]["properties"],
+        }
+        if is_v2:
+            thing_payload = adapt_payload(thing_payload)
+        thing_id, thing_status = em.get_or_create(
+            settings.things_path, thing_name, thing_payload, "things"
+        )
+        if not thing_id:
+            return {
+                "target": stack.label,
+                "version": stack.version,
+                "ok": False,
+                "message": f"Unable to register Thing {thing_name}.",
+            }
+
+        location_name = self._prefixed_name(site_config["location"]["name"])
+        location_payload: dict[str, Any] = {
+            "name": location_name,
+            "description": site_config["location"]["description"],
+            "encodingType": site_config["location"]["encodingType"],
+            "location": site_config["location"]["location"],
+            "Things": [{"@iot.id": thing_id}],
+        }
+        if is_v2:
+            location_payload = adapt_payload(location_payload)
+        location_id, location_status = em.get_or_create(
+            settings.locations_path, location_name, location_payload, "locations"
+        )
+
+        sensor_ids: dict[str, str | None] = {}
+        observed_property_ids: dict[str, str | None] = {}
+        datastream_results: list[dict[str, Any]] = []
+
+        for sensor in site_config["sensors"]:
+            sensor_name = self._prefixed_name(sensor["name"])
+            sensor_payload: dict[str, Any] = {
+                "name": sensor_name,
+                "description": sensor["description"],
+                "encodingType": sensor["encodingType"],
+                "metadata": sensor["metadata"],
+            }
+            sensor_properties = sensor.get("properties")
+            if isinstance(sensor_properties, dict) and sensor_properties:
+                sensor_payload["properties"] = sensor_properties
+            if is_v2:
+                sensor_payload = adapt_payload(sensor_payload)
+            sensor_id, _ = em.get_or_create(
+                settings.sensors_path, sensor_name, sensor_payload, "sensors"
+            )
+            sensor_ids[sensor["sensor_id"]] = sensor_id
+
+            for observed_property in sensor["observed_properties"]:
+                property_payload = site_config["observed_properties"][observed_property]
+                op_record: dict[str, Any] = {
+                    "name": property_payload["name"],
+                    "definition": property_payload["definition"],
+                    "description": property_payload["description"],
+                }
+                if is_v2:
+                    op_record = adapt_payload(op_record)
+                op_id, _ = em.get_or_create(
+                    settings.observed_properties_path,
+                    property_payload["name"],
+                    op_record,
+                    "observed_properties",
+                )
+                observed_property_ids[observed_property] = op_id
+
+                datastream_key = self._datastream_key(sensor["sensor_id"], observed_property)
+                ds_payload: dict[str, Any] = {
+                    "name": f"{sensor_name} - {property_payload['name']}",
+                    "description": f"{property_payload['name']} observations for {thing_name}",
+                    "observationType": "http://www.opengis.net/def/observationType/OGC-OM/2.0/OM_Measurement",
+                    "unitOfMeasurement": {
+                        "name": property_payload["name"],
+                        "symbol": property_payload["unit"],
+                        "definition": property_payload["definition"],
+                    },
+                    "Thing": {"@iot.id": thing_id},
+                    "Sensor": {"@iot.id": sensor_id},
+                    "ObservedProperty": {"@iot.id": op_id},
+                    "properties": {
+                        "site_key": site_config["site_key"],
+                        "thing_name": thing_name,
+                        "sensor_id": sensor["sensor_id"],
+                        "observed_property": observed_property,
+                        "streamKey": observed_property,
+                    },
+                }
+                if is_v2:
+                    ds_payload = adapt_datastream_payload(ds_payload)
+                ds_id, ds_status = em.get_or_create(
+                    settings.datastreams_path, datastream_key, ds_payload, "datastreams"
+                )
+                datastream_results.append({
+                    "datastream_key": datastream_key,
+                    "name": ds_payload["name"],
+                    "status": ds_status,
+                    "id": ds_id,
+                })
+
+        return {
+            "target": stack.label,
+            "version": stack.version,
+            "ok": True,
+            "thing_id": thing_id,
+            "thing_status": thing_status,
+            "location_id": location_id,
+            "location_status": location_status,
+            "datastream_results": datastream_results,
+        }
+
+    def _register_entity_set_on_extra_targets(
+        self, site_config: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Register entity set on all non-primary target stacks."""
+        results: list[dict[str, Any]] = []
+        primary_url = self._primary_base_url()
+        for stack in self._target_stacks:
+            if stack.base_url == primary_url:
+                continue
+            try:
+                result = self._register_entity_set_on_stack(stack, site_config)
+                results.append(result)
+                logger.info(
+                    "Registered entity set on %s (%s): %s",
+                    stack.label, stack.version, "ok" if result.get("ok") else "failed",
+                )
+            except Exception:
+                logger.exception("Failed to register entities on %s", stack.label)
+                results.append({
+                    "target": stack.label,
+                    "version": stack.version,
+                    "ok": False,
+                    "message": "Exception during registration (see logs).",
+                })
+        return results
 
     def register_demo_entities(self, readings: list[SensorReading] | None = None) -> dict[str, Any]:
         _ = readings
@@ -1080,10 +1247,21 @@ class SensorThingsClient:
             "results": results,
         }
 
+    def _headers_for_url(self, base_url: str) -> dict[str, str]:
+        """Return auth headers appropriate for the given target URL."""
+        stack = self._target_stack_for_url(base_url)
+        if stack:
+            return stack.http.headers()
+        return self._headers()
+
     def _check_frost_status_for_base_url(self, root_url: str) -> dict[str, Any]:
+        headers = self._headers_for_url(root_url)
+        stack = self._target_stack_for_url(root_url)
+        target_version = stack.version if stack else "v1.1"
+
         started = time.perf_counter()
         try:
-            root_response = requests.get(root_url, headers=self._headers(), timeout=self._request_timeout())
+            root_response = requests.get(root_url, headers=headers, timeout=self._request_timeout())
             elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
             version = root_response.headers.get("SensorThings-Version") or root_response.headers.get("X-SensorThings-Version")
             if not version and root_response.headers.get("Content-Type", "").startswith("application/json"):
@@ -1098,18 +1276,17 @@ class SensorThingsClient:
             things_status_code = None
             things_endpoint = self._endpoint_for_base_url(root_url, settings.things_path)
             if things_endpoint:
-                # Some STA servers reject $top=0; retry with $top=1 to keep count checks portable.
                 things_response = requests.get(
                     things_endpoint,
                     params={"$count": "true", "$top": "0"},
-                    headers=self._headers(),
+                    headers=headers,
                     timeout=self._request_timeout(),
                 )
                 if things_response.status_code == 400:
                     things_response = requests.get(
                         things_endpoint,
                         params={"$count": "true", "$top": "1"},
-                        headers=self._headers(),
+                        headers=headers,
                         timeout=self._request_timeout(),
                     )
                 things_status_code = things_response.status_code
@@ -1126,9 +1303,11 @@ class SensorThingsClient:
                 "status_code": root_response.status_code,
                 "response_time_ms": elapsed_ms,
                 "version": version,
+                "configured_version": target_version,
                 "things_count": things_count,
                 "things_status_code": things_status_code,
                 "root_url": root_url,
+                "label": stack.label if stack else None,
             }
         except requests.RequestException as exc:
             elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
@@ -1138,8 +1317,10 @@ class SensorThingsClient:
                 "status_code": getattr(getattr(exc, "response", None), "status_code", None),
                 "response_time_ms": elapsed_ms,
                 "version": None,
+                "configured_version": target_version,
                 "things_count": None,
                 "root_url": root_url,
+                "label": stack.label if stack else None,
                 "error": str(exc),
             }
 
@@ -1163,8 +1344,11 @@ class SensorThingsClient:
         }
 
     def _check_capabilities_for_base_url(self, root_url: str) -> dict[str, Any]:
+        headers = self._headers_for_url(root_url)
+        stack = self._target_stack_for_url(root_url)
+
         try:
-            response = requests.get(root_url, headers=self._headers(), timeout=self._request_timeout())
+            response = requests.get(root_url, headers=headers, timeout=self._request_timeout())
         except requests.RequestException as exc:
             return {
                 "mode": "live",
@@ -1205,6 +1389,8 @@ class SensorThingsClient:
             "reachable": response.ok,
             "status_code": response.status_code,
             "root_url": root_url,
+            "configured_version": stack.version if stack else "v1.1",
+            "label": stack.label if stack else None,
             "collections": collections,
             "conformance": conformance,
             "extensions": extensions,
@@ -1229,6 +1415,19 @@ class SensorThingsClient:
             "targets": targets,
         }
 
+    def _target_stack_for_url(self, base_url: str) -> TargetStack | None:
+        """Find the TargetStack matching a base URL."""
+        normalized = base_url.rstrip("/")
+        for stack in self._target_stacks:
+            if stack.base_url.rstrip("/") == normalized:
+                return stack
+        return None
+
+    def _is_v2_url(self, base_url: str) -> bool:
+        """Check if a base URL corresponds to a v2.0 target."""
+        stack = self._target_stack_for_url(base_url)
+        return stack.is_v2 if stack else False
+
     def push_observations(self, readings: list[SensorReading]) -> dict[str, Any]:
         preview = self.build_preview(readings)
         base_urls = self._base_urls()
@@ -1245,14 +1444,22 @@ class SensorThingsClient:
         total_sent = 0
         for base_url in base_urls:
             endpoint = self._endpoint_for_base_url(base_url, settings.observations_path)
+            is_v2 = self._is_v2_url(base_url)
+            stack = self._target_stack_for_url(base_url)
             results: list[dict[str, Any]] = []
             sent = 0
             for reading in readings:
-                datastream_id = (
-                    datastream_ids.get(self._datastream_key(reading.sensor_id, reading.observed_property))
-                    or datastream_ids.get(getattr(reading, "stream_key", "") or "")
-                    or datastream_ids.get(reading.sensor_id)
-                )
+                datastream_id = None
+                # For non-primary targets, resolve via the target's own cache/stack
+                if stack and stack.base_url != (self._primary_base_url() or ""):
+                    ds_key = self._datastream_key(reading.sensor_id, reading.observed_property)
+                    datastream_id = stack.cache.get("datastreams", ds_key)
+                if not datastream_id:
+                    datastream_id = (
+                        datastream_ids.get(self._datastream_key(reading.sensor_id, reading.observed_property))
+                        or datastream_ids.get(getattr(reading, "stream_key", "") or "")
+                        or datastream_ids.get(reading.sensor_id)
+                    )
                 if not datastream_id:
                     datastream_id = self._resolve_datastream_id_live(base_url, reading)
                 if not datastream_id:
@@ -1281,6 +1488,11 @@ class SensorThingsClient:
                         "stream_key": reading.stream_key,
                     },
                 }
+
+                # Adapt payload for v2.0 targets
+                if is_v2:
+                    payload = adapt_observation_payload(payload)
+
                 try:
                     response = self._post_observation(endpoint, payload, datastream_id)
                 except (ObservationUploadError, requests.RequestException) as exc:
