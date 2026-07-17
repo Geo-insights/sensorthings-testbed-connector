@@ -87,11 +87,21 @@ class EntityManager:
                 return cached_id, "cached"
             self._cache.drop(collection, name)
 
-        # 2. Search server by name
+        # 2. Search server by cache key
         existing_id = self.find_by_name(path, name)
         if existing_id:
             self._cache.put(collection, name, existing_id)
             return existing_id, "existing"
+
+        # 2b. If the cache key differs from the payload name (e.g. datastream
+        #     keys like "sensor_id::property"), also search by the actual entity
+        #     name so we don't create duplicates when the local cache is empty.
+        payload_name = str(payload.get("name", "")).strip()
+        if payload_name and payload_name != name:
+            existing_id = self.find_by_name(path, payload_name)
+            if existing_id:
+                self._cache.put(collection, name, existing_id)
+                return existing_id, "existing"
 
         # 3. Create new
         endpoint = self._http.endpoint(path)
