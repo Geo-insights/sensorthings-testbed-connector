@@ -332,6 +332,29 @@ def ohnics_cleanup_duplicates() -> dict:
     return result
 
 
+@router.get("/debug-find")
+def debug_find_by_name(name: str = Query(...), path: str = Query(default="/Datastreams")) -> dict:
+    """Debug: test find_by_name against FROST."""
+    import requests as req
+
+    base = client._http.primary_base_url
+    headers = client._headers()
+
+    # Raw query
+    filter_str = f"name eq '{name}'"
+    resp = req.get(
+        f"{base}{path}",
+        params={"$filter": filter_str, "$top": "3", "$select": "@iot.id,name"},
+        headers=headers, timeout=15,
+    )
+    raw = resp.json() if resp.ok else {"error": resp.status_code, "body": resp.text[:500]}
+
+    # Via entity_manager
+    found_id = client._entity_manager.find_by_name(path, name)
+
+    return {"filter": filter_str, "found_id": found_id, "raw_response": raw}
+
+
 # --- Sensor metadata & image endpoints ---
 
 _ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
