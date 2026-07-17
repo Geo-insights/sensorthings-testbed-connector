@@ -7,6 +7,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from app.frost.target import FrostTarget
+
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
@@ -117,7 +119,13 @@ def _load_base_urls() -> tuple[str, ...]:
             parsed = None
 
         if isinstance(parsed, list):
-            extras = [str(item).strip().rstrip("/") for item in parsed if str(item).strip()]
+            for item in parsed:
+                if isinstance(item, dict):
+                    url = str(item.get("url", "")).strip().rstrip("/")
+                    if url:
+                        extras.append(url)
+                elif isinstance(item, str) and item.strip():
+                    extras.append(item.strip().rstrip("/"))
         else:
             extras = [item.strip().rstrip("/") for item in raw_multi.split(",") if item.strip()]
 
@@ -138,6 +146,80 @@ def _load_base_urls() -> tuple[str, ...]:
     return tuple(deduped)
 
 
+def _load_frost_targets() -> tuple[FrostTarget, ...]:
+    """Parse FROST targets from env vars, supporting version + per-target auth.
+
+    ``SENSORTHINGS_BASE_URLS`` accepts:
+    - Plain strings (default to v1.1 with global auth)
+    - JSON objects with ``url``, ``version``, ``label``, ``auth_username``, etc.
+
+    ``SENSORTHINGS_BASE_URL`` is prepended as the primary target (v1.1).
+    """
+    global_username = os.getenv("SENSORTHINGS_AUTH_USERNAME", "")
+    global_password = os.getenv("SENSORTHINGS_AUTH_PASSWORD", "")
+    global_token = os.getenv("SENSORTHINGS_AUTH_TOKEN", "")
+
+    raw_primary = os.getenv("SENSORTHINGS_BASE_URL", "").strip().rstrip("/")
+    raw_multi = os.getenv("SENSORTHINGS_BASE_URLS", "").strip()
+
+    items: list[dict | str] = []
+    if raw_multi:
+        try:
+            parsed = json.loads(raw_multi)
+        except json.JSONDecodeError:
+            parsed = None
+
+        if isinstance(parsed, list):
+            items = list(parsed)
+        else:
+            items = [item.strip() for item in raw_multi.split(",") if item.strip()]
+
+    all_items: list[dict | str] = []
+    if raw_primary:
+        all_items.append(raw_primary)
+    all_items.extend(items)
+
+    targets: list[FrostTarget] = []
+    seen: set[str] = set()
+    for item in all_items:
+        if isinstance(item, dict):
+            url = str(item.get("url", "")).strip().rstrip("/")
+            version = str(item.get("version", "v1.1")).strip()
+            label = str(item.get("label", "")).strip()
+            auth_user = str(item.get("auth_username", "")).strip()
+            auth_pass = str(item.get("auth_password", "")).strip()
+            auth_tok = str(item.get("auth_token", "")).strip()
+            # Fall back to global auth if per-target auth is not set
+            if not auth_user and not auth_tok:
+                auth_user = global_username
+                auth_pass = global_password
+                auth_tok = global_token
+        else:
+            url = str(item).strip().rstrip("/")
+            version = "v1.1"
+            label = ""
+            auth_user = global_username
+            auth_pass = global_password
+            auth_tok = global_token
+
+        if not url:
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+
+        targets.append(FrostTarget(
+            url=url,
+            version=version,
+            auth_username=auth_user,
+            auth_password=auth_pass,
+            auth_token=auth_tok,
+            label=label,
+        ))
+
+    return tuple(targets)
+
+
 @dataclass(frozen=True)
 class Settings:
     connector_name: str = os.getenv("CONNECTOR_NAME", "UrbanAdapt SensorThings Connector")
@@ -151,6 +233,7 @@ class Settings:
     monitoring_mqtt_tls: bool = os.getenv("MONITORING_MQTT_TLS", "false").lower() in {"1", "true", "yes", "on"}
     sensorthings_base_url: str = os.getenv("SENSORTHINGS_BASE_URL", "").rstrip("/")
     sensorthings_base_urls: tuple[str, ...] = field(default_factory=_load_base_urls)
+    frost_targets: tuple[FrostTarget, ...] = field(default_factory=_load_frost_targets)
     things_path: str = os.getenv("SENSORTHINGS_THINGS_PATH", "/Things")
     locations_path: str = os.getenv("SENSORTHINGS_LOCATIONS_PATH", "/Locations")
     sensors_path: str = os.getenv("SENSORTHINGS_SENSORS_PATH", "/Sensors")

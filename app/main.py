@@ -111,7 +111,7 @@ def _seed_timestamps_from_frost(source_name: str) -> dict[str, datetime]:
         if not sensor_id or not observed_property:
             continue
 
-        ds_id = ds.get("@iot.id")
+        ds_id = ds.get("@iot.id") or ds.get("id")
         if not ds_id:
             continue
 
