@@ -198,11 +198,13 @@ async def ohnics_push() -> dict:
     """Manually trigger one Ohnics fetch-and-push cycle.
 
     Registers discovered sensor entities in FROST before pushing observations.
+    Deduplicates against the latest observation already in FROST.
     Requires OHNICS_ENABLED=true in .env.
     """
     if not settings.ohnics_enabled:
         raise HTTPException(status_code=503, detail="Ohnics source is disabled. Set OHNICS_ENABLED=true.")
 
+    from app.main import _dedup_readings, _seed_timestamps_from_frost
     from app.services.ohnics_source import OhnicsPollingSource
 
     source = OhnicsPollingSource()
@@ -216,10 +218,18 @@ async def ohnics_push() -> dict:
     for entity_set in entity_sets:
         reg_results.append(client.register_entity_set(entity_set))
 
-    result = client.push_observations(readings)
+    # Dedup against what's already in FROST
+    last_timestamps = _seed_timestamps_from_frost("Ohnics")
+    new_readings = _dedup_readings(readings, last_timestamps)
+
+    if not new_readings:
+        return {"source": "ohnics", "readings": len(readings), "new": 0, "pushed": 0, "message": "All readings already in FROST."}
+
+    result = client.push_observations(new_readings)
     return {
         "source": "ohnics",
         "readings": len(readings),
+        "new": len(new_readings),
         "sensors_registered": len(reg_results),
         "pushed": result.get("total_sent", 0),
         "detail": result,
@@ -249,6 +259,46 @@ async def levellog_push() -> dict:
 
     result = client.push_observations(readings)
     return {"source": "levellog", "readings": len(readings), "pushed": result.get("total_sent", 0), "detail": result}
+
+
+@router.post("/ohnics-cleanup")
+def ohnics_cleanup_duplicates() -> dict:
+    """Delete duplicate Ohnics observations from FROST (temporary maintenance endpoint)."""
+    import requests as req
+
+    prefix = settings.entity_name_prefix
+    base = client._http.primary_base_url
+    headers = client._headers()
+
+    resp = req.get(
+        f"{base}/Datastreams",
+        params={"$filter": f"startswith(name,'{prefix}Ohnics')", "$select": "@iot.id,name", "$top": "200"},
+        headers=headers, timeout=30,
+    )
+    resp.raise_for_status()
+    datastreams = resp.json().get("value", [])
+
+    total_deleted = 0
+    for ds in datastreams:
+        ds_id = str(ds["@iot.id"])
+        obs_resp = req.get(
+            f"{base}/Datastreams({ds_id})/Observations",
+            params={"$select": "@iot.id,phenomenonTime,result", "$orderby": "@iot.id asc", "$top": "1000"},
+            headers=headers, timeout=30,
+        )
+        obs_resp.raise_for_status()
+
+        seen: set[str] = set()
+        for obs in obs_resp.json().get("value", []):
+            key = f"{obs['phenomenonTime']}|{obs['result']}"
+            if key in seen:
+                del_resp = req.delete(f"{base}/Observations({obs['@iot.id']})", headers=headers, timeout=30)
+                if del_resp.status_code in (200, 202, 204):
+                    total_deleted += 1
+            else:
+                seen.add(key)
+
+    return {"total_deleted": total_deleted, "datastreams_checked": len(datastreams)}
 
 
 # --- Sensor metadata & image endpoints ---

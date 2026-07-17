@@ -53,11 +53,12 @@ def _dedup_readings(
     readings: list,
     last_timestamps: dict[str, datetime],
 ) -> list:
-    """Filter out readings whose timestamp matches the last-pushed value."""
+    """Filter out readings whose timestamp is <= the last-pushed value."""
     new = []
     for r in readings:
         key = f"{r.sensor_id}::{r.observed_property}"
-        if r.timestamp != last_timestamps.get(key):
+        last_ts = last_timestamps.get(key)
+        if last_ts is None or r.timestamp > last_ts:
             new.append(r)
     return new
 
@@ -72,6 +73,56 @@ def _update_timestamps(
         last_timestamps[key] = r.timestamp
 
 
+def _seed_timestamps_from_frost(source_name: str) -> dict[str, datetime]:
+    """Query FROST for the latest observation per datastream to avoid re-pushing on restart."""
+    import requests
+
+    base = client._http.primary_base_url
+    if not base:
+        return {}
+
+    headers = client._headers()
+    prefix = settings.entity_name_prefix
+
+    try:
+        resp = requests.get(
+            f"{base}/Datastreams",
+            params={
+                "$filter": f"startswith(name,'{prefix}{source_name}')",
+                "$expand": "Observations($orderby=phenomenonTime desc;$top=1;$select=phenomenonTime)",
+                "$select": "@iot.id,name,properties",
+                "$top": "200",
+            },
+            headers=headers,
+            timeout=30,
+        )
+        resp.raise_for_status()
+    except Exception:
+        logger.warning("Failed to seed timestamps from FROST for %s", source_name)
+        return {}
+
+    timestamps: dict[str, datetime] = {}
+    for ds in resp.json().get("value", []):
+        props = ds.get("properties", {})
+        sensor_id = props.get("sensor_id", "")
+        observed_property = props.get("observed_property", "")
+        if not sensor_id or not observed_property:
+            continue
+
+        observations = ds.get("Observations", [])
+        if observations:
+            raw_ts = observations[0].get("phenomenonTime", "")
+            try:
+                ts = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+                key = f"{sensor_id}::{observed_property}"
+                timestamps[key] = ts
+            except (ValueError, TypeError):
+                pass
+
+    logger.info("Seeded %d timestamps from FROST for %s", len(timestamps), source_name)
+    return timestamps
+
+
 async def _polling_ingest_loop(source):
     """Background loop for a REST API polling source."""
     from app.services.polling_source import PollingSource
@@ -79,7 +130,10 @@ async def _polling_ingest_loop(source):
     poll_seconds = source.poll_interval()
     logger.info("Polling loop started for %s (every %ds)", source.source_name, poll_seconds)
     entities_registered = False
-    last_timestamps: dict[str, datetime] = {}
+    # Seed from FROST so we don't re-push observations after a restart
+    last_timestamps = await run_in_threadpool(
+        _seed_timestamps_from_frost, source.source_name.capitalize()
+    )
     while True:
         try:
             readings = await source.fetch_readings()
@@ -92,8 +146,13 @@ async def _polling_ingest_loop(source):
                         for entity_set in entity_sets:
                             await run_in_threadpool(client.register_entity_set, entity_set)
                         entities_registered = True
+                    # Re-seed after registration in case this is first deploy
+                    if not last_timestamps:
+                        last_timestamps = await run_in_threadpool(
+                            _seed_timestamps_from_frost, source.source_name.capitalize()
+                        )
 
-                # Skip readings already pushed in a previous cycle
+                # Skip readings already pushed in a previous cycle or before restart
                 new_readings = _dedup_readings(readings, last_timestamps)
                 if new_readings:
                     result = await run_in_threadpool(client.push_observations, new_readings)
