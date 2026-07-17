@@ -75,7 +75,7 @@ def _update_timestamps(
 
 def _seed_timestamps_from_frost(source_name: str) -> dict[str, datetime]:
     """Query FROST for the latest observation per datastream to avoid re-pushing on restart."""
-    import requests
+    import requests as req
 
     base = client._http.primary_base_url
     if not base:
@@ -84,13 +84,12 @@ def _seed_timestamps_from_frost(source_name: str) -> dict[str, datetime]:
     headers = client._headers()
     prefix = settings.entity_name_prefix
 
+    # Step 1: get all datastreams for this source (with properties for key mapping)
     try:
-        resp = requests.get(
+        resp = req.get(
             f"{base}/Datastreams",
             params={
                 "$filter": f"startswith(name,'{prefix}{source_name}')",
-                "$expand": "Observations($orderby=phenomenonTime desc;$top=1;$select=phenomenonTime)",
-                "$select": "@iot.id,name,properties",
                 "$top": "200",
             },
             headers=headers,
@@ -98,18 +97,37 @@ def _seed_timestamps_from_frost(source_name: str) -> dict[str, datetime]:
         )
         resp.raise_for_status()
     except Exception:
-        logger.warning("Failed to seed timestamps from FROST for %s", source_name)
+        logger.warning("Failed to fetch datastreams from FROST for %s", source_name)
         return {}
 
+    datastreams = resp.json().get("value", [])
     timestamps: dict[str, datetime] = {}
-    for ds in resp.json().get("value", []):
+
+    # Step 2: for each datastream, get the latest observation
+    for ds in datastreams:
         props = ds.get("properties", {})
         sensor_id = props.get("sensor_id", "")
         observed_property = props.get("observed_property", "")
         if not sensor_id or not observed_property:
             continue
 
-        observations = ds.get("Observations", [])
+        ds_id = ds.get("@iot.id")
+        if not ds_id:
+            continue
+
+        try:
+            obs_resp = req.get(
+                f"{base}/Datastreams({ds_id})/Observations",
+                params={"$orderby": "phenomenonTime desc", "$top": "1", "$select": "phenomenonTime"},
+                headers=headers,
+                timeout=15,
+            )
+            if not obs_resp.ok:
+                continue
+            observations = obs_resp.json().get("value", [])
+        except Exception:
+            continue
+
         if observations:
             raw_ts = observations[0].get("phenomenonTime", "")
             try:
