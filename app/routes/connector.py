@@ -263,42 +263,73 @@ async def levellog_push() -> dict:
 
 @router.post("/ohnics-cleanup")
 def ohnics_cleanup_duplicates() -> dict:
-    """Delete duplicate Ohnics observations from FROST (temporary maintenance endpoint)."""
+    """Remove duplicate Ohnics entities and observations from FROST.
+
+    For each entity type (Things, Sensors, Locations, Datastreams), finds
+    entities with the same name and keeps only the one with the lowest @iot.id.
+    Also deduplicates observations on the remaining datastreams.
+    Temporary maintenance endpoint.
+    """
     import requests as req
 
     prefix = settings.entity_name_prefix
     base = client._http.primary_base_url
     headers = client._headers()
+    result: dict = {}
 
+    # Deduplicate entities: keep lowest @iot.id per name
+    for entity_type in ["Datastreams", "Sensors", "Things", "Locations"]:
+        resp = req.get(
+            f"{base}/{entity_type}",
+            params={
+                "$filter": f"startswith(name,'{prefix}Ohnics')",
+                "$select": "@iot.id,name",
+                "$orderby": "@iot.id asc",
+                "$top": "1000",
+            },
+            headers=headers, timeout=30,
+        )
+        resp.raise_for_status()
+        entities = resp.json().get("value", [])
+
+        seen_names: dict[str, str] = {}  # name → first @iot.id
+        deleted = 0
+        for entity in entities:
+            name = entity["name"]
+            eid = str(entity["@iot.id"])
+            if name in seen_names:
+                req.delete(f"{base}/{entity_type}({eid})", headers=headers, timeout=30)
+                deleted += 1
+            else:
+                seen_names[name] = eid
+        result[entity_type] = {"total": len(entities), "duplicates_deleted": deleted, "kept": len(seen_names)}
+
+    # Deduplicate observations on remaining Ohnics datastreams
     resp = req.get(
         f"{base}/Datastreams",
         params={"$filter": f"startswith(name,'{prefix}Ohnics')", "$select": "@iot.id,name", "$top": "200"},
         headers=headers, timeout=30,
     )
     resp.raise_for_status()
-    datastreams = resp.json().get("value", [])
-
-    total_deleted = 0
-    for ds in datastreams:
-        ds_id = str(ds["@iot.id"])
+    obs_deleted = 0
+    for ds in resp.json().get("value", []):
         obs_resp = req.get(
-            f"{base}/Datastreams({ds_id})/Observations",
+            f"{base}/Datastreams({ds['@iot.id']})/Observations",
             params={"$select": "@iot.id,phenomenonTime,result", "$orderby": "@iot.id asc", "$top": "1000"},
             headers=headers, timeout=30,
         )
         obs_resp.raise_for_status()
-
         seen: set[str] = set()
         for obs in obs_resp.json().get("value", []):
             key = f"{obs['phenomenonTime']}|{obs['result']}"
             if key in seen:
-                del_resp = req.delete(f"{base}/Observations({obs['@iot.id']})", headers=headers, timeout=30)
-                if del_resp.status_code in (200, 202, 204):
-                    total_deleted += 1
+                req.delete(f"{base}/Observations({obs['@iot.id']})", headers=headers, timeout=30)
+                obs_deleted += 1
             else:
                 seen.add(key)
+    result["Observations"] = {"duplicates_deleted": obs_deleted}
 
-    return {"total_deleted": total_deleted, "datastreams_checked": len(datastreams)}
+    return result
 
 
 # --- Sensor metadata & image endpoints ---
