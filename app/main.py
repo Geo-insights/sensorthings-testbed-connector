@@ -133,7 +133,9 @@ def _seed_timestamps_from_frost(source_name: str) -> dict[str, datetime]:
             try:
                 ts = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
                 key = f"{sensor_id}::{observed_property}"
-                timestamps[key] = ts
+                # Keep the newest timestamp if multiple datastreams share a key
+                if key not in timestamps or ts > timestamps[key]:
+                    timestamps[key] = ts
             except (ValueError, TypeError):
                 pass
 
