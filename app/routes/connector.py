@@ -251,60 +251,6 @@ async def levellog_push() -> dict:
     return {"source": "levellog", "readings": len(readings), "pushed": result.get("total_sent", 0), "detail": result}
 
 
-@router.post("/ohnics-cleanup")
-def ohnics_cleanup_duplicates() -> dict:
-    """Delete duplicate Ohnics observations from FROST.
-
-    Keeps the first observation per (datastream, phenomenonTime, result)
-    and deletes the rest.
-    """
-    import requests as req
-
-    prefix = settings.entity_name_prefix
-    base = client._http.primary_base_url
-    headers = client._headers()
-
-    # Find all Ohnics datastreams
-    resp = req.get(
-        f"{base}/Datastreams",
-        params={"$filter": f"startswith(name,'{prefix}Ohnics')", "$select": "@iot.id,name", "$top": "200"},
-        headers=headers, timeout=30,
-    )
-    resp.raise_for_status()
-    datastreams = resp.json().get("value", [])
-
-    total_deleted = 0
-    details = []
-    for ds in datastreams:
-        ds_id = str(ds["@iot.id"])
-        obs_resp = req.get(
-            f"{base}/Datastreams({ds_id})/Observations",
-            params={"$select": "@iot.id,phenomenonTime,result", "$orderby": "@iot.id asc", "$top": "1000"},
-            headers=headers, timeout=30,
-        )
-        obs_resp.raise_for_status()
-        observations = obs_resp.json().get("value", [])
-
-        seen: set[str] = set()
-        duplicates = []
-        for obs in observations:
-            key = f"{obs['phenomenonTime']}|{obs['result']}"
-            if key in seen:
-                duplicates.append(str(obs["@iot.id"]))
-            else:
-                seen.add(key)
-
-        for dup_id in duplicates:
-            del_resp = req.delete(f"{base}/Observations({dup_id})", headers=headers, timeout=30)
-            if del_resp.status_code in (200, 204):
-                total_deleted += 1
-
-        if duplicates:
-            details.append({"datastream": ds["name"], "deleted": len(duplicates)})
-
-    return {"total_deleted": total_deleted, "datastreams_cleaned": len(details), "details": details}
-
-
 # --- Sensor metadata & image endpoints ---
 
 _ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
