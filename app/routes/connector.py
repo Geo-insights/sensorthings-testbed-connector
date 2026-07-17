@@ -332,27 +332,51 @@ def ohnics_cleanup_duplicates() -> dict:
     return result
 
 
-@router.get("/debug-find")
-def debug_find_by_name(name: str = Query(...), path: str = Query(default="/Datastreams")) -> dict:
-    """Debug: test find_by_name against FROST."""
+@router.get("/debug-seed")
+def debug_seed() -> dict:
+    """Debug: test _seed_timestamps_from_frost."""
     import requests as req
 
     base = client._http.primary_base_url
     headers = client._headers()
+    prefix = settings.entity_name_prefix
 
-    # Raw query
-    filter_str = f"name eq '{name}'"
+    # Get first 2 Ohnics datastreams
     resp = req.get(
-        f"{base}{path}",
-        params={"$filter": filter_str, "$top": "3", "$select": "@iot.id,name"},
+        f"{base}/Datastreams",
+        params={"$filter": f"startswith(name,'{prefix}Ohnics')", "$top": "2"},
         headers=headers, timeout=15,
     )
-    raw = resp.json() if resp.ok else {"error": resp.status_code, "body": resp.text[:500]}
+    datastreams = resp.json().get("value", []) if resp.ok else []
 
-    # Via entity_manager
-    found_id = client._entity_manager.find_by_name(path, name)
+    debug = []
+    for ds in datastreams:
+        ds_id = ds.get("@iot.id")
+        props = ds.get("properties", {})
 
-    return {"filter": filter_str, "found_id": found_id, "raw_response": raw}
+        obs_resp = req.get(
+            f"{base}/Datastreams({ds_id})/Observations",
+            params={"$orderby": "phenomenonTime desc", "$top": "1", "$select": "phenomenonTime"},
+            headers=headers, timeout=15,
+        )
+        obs_raw = obs_resp.json() if obs_resp.ok else {"error": obs_resp.status_code}
+
+        debug.append({
+            "ds_id": ds_id,
+            "ds_name": ds.get("name"),
+            "props": props,
+            "obs_response": obs_raw,
+        })
+
+    # Also run the actual seed function
+    from app.main import _seed_timestamps_from_frost
+    timestamps = _seed_timestamps_from_frost("Ohnics")
+
+    return {
+        "datastream_debug": debug,
+        "seed_result_count": len(timestamps),
+        "seed_sample": {k: v.isoformat() for k, v in list(timestamps.items())[:4]},
+    }
 
 
 # --- Sensor metadata & image endpoints ---
