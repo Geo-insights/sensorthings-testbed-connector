@@ -1295,7 +1295,7 @@ class SensorThingsClient:
                 except ValueError:
                     things_body = {}
                 if isinstance(things_body, dict):
-                    things_count = things_body.get("@iot.count") or things_body.get("count")
+                    things_count = things_body.get("@iot.count") or things_body.get("@count") or things_body.get("count")
 
             return {
                 "mode": "live",
