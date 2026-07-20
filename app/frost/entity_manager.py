@@ -6,12 +6,17 @@ Provides idempotent get-or-create semantics with cache integration.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from app.frost.cache import EntityCache
 from app.frost.http_client import FrostHTTPClient
 
 logger = logging.getLogger(__name__)
+
+# Cached entity IDs are assumed valid for this many seconds without re-checking
+# against the FROST server. Avoids an HTTP GET per entity on every registration.
+_VALIDATION_TTL_SECONDS = 600  # 10 minutes
 
 
 class EntityManager:
@@ -20,6 +25,8 @@ class EntityManager:
     def __init__(self, http: FrostHTTPClient, cache: EntityCache) -> None:
         self._http = http
         self._cache = cache
+        # In-memory only: tracks when each (collection, name) was last validated
+        self._validated_at: dict[str, float] = {}
 
     # -- Lookup ------------------------------------------------------------
 
@@ -57,14 +64,31 @@ class EntityManager:
             return None
         return self._http.extract_first_iot_id(body)
 
-    def cached_id_matches(self, path: str, entity_id: str, expected_name: str | None) -> bool:
-        """Verify that a cached entity ID still maps to the expected name on the server."""
+    def cached_id_matches(
+        self, path: str, entity_id: str, expected_name: str | None, cache_key: str = ""
+    ) -> bool:
+        """Verify that a cached entity ID still maps to the expected name on the server.
+
+        Skips the HTTP check when the entry was validated less than
+        ``_VALIDATION_TTL_SECONDS`` ago (avoids ~30 redundant GETs per cycle).
+        """
         if not expected_name:
             return True
+        # Fast path: recently validated
+        vkey = f"{path}:{cache_key or entity_id}"
+        last = self._validated_at.get(vkey)
+        if last is not None and (time.monotonic() - last) < _VALIDATION_TTL_SECONDS:
+            return True
+        # Slow path: actually check the server
         entity = self.fetch_by_id(path, entity_id)
         if not entity:
+            self._validated_at.pop(vkey, None)
             return False
-        return str(entity.get("name", "")).strip() == expected_name.strip()
+        if str(entity.get("name", "")).strip() != expected_name.strip():
+            self._validated_at.pop(vkey, None)
+            return False
+        self._validated_at[vkey] = time.monotonic()
+        return True
 
     # -- Idempotent create -------------------------------------------------
 
@@ -83,7 +107,7 @@ class EntityManager:
         cached_id = self._cache.get(collection, name)
         if cached_id:
             expected_name = str(payload.get("name", "")).strip() or None
-            if self.cached_id_matches(path, cached_id, expected_name):
+            if self.cached_id_matches(path, cached_id, expected_name, cache_key=name):
                 return cached_id, "cached"
             self._cache.drop(collection, name)
 

@@ -290,6 +290,9 @@ class Settings:
     levellog_client_secret: str = os.getenv("LEVELLOG_CLIENT_SECRET", "").strip()
     levellog_installation_ids: str = os.getenv("LEVELLOG_INSTALLATION_IDS", "").strip()
     levellog_poll_seconds: int = int(os.getenv("LEVELLOG_POLL_SECONDS", "900"))
+    # --- Monitoring module direct push ---
+    monitoring_push_url: str = os.getenv("MONITORING_PUSH_URL", "").strip().rstrip("/")
+    monitoring_push_key: str = os.getenv("MONITORING_PUSH_KEY", "").strip()
 
 
 settings = Settings()

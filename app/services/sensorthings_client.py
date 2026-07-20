@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -1428,6 +1429,36 @@ class SensorThingsClient:
         stack = self._target_stack_for_url(base_url)
         return stack.is_v2 if stack else False
 
+    def _push_single_observation(
+        self, endpoint: str, payload: dict[str, Any], datastream_id: str, sensor_id: str,
+    ) -> dict[str, Any]:
+        """POST one observation with retry. Thread-safe (uses session internally)."""
+        try:
+            response = self._post_observation(endpoint, payload, datastream_id)
+        except (ObservationUploadError, requests.RequestException) as exc:
+            last_status = getattr(exc, "last_status", None) or getattr(getattr(exc, "response", None), "status_code", None)
+            health_monitor.record_failure(datastream_id, str(exc))
+            logger.error(
+                "Final observation push failure",
+                extra={"timestamp": datetime.now(UTC).isoformat(), "datastream_id": datastream_id, "status_code": last_status},
+            )
+            self._write_failed_observation(
+                {"timestamp": datetime.now(UTC).isoformat(), "datastream_id": datastream_id, "endpoint": endpoint, "payload": payload, "status_code": last_status, "error": str(exc)},
+            )
+            return {"sensor_id": sensor_id, "datastream_id": datastream_id, "status_code": last_status, "ok": False, "error": str(exc)}
+
+        if response.ok:
+            health_monitor.record_success(datastream_id)
+        else:
+            logger.error(
+                "Final observation push failure",
+                extra={"timestamp": datetime.now(UTC).isoformat(), "datastream_id": datastream_id, "status_code": response.status_code},
+            )
+            self._write_failed_observation(
+                {"timestamp": datetime.now(UTC).isoformat(), "datastream_id": datastream_id, "endpoint": endpoint, "payload": payload, "status_code": response.status_code, "body": response.text[:500]},
+            )
+        return {"sensor_id": sensor_id, "datastream_id": datastream_id, "status_code": response.status_code, "ok": response.ok, "body": response.text[:500]}
+
     def push_observations(self, readings: list[SensorReading]) -> dict[str, Any]:
         preview = self.build_preview(readings)
         base_urls = self._base_urls()
@@ -1446,11 +1477,13 @@ class SensorThingsClient:
             endpoint = self._endpoint_for_base_url(base_url, settings.observations_path)
             is_v2 = self._is_v2_url(base_url)
             stack = self._target_stack_for_url(base_url)
-            results: list[dict[str, Any]] = []
-            sent = 0
+
+            # Phase 1: resolve datastream IDs and build payloads (sequential,
+            # touches caches)
+            tasks: list[tuple[str, dict[str, Any], str, str]] = []  # (endpoint, payload, ds_id, sensor_id)
+            unresolved: list[dict[str, Any]] = []
             for reading in readings:
                 datastream_id = None
-                # For non-primary targets, resolve via the target's own cache/stack
                 if stack and stack.base_url != (self._primary_base_url() or ""):
                     ds_key = self._datastream_key(reading.sensor_id, reading.observed_property)
                     datastream_id = stack.cache.get("datastreams", ds_key)
@@ -1463,12 +1496,8 @@ class SensorThingsClient:
                 if not datastream_id:
                     datastream_id = self._resolve_datastream_id_live(base_url, reading)
                 if not datastream_id:
-                    results.append(
-                        {
-                            "sensor_id": reading.sensor_id,
-                            "ok": False,
-                            "message": "No datastream mapping available for this sensor; dynamic lookup also failed.",
-                        }
+                    unresolved.append(
+                        {"sensor_id": reading.sensor_id, "ok": False, "message": "No datastream mapping available for this sensor; dynamic lookup also failed."}
                     )
                     continue
 
@@ -1488,102 +1517,35 @@ class SensorThingsClient:
                         "stream_key": reading.stream_key,
                     },
                 }
-
-                # Adapt payload for v2.0 targets
                 if is_v2:
                     payload = adapt_observation_payload(payload)
+                tasks.append((endpoint, payload, datastream_id, reading.sensor_id))
 
-                try:
-                    response = self._post_observation(endpoint, payload, datastream_id)
-                except (ObservationUploadError, requests.RequestException) as exc:
-                    last_status = getattr(exc, "last_status", None) or getattr(getattr(exc, "response", None), "status_code", None)
-                    health_monitor.record_failure(datastream_id, str(exc))
-                    logger.error(
-                        "Final observation push failure",
-                        extra={
-                            "timestamp": datetime.now(UTC).isoformat(),
-                            "datastream_id": datastream_id,
-                            "status_code": last_status,
-                        },
-                    )
-                    self._write_failed_observation(
-                        {
-                            "timestamp": datetime.now(UTC).isoformat(),
-                            "datastream_id": datastream_id,
-                            "endpoint": endpoint,
-                            "payload": payload,
-                            "status_code": last_status,
-                            "error": str(exc),
-                        }
-                    )
-                    results.append(
-                        {
-                            "sensor_id": reading.sensor_id,
-                            "datastream_id": datastream_id,
-                            "status_code": last_status,
-                            "ok": False,
-                            "error": str(exc),
-                        }
-                    )
-                    continue
-
-                sent += 1
-                if response.ok:
-                    health_monitor.record_success(datastream_id)
-                results.append(
-                    {
-                        "sensor_id": reading.sensor_id,
-                        "datastream_id": datastream_id,
-                        "status_code": response.status_code,
-                        "ok": response.ok,
-                        "body": response.text[:500],
+            # Phase 2: POST observations in parallel
+            results: list[dict[str, Any]] = list(unresolved)
+            sent = 0
+            if tasks:
+                with ThreadPoolExecutor(max_workers=min(10, len(tasks))) as pool:
+                    futures = {
+                        pool.submit(self._push_single_observation, ep, pl, ds_id, sid): ds_id
+                        for ep, pl, ds_id, sid in tasks
                     }
-                )
-                if not response.ok:
-                    logger.error(
-                        "Final observation push failure",
-                        extra={
-                            "timestamp": datetime.now(UTC).isoformat(),
-                            "datastream_id": datastream_id,
-                            "status_code": response.status_code,
-                        },
-                    )
-                    self._write_failed_observation(
-                        {
-                            "timestamp": datetime.now(UTC).isoformat(),
-                            "datastream_id": datastream_id,
-                            "endpoint": endpoint,
-                            "payload": payload,
-                            "status_code": response.status_code,
-                            "body": response.text[:500],
-                        }
-                    )
+                    for future in as_completed(futures):
+                        result = future.result()
+                        results.append(result)
+                        if result.get("ok"):
+                            sent += 1
 
             endpoint_results.append(
-                {
-                    "base_url": base_url,
-                    "endpoint": endpoint,
-                    "sent": sent,
-                    "results": results,
-                }
+                {"base_url": base_url, "endpoint": endpoint, "sent": sent, "results": results}
             )
             total_sent += sent
 
         if len(endpoint_results) == 1:
             only = endpoint_results[0]
-            return {
-                "mode": "live",
-                "endpoint": only["endpoint"],
-                "sent": only["sent"],
-                "results": only["results"],
-            }
+            return {"mode": "live", "endpoint": only["endpoint"], "sent": only["sent"], "results": only["results"]}
 
-        return {
-            "mode": "live",
-            "multi_target": True,
-            "sent": total_sent,
-            "targets": endpoint_results,
-        }
+        return {"mode": "live", "multi_target": True, "sent": total_sent, "targets": endpoint_results}
 
 
 client = SensorThingsClient()
