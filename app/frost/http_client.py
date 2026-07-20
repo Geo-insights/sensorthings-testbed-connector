@@ -35,6 +35,9 @@ class FrostHTTPClient:
         self._auth_password = auth_password
         self._auth_token = auth_token
         self._timeout = timeout
+        # Reuse TCP connections (TLS handshake, keep-alive) across requests
+        self._session = requests.Session()
+        self._session.headers.update(self.headers())
 
     # -- URL helpers -------------------------------------------------------
 
@@ -71,19 +74,19 @@ class FrostHTTPClient:
 
     def get(self, url: str, params: dict[str, str] | None = None) -> requests.Response:
         try:
-            return requests.get(url, params=params, headers=self.headers(), timeout=self._timeout)
+            return self._session.get(url, params=params, timeout=self._timeout)
         except requests.RequestException as exc:
             raise FrostConnectionError(url, cause=exc) from exc
 
     def post(self, url: str, payload: dict[str, Any]) -> requests.Response:
         try:
-            return requests.post(url, json=payload, headers=self.headers(), timeout=self._timeout)
+            return self._session.post(url, json=payload, timeout=self._timeout)
         except requests.RequestException as exc:
             raise FrostConnectionError(url, cause=exc) from exc
 
     def patch(self, url: str, payload: dict[str, Any]) -> requests.Response:
         try:
-            return requests.patch(url, json=payload, headers=self.headers(), timeout=self._timeout)
+            return self._session.patch(url, json=payload, timeout=self._timeout)
         except requests.RequestException as exc:
             raise FrostConnectionError(url, cause=exc) from exc
 
@@ -139,7 +142,7 @@ class FrostHTTPClient:
 
         for attempt in range(1, max_attempts + 1):
             try:
-                response = requests.post(url, json=payload, headers=self.headers(), timeout=self._timeout)
+                response = self._session.post(url, json=payload, timeout=self._timeout)
                 last_response = response
                 if response.ok:
                     return response

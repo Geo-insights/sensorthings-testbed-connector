@@ -29,6 +29,8 @@ def _kafka_push_cycle(max_messages: int = 500, timeout: float = 5.0) -> dict:
         return {"pulled": 0}
     readings = avro_batch_to_sensor_readings(records)
     result = client.push_observations(readings)
+    # Forward to monitoring module (fire-and-forget)
+    _push_to_monitoring(readings)
     return {"pulled": len(records), "mapped": len(readings), "pushed": result.get("total_sent", 0)}
 
 
@@ -47,6 +49,51 @@ async def _kafka_ingest_loop():
         except Exception:
             logger.exception("Kafka ingest cycle failed")
         await asyncio.sleep(poll_seconds)
+
+
+def _push_to_monitoring(readings: list) -> None:
+    """Fire-and-forget push of readings to the monitoring module.
+
+    Runs after observations are successfully pushed to FROST. Failures are
+    logged but never block the main ingest loop.
+    """
+    if not settings.monitoring_push_url or not settings.monitoring_push_key:
+        return
+    import requests as req
+
+    base_url = client._http.primary_base_url or ""
+    payload = {
+        "readings": [
+            {
+                "server_url": base_url,
+                "datastream_id": str(
+                    client._datastream_ids.get(
+                        f"{r.sensor_id}::{r.observed_property}", ""
+                    )
+                ),
+                "value": r.value,
+                "timestamp": r.timestamp.isoformat().replace("+00:00", "Z"),
+                "quality": getattr(r, "quality", "good") or "good",
+            }
+            for r in readings
+            if client._datastream_ids.get(f"{r.sensor_id}::{r.observed_property}")
+        ],
+    }
+    if not payload["readings"]:
+        return
+    try:
+        resp = req.post(
+            f"{settings.monitoring_push_url}/readings/push",
+            json=payload,
+            headers={"X-Connector-Key": settings.monitoring_push_key},
+            timeout=10,
+        )
+        if resp.ok:
+            logger.debug("Monitoring push: %d readings forwarded", len(payload["readings"]))
+        else:
+            logger.warning("Monitoring push failed: %s %s", resp.status_code, resp.text[:200])
+    except Exception:
+        logger.warning("Monitoring push failed (connection error)", exc_info=True)
 
 
 def _dedup_readings(
@@ -149,30 +196,55 @@ async def _polling_ingest_loop(source):
 
     poll_seconds = source.poll_interval()
     logger.info("Polling loop started for %s (every %ds)", source.source_name, poll_seconds)
+
+    # Eager registration: register entities before the first data fetch so we
+    # don't lose readings if the first fetch succeeds but registration would
+    # have been the next step.
     entities_registered = False
+    entity_sets = source.entity_sets()
+    if entity_sets:
+        for attempt in range(1, 4):
+            try:
+                logger.info("%s: eagerly registering %d entity sets in FROST (attempt %d)", source.source_name, len(entity_sets), attempt)
+                for entity_set in entity_sets:
+                    await run_in_threadpool(client.register_entity_set, entity_set)
+                entities_registered = True
+                break
+            except Exception:
+                logger.exception("%s: eager registration attempt %d failed", source.source_name, attempt)
+                if attempt < 3:
+                    await asyncio.sleep(10)
+    else:
+        logger.info("%s: no static entity sets; will register on first data fetch", source.source_name)
+
     # Seed from FROST so we don't re-push observations after a restart
     last_timestamps = await run_in_threadpool(
         _seed_timestamps_from_frost, source.source_name.capitalize()
     )
+
     while True:
         try:
             readings = await source.fetch_readings()
             if readings:
-                # Register entities in FROST on first successful fetch
+                # If eager registration failed, retry on data arrival
                 if not entities_registered:
                     entity_sets = source.entity_sets()
                     if entity_sets:
-                        logger.info("%s: registering %d entity sets in FROST", source.source_name, len(entity_sets))
-                        for entity_set in entity_sets:
-                            await run_in_threadpool(client.register_entity_set, entity_set)
-                        entities_registered = True
-                    # Re-seed after registration in case this is first deploy
-                    if not last_timestamps:
-                        last_timestamps = await run_in_threadpool(
-                            _seed_timestamps_from_frost, source.source_name.capitalize()
-                        )
+                        try:
+                            logger.info("%s: retrying registration of %d entity sets", source.source_name, len(entity_sets))
+                            for entity_set in entity_sets:
+                                await run_in_threadpool(client.register_entity_set, entity_set)
+                            entities_registered = True
+                            if not last_timestamps:
+                                last_timestamps = await run_in_threadpool(
+                                    _seed_timestamps_from_frost, source.source_name.capitalize()
+                                )
+                        except Exception:
+                            logger.exception("%s: registration retry failed; pushing with cached IDs", source.source_name)
 
-                # Skip readings already pushed in a previous cycle or before restart
+                # Push readings regardless — if datastream IDs are cached from
+                # a previous run, observations can be pushed even before
+                # registration completes.
                 new_readings = _dedup_readings(readings, last_timestamps)
                 if new_readings:
                     result = await run_in_threadpool(client.push_observations, new_readings)
@@ -184,6 +256,8 @@ async def _polling_ingest_loop(source):
                         len(new_readings),
                         result.get("total_sent", 0),
                     )
+                    # Forward to monitoring module (fire-and-forget)
+                    await run_in_threadpool(_push_to_monitoring, new_readings)
                 else:
                     logger.debug("%s: all %d readings already pushed, skipping", source.source_name, len(readings))
         except Exception:
