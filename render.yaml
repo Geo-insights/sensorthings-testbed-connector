@@ -39,3 +39,11 @@ services:
         sync: false
       - key: SENSORTHINGS_AUTH_PASSWORD
         sync: false
+    # Persist the registered-entity caches and dead-letter queue across deploys.
+    # Without this, /app/data is wiped on every redeploy, forcing full
+    # re-registration and a window where pushes fall back to the wrong target's
+    # datastream IDs (422s). Mounting a disk keeps entities_*.json durable.
+    disk:
+      name: connector-data
+      mountPath: /app/data
+      sizeGB: 1
