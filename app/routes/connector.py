@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter
 from fastapi import HTTPException
@@ -122,7 +123,7 @@ def create_task(request: TaskingTaskCreateRequest) -> dict:
 
 @router.get("/tasking/tasks")
 def list_tasks(
-    site_key: str = Query(..., pattern="^(tgv|blijdorp)$"),
+    site_key: Literal["tgv", "blijdorp"] = Query(...),
     capability_key: str | None = None,
     top: int = Query(20, ge=1, le=200),
 ) -> dict:
