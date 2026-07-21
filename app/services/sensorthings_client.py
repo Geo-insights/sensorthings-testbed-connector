@@ -17,7 +17,7 @@ from app.exceptions import (
 from app.frost.cache import EntityCache
 from app.frost.circuit_breaker import CircuitBreaker
 from app.frost.entity_manager import EntityManager
-from app.frost.http_client import FrostHTTPClient
+from app.frost.http_client import FrostHTTPClient, is_retryable_status
 from app.frost.target_stack import TargetStack
 from app.frost.v2_adapter import adapt_datastream_payload, adapt_observation_payload, adapt_payload
 from app.models import (
@@ -1271,6 +1271,12 @@ class SensorThingsClient:
                 results.append({"datastream_id": datastream_id, "ok": True, "status_code": response.status_code, "duplicate": True})
                 continue
 
+            # Permanent client error (bad payload / unknown datastream) — drop it
+            # from the queue instead of retrying it on every replay pass forever.
+            if not is_retryable_status(response.status_code):
+                results.append({"datastream_id": datastream_id, "ok": False, "status_code": response.status_code, "dropped": True})
+                continue
+
             kept_lines.append(line)
             results.append({"datastream_id": datastream_id, "ok": False, "status_code": response.status_code})
 
@@ -1278,6 +1284,7 @@ class SensorThingsClient:
         return {
             "mode": "live" if settings.sensorthings_base_url else "preview",
             "replayed": sum(1 for result in results if result["ok"]),
+            "dropped": sum(1 for result in results if result.get("dropped")),
             "remaining": len(kept_lines),
             "results": results,
         }
@@ -1486,6 +1493,23 @@ class SensorThingsClient:
 
         if response.ok:
             health_monitor.record_success(datastream_id)
+        elif response.status_code == 409:
+            # Duplicate — the observation is already on the server. Treat as a
+            # success and don't dead-letter it.
+            health_monitor.record_success(datastream_id)
+            return {"sensor_id": sensor_id, "datastream_id": datastream_id, "status_code": 409, "ok": True, "duplicate": True}
+        elif not is_retryable_status(response.status_code):
+            # Permanent client error (bad payload / unknown datastream). Drop it
+            # instead of dead-lettering so the replay loop can't retry it forever.
+            health_monitor.record_failure(datastream_id, f"dropped status {response.status_code}")
+            logger.warning(
+                "Observation dropped (datastream=%s status=%s endpoint=%s) — non-retryable, not dead-lettered: %s",
+                datastream_id,
+                response.status_code,
+                endpoint,
+                response.text[:200],
+            )
+            return {"sensor_id": sensor_id, "datastream_id": datastream_id, "status_code": response.status_code, "ok": False, "dropped": True, "body": response.text[:500]}
         else:
             logger.error(
                 "Final observation push failure (datastream=%s status=%s endpoint=%s)",
@@ -1586,18 +1610,27 @@ class SensorThingsClient:
         per_obs_endpoint = self._endpoint_for_base_url(base_url, settings.observations_path)
         for i, (ds_id, payload, sensor_id) in enumerate(flat):
             entry = entries[i] if i < len(entries) else None
-            failed = (not response.ok) or (isinstance(entry, str) and entry.lower().startswith("error"))
-            if failed:
-                error = str(entry) if entry else f"batch status {response.status_code}"
-                health_monitor.record_failure(ds_id, error)
-                self._write_failed_observation(
-                    {"timestamp": datetime.now(UTC).isoformat(), "datastream_id": ds_id, "endpoint": per_obs_endpoint, "payload": payload, "status_code": response.status_code, "error": error},
-                )
-                results.append({"sensor_id": sensor_id, "datastream_id": ds_id, "status_code": response.status_code, "ok": False, "error": error})
-            else:
+            entry_error = isinstance(entry, str) and entry.lower().startswith("error")
+            failed = (not response.ok) or entry_error
+            if not failed:
                 health_monitor.record_success(ds_id)
                 sent += 1
                 results.append({"sensor_id": sensor_id, "datastream_id": ds_id, "status_code": response.status_code, "ok": True})
+                continue
+
+            error = str(entry) if entry else f"batch status {response.status_code}"
+            health_monitor.record_failure(ds_id, error)
+            # Per-entry errors are validation failures, and a non-retryable HTTP
+            # status is a permanent client error — drop both instead of
+            # dead-lettering them for the replay loop to retry forever.
+            permanent = entry_error or (not response.ok and not is_retryable_status(response.status_code))
+            if permanent:
+                results.append({"sensor_id": sensor_id, "datastream_id": ds_id, "status_code": response.status_code, "ok": False, "dropped": True, "error": error})
+                continue
+            self._write_failed_observation(
+                {"timestamp": datetime.now(UTC).isoformat(), "datastream_id": ds_id, "endpoint": per_obs_endpoint, "payload": payload, "status_code": response.status_code, "error": error},
+            )
+            results.append({"sensor_id": sensor_id, "datastream_id": ds_id, "status_code": response.status_code, "ok": False, "error": error})
 
         if sent < len(flat):
             logger.warning(
