@@ -34,6 +34,23 @@ from app.sources.climate_adaptation import CLIMATE_ADAPTATION_ENTITY_SETS
 
 logger = logging.getLogger(__name__)
 
+
+def _as_quality_list(quality: Any) -> Any:
+    """Coerce a scalar resultQuality into a list.
+
+    The STA spec types resultQuality as Any, but some servers (e.g. the
+    collaborall.net custom server) reject scalars with
+    "The result quality field must be an array." Standard FROST accepts the
+    list form too, so we always send an array. Mirrors the coercion already
+    done in app/sta/models.py.
+    """
+    if quality is None:
+        return None
+    if isinstance(quality, list):
+        return quality
+    return [quality]
+
+
 # Per-target circuit breaker shared by push + replay paths.
 observation_breaker = CircuitBreaker(
     failure_threshold=settings.frost_cb_failure_threshold,
@@ -1684,7 +1701,7 @@ class SensorThingsClient:
                 payload = {
                     "phenomenonTime": reading.timestamp.isoformat().replace("+00:00", "Z"),
                     "result": reading.value,
-                    "resultQuality": reading.quality,
+                    "resultQuality": _as_quality_list(reading.quality),
                     "Datastream": {"@iot.id": datastream_id},
                     "parameters": {
                         "sensor_id": reading.sensor_id,
