@@ -18,6 +18,20 @@ from app.exceptions import FrostConnectionError, FrostRequestError, ObservationU
 
 logger = logging.getLogger(__name__)
 
+# 4xx statuses that are worth retrying: request timeout, too-early, rate-limit.
+# Every other 4xx is a permanent client error (bad payload, unknown datastream,
+# auth) that will never succeed on retry, so we fail fast instead.
+_RETRYABLE_CLIENT_STATUS = frozenset({408, 425, 429})
+
+
+def is_retryable_status(status_code: int | None) -> bool:
+    """True when an HTTP status is worth retrying (transient / server-side)."""
+    if status_code is None:
+        return True  # network-level failure — no response received
+    if status_code >= 500:
+        return True
+    return status_code in _RETRYABLE_CLIENT_STATUS
+
 
 class FrostHTTPClient:
     """Low-level HTTP client for FROST server interactions."""
@@ -145,6 +159,16 @@ class FrostHTTPClient:
                 response = self._session.post(url, json=payload, timeout=self._timeout)
                 last_response = response
                 if response.ok:
+                    return response
+                if not is_retryable_status(response.status_code):
+                    # Permanent client error — retrying is pointless and just
+                    # spams the log with attempt 2/3, 3/3. Fail fast.
+                    logger.warning(
+                        "Observation push rejected (datastream=%s status=%s url=%s) — non-retryable, giving up",
+                        datastream_id,
+                        response.status_code,
+                        url,
+                    )
                     return response
                 logger.warning(
                     "Observation push failed (datastream=%s status=%s attempt=%d/%d url=%s)",

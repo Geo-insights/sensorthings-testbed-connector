@@ -311,8 +311,9 @@ async def _failed_replay_loop():
             )
             replayed = summary.get("replayed", 0)
             remaining = summary.get("remaining", 0)
-            if replayed or remaining:
-                logger.info("DLQ replay: %s replayed, %s remaining", replayed, remaining)
+            dropped = summary.get("dropped", 0)
+            if replayed or remaining or dropped:
+                logger.info("DLQ replay: %s replayed, %s dropped, %s remaining", replayed, dropped, remaining)
         except Exception:
             logger.exception("DLQ replay pass failed")
 
