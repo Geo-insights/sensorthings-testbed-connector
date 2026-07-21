@@ -46,20 +46,20 @@ class AsyncAPIClient:
                     await asyncio.sleep(wait)
         return None  # unreachable
 
-    async def post(self, path: str, data: dict[str, Any] | str | None = None, json_body: Any = None) -> Any:
+    async def post(self, path: str, data: dict[str, Any] | str | None = None, json_body: Any = None, params: dict[str, Any] | None = None) -> Any:
         """POST request with retries. Returns parsed JSON."""
         url = f"{self._base_url}{path}" if self._base_url else path
         async with httpx.AsyncClient(verify=self._verify_ssl, timeout=self._timeout) as client:
             for attempt in range(1, self._max_retries + 1):
                 try:
                     if json_body is not None:
-                        resp = await client.post(url, json=json_body, headers=self._headers)
+                        resp = await client.post(url, json=json_body, params=params, headers=self._headers)
                     elif isinstance(data, str):
-                        resp = await client.post(url, content=data.encode(), headers=self._headers)
+                        resp = await client.post(url, content=data.encode(), params=params, headers=self._headers)
                     elif isinstance(data, dict):
-                        resp = await client.post(url, data=data, headers=self._headers)
+                        resp = await client.post(url, data=data, params=params, headers=self._headers)
                     else:
-                        resp = await client.post(url, headers=self._headers)
+                        resp = await client.post(url, params=params, headers=self._headers)
                     resp.raise_for_status()
                     return resp.json()
                 except (httpx.HTTPStatusError, httpx.RequestError) as exc:

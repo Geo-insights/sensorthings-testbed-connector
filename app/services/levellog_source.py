@@ -28,7 +28,9 @@ class LevellogPollingSource(PollingSource):
             scope="service.external",
         )
         self._base_url = settings.levellog_api_url
-        self._installation_ids = _parse_installation_ids(settings.levellog_installation_ids)
+        # Per-installation config: {id, name, lat, lon}. Falls back (in config.py)
+        # to LEVELLOG_INSTALLATION_IDS when LEVELLOG_INSTALLATIONS_JSON is unset.
+        self._installations = list(settings.levellog_installations)
         self._last_fetch: dict[str, datetime] = {}
 
     def is_enabled(self) -> bool:
@@ -40,15 +42,21 @@ class LevellogPollingSource(PollingSource):
     def entity_sets(self) -> list[dict[str, Any]]:
         """Return entity sets for configured installations."""
         sets: list[dict[str, Any]] = []
-        for inst_id in self._installation_ids:
-            name = inst_id[:8]  # short name from UUID
-            sets.append(build_entity_set(name, inst_id))
+        for inst in self._installations:
+            inst_id = str(inst["id"])
+            name = str(inst.get("name") or inst_id[:8])
+            lat = inst.get("lat")
+            lon = inst.get("lon")
+            if lat is not None and lon is not None:
+                sets.append(build_entity_set(name, inst_id, lat=float(lat), lon=float(lon)))
+            else:
+                sets.append(build_entity_set(name, inst_id))
         return sets
 
     async def fetch_readings(self) -> list[SensorReading]:
         """Fetch latest groundwater readings from CARS API."""
-        if not self._installation_ids:
-            logger.warning("Levellog: no installation IDs configured")
+        if not self._installations:
+            logger.warning("Levellog: no installations configured")
             return []
 
         token = await self._oauth.get_token()
@@ -62,48 +70,51 @@ class LevellogPollingSource(PollingSource):
         )
 
         all_readings: list[SensorReading] = []
-        for inst_id in self._installation_ids:
-            readings = await self._fetch_installation(client, inst_id)
+        for inst in self._installations:
+            readings = await self._fetch_installation(client, inst)
             all_readings.extend(readings)
 
         if all_readings:
-            logger.info("Levellog: fetched %d readings from %d installation(s)", len(all_readings), len(self._installation_ids))
+            logger.info(
+                "Levellog: fetched %d readings from %d installation(s)",
+                len(all_readings),
+                len(self._installations),
+            )
         return all_readings
 
     async def _fetch_installation(
-        self, client: AsyncAPIClient, installation_id: str
+        self, client: AsyncAPIClient, inst: dict[str, Any]
     ) -> list[SensorReading]:
-        """Fetch readings for a single installation."""
-        # Query data since last fetch (or last 24h on first run)
+        """Fetch readings for a single installation.
+
+        Per the CARS REST API: POST /api/normalizedlogdata/{installationId}
+        with ``startDate``/``endDate``/``amountOfEntries`` as query parameters
+        and a JSON array body of variable names to include (empty = all).
+        """
+        installation_id = str(inst["id"])
+        name = str(inst.get("name") or installation_id[:8])
+
+        # Query data since last fetch (or last 24h on first run).
         since = self._last_fetch.get(installation_id, datetime.now(UTC) - timedelta(hours=24))
         now = datetime.now(UTC)
 
         try:
-            # POST /api/normalizedlogdata/{installationId}
-            # Body typically contains date range filters
-            body = {
-                "from": since.isoformat(),
-                "till": now.isoformat(),
-            }
             data = await client.post(
                 f"/api/normalizedlogdata/{installation_id}",
-                json_body=body,
+                params={
+                    "startDate": since.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "endDate": now.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "amountOfEntries": 1000,
+                },
+                json_body=[],
             )
         except Exception:
             logger.exception("Levellog: failed to fetch data for installation %s", installation_id)
             return []
 
-        name = installation_id[:8]
         readings = parse_logdata_readings(data, installation_id, name)
 
         if readings:
             self._last_fetch[installation_id] = now
 
         return readings
-
-
-def _parse_installation_ids(raw: str) -> list[str]:
-    """Parse comma-separated installation IDs."""
-    if not raw.strip():
-        return []
-    return [item.strip() for item in raw.split(",") if item.strip()]
