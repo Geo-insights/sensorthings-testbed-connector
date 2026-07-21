@@ -293,6 +293,16 @@ class Settings:
     # --- Monitoring module direct push ---
     monitoring_push_url: str = os.getenv("MONITORING_PUSH_URL", "").strip().rstrip("/")
     monitoring_push_key: str = os.getenv("MONITORING_PUSH_KEY", "").strip()
+    # --- Observation push reliability ---
+    # Batch pushes via the SensorThings CreateObservations (dataArray) extension.
+    frost_batch_push_enabled: bool = os.getenv("FROST_BATCH_PUSH_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    # Circuit breaker: skip a target after N consecutive failed push cycles.
+    frost_cb_failure_threshold: int = int(os.getenv("FROST_CB_FAILURE_THRESHOLD", "3"))
+    frost_cb_cooldown_seconds: float = field(default_factory=lambda: _load_float("FROST_CB_COOLDOWN_SECONDS", "600"))
+    # Scheduled replay of the failed-observations dead-letter queue.
+    failed_replay_enabled: bool = os.getenv("FAILED_REPLAY_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    failed_replay_interval_seconds: int = int(os.getenv("FAILED_REPLAY_INTERVAL_SECONDS", "900"))
+    failed_replay_max_lines: int = int(os.getenv("FAILED_REPLAY_MAX_LINES", "500"))
 
 
 settings = Settings()
