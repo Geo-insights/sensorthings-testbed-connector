@@ -342,6 +342,11 @@ class Settings:
     # --- Observation push reliability ---
     # Batch pushes via the SensorThings CreateObservations (dataArray) extension.
     frost_batch_push_enabled: bool = os.getenv("FROST_BATCH_PUSH_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    # Cap observations per CreateObservations request so a large backlog doesn't
+    # exceed the server timeout (a 4500-obs batch read-times-out at 15s).
+    frost_batch_max_observations: int = int(os.getenv("FROST_BATCH_MAX_OBSERVATIONS", "500"))
+    # Batch requests carry many observations, so allow a longer read timeout.
+    frost_batch_timeout_seconds: float = field(default_factory=lambda: _load_float("FROST_BATCH_TIMEOUT_SECONDS", "60"))
     # Circuit breaker: skip a target after N consecutive failed push cycles.
     frost_cb_failure_threshold: int = int(os.getenv("FROST_CB_FAILURE_THRESHOLD", "3"))
     frost_cb_cooldown_seconds: float = field(default_factory=lambda: _load_float("FROST_CB_COOLDOWN_SECONDS", "600"))

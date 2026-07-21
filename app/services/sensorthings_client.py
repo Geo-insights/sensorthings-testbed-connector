@@ -1554,6 +1554,32 @@ class SensorThingsClient:
         if normalized in self._no_batch_targets:
             return None
 
+        # Chunk large batches so one CreateObservations request doesn't exceed
+        # the server timeout (a 4500-obs batch read-times-out at 15s).
+        max_obs = settings.frost_batch_max_observations
+        if max_obs > 0 and len(tasks) > max_obs:
+            total_sent = 0
+            all_results: list[dict[str, Any]] = []
+            for i in range(0, len(tasks), max_obs):
+                outcome = self._push_batch_data_array(base_url, tasks[i:i + max_obs])
+                if outcome is None:
+                    # Target doesn't support the dataArray extension. If nothing
+                    # was sent yet, let the caller fall back to per-observation
+                    # pushes for the whole batch; otherwise dead-letter the rest.
+                    if not all_results:
+                        return None
+                    per_obs_endpoint = self._endpoint_for_base_url(base_url, settings.observations_path)
+                    for _ep, payload, ds_id, sensor_id in tasks[i:]:
+                        self._write_failed_observation(
+                            {"timestamp": datetime.now(UTC).isoformat(), "datastream_id": ds_id, "endpoint": per_obs_endpoint, "payload": payload, "status_code": None, "error": "batch_unsupported_midway"},
+                        )
+                        all_results.append({"sensor_id": sensor_id, "datastream_id": ds_id, "status_code": None, "ok": False, "error": "batch_unsupported_midway"})
+                    break
+                sent_c, res_c = outcome
+                total_sent += sent_c
+                all_results.extend(res_c)
+            return total_sent, all_results
+
         components = ["phenomenonTime", "result", "resultQuality", "parameters"]
         # Group per datastream, preserving order so the response array maps back.
         grouped: dict[str, list[tuple[dict[str, Any], str]]] = {}
@@ -1586,7 +1612,7 @@ class SensorThingsClient:
         url = f"{normalized}/CreateObservations"
         try:
             response = requests.post(
-                url, json=body, headers=self._headers_for_url(base_url), timeout=self._request_timeout()
+                url, json=body, headers=self._headers_for_url(base_url), timeout=settings.frost_batch_timeout_seconds
             )
         except requests.RequestException as exc:
             # Network failure: dead-letter everything for the replay loop.
