@@ -65,39 +65,87 @@ def build_entity_set(
 
 
 def parse_logdata_readings(
-    raw_data: dict[str, Any],
+    raw_data: Any,
     installation_id: str,
     installation_name: str,
 ) -> list[SensorReading]:
-    """Parse CARS normalizedlogdata response into SensorReadings.
+    """Parse a CARS normalizedlogdata response into SensorReadings.
 
-    The CARS API returns time-series data in various formats. This function
-    handles the common structure and extracts water level values.
+    Per the CARS REST API (POST /api/{Type}/{installationId}), the normalized
+    logdata response is a **table**: an array of rows, each row an array of
+    string cells. The first row is the header (column names); the first column
+    is the timestamp and the remaining columns are variable values. We pick the
+    column whose header looks like a water level.
+
+    A legacy list-of-dicts shape is still handled as a fallback so the parser
+    keeps working if a given installation type returns objects instead.
     """
+    prop_def = OBSERVED_PROPERTIES["water_level"]
+
+    def _emit(ts: datetime, value: float) -> SensorReading:
+        return SensorReading(
+            sensor_id=f"tgv-levellog-{installation_id[:8]}",
+            sensor_name=f"Levellog {installation_name} sensor",
+            observed_property="water_level",
+            unit=prop_def["unit"],
+            value=value,
+            timestamp=ts,
+            quality="good",
+            location="tgv",
+            thing_name=f"Levellog {installation_name}",
+            observed_property_name=prop_def["name"],
+        )
+
+    def _parse_ts(raw: Any) -> datetime | None:
+        if raw in (None, ""):
+            return None
+        try:
+            return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
     readings: list[SensorReading] = []
 
-    # The normalized logdata response may contain a list of data points
-    # with timestamps and variable values. Exact structure depends on the
-    # installation type and variables configured.
-    data_points = raw_data if isinstance(raw_data, list) else raw_data.get("data", raw_data.get("value", []))
+    # Preferred shape: array-of-arrays (table with a header row).
+    if isinstance(raw_data, list) and raw_data and isinstance(raw_data[0], list):
+        header = [str(c).strip() for c in raw_data[0]]
+        # Find the value column: header containing "level"/"water"/"stand",
+        # otherwise the first non-timestamp column.
+        value_col = None
+        for idx, col in enumerate(header[1:], start=1):
+            low = col.lower()
+            if any(tok in low for tok in ("level", "water", "grondwater", "stand", "gws")):
+                value_col = idx
+                break
+        if value_col is None and len(header) > 1:
+            value_col = 1
+
+        for row in raw_data[1:]:
+            if not isinstance(row, list) or value_col is None or len(row) <= value_col:
+                continue
+            ts = _parse_ts(row[0])
+            if ts is None:
+                continue
+            try:
+                value = float(str(row[value_col]).replace(",", "."))
+            except (ValueError, TypeError):
+                continue
+            readings.append(_emit(ts, value))
+        return readings
+
+    # Fallback shape: list of dicts (or {"data"/"value": [...]}).
+    data_points = raw_data if isinstance(raw_data, list) else (
+        raw_data.get("data", raw_data.get("value", [])) if isinstance(raw_data, dict) else []
+    )
     if not isinstance(data_points, list):
         return readings
 
-    prop_def = OBSERVED_PROPERTIES["water_level"]
     for point in data_points:
         if not isinstance(point, dict):
             continue
-
-        # Extract timestamp
-        ts_raw = point.get("Timestamp", point.get("timestamp", point.get("DateTime", "")))
-        if not ts_raw:
+        ts = _parse_ts(point.get("Timestamp", point.get("timestamp", point.get("DateTime", ""))))
+        if ts is None:
             continue
-        try:
-            ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
-        except ValueError:
-            continue
-
-        # Extract value — try common field names for water level
         value = None
         for key in ("Value", "value", "Level", "level", "WaterLevel", "NormalizedValue"):
             if key in point:
@@ -106,23 +154,8 @@ def parse_logdata_readings(
                     break
                 except (ValueError, TypeError):
                     continue
-
         if value is None:
             continue
-
-        readings.append(
-            SensorReading(
-                sensor_id=f"tgv-levellog-{installation_id[:8]}",
-                sensor_name=f"Levellog {installation_name} sensor",
-                observed_property="water_level",
-                unit=prop_def["unit"],
-                value=value,
-                timestamp=ts,
-                quality="good",
-                location="tgv",
-                thing_name=f"Levellog {installation_name}",
-                observed_property_name=prop_def["name"],
-            )
-        )
+        readings.append(_emit(ts, value))
 
     return readings

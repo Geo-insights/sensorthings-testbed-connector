@@ -99,6 +99,51 @@ def _load_tgv_device_mapping() -> dict[str, dict[str, str]]:
     return {str(k): dict(v) for k, v in data.items() if isinstance(v, dict)}
 
 
+def _load_levellog_installations() -> tuple[dict[str, object], ...]:
+    """Parse LEVELLOG_INSTALLATIONS_JSON (per-installation name + coordinates).
+
+    Format: [{"id": "<uuid>", "name": "Waterstraat", "lat": 51.99, "lon": 4.37}, ...]
+    Falls back to LEVELLOG_INSTALLATION_IDS (comma-separated ids, no name/coords).
+    """
+    raw = os.getenv("LEVELLOG_INSTALLATIONS_JSON", "").strip()
+    installs: list[dict[str, object]] = []
+    if raw:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            data = []
+        if isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                inst_id = str(item.get("id", "")).strip()
+                if not inst_id:
+                    continue
+                installs.append(
+                    {
+                        "id": inst_id,
+                        "name": str(item.get("name", "")).strip() or inst_id[:8],
+                        "lat": _coerce_float(item.get("lat")),
+                        "lon": _coerce_float(item.get("lon")),
+                    }
+                )
+    if not installs:
+        legacy = os.getenv("LEVELLOG_INSTALLATION_IDS", "").strip()
+        for inst_id in (item.strip() for item in legacy.split(",")):
+            if inst_id:
+                installs.append({"id": inst_id, "name": inst_id[:8], "lat": None, "lon": None})
+    return tuple(installs)
+
+
+def _coerce_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
 def _load_float(name: str, default: str) -> float:
     raw = os.getenv(name, default).strip()
     try:
@@ -289,6 +334,7 @@ class Settings:
     levellog_client_id: str = os.getenv("LEVELLOG_CLIENT_ID", "").strip()
     levellog_client_secret: str = os.getenv("LEVELLOG_CLIENT_SECRET", "").strip()
     levellog_installation_ids: str = os.getenv("LEVELLOG_INSTALLATION_IDS", "").strip()
+    levellog_installations: tuple[dict[str, object], ...] = field(default_factory=_load_levellog_installations)
     levellog_poll_seconds: int = int(os.getenv("LEVELLOG_POLL_SECONDS", "900"))
     # --- Monitoring module direct push ---
     monitoring_push_url: str = os.getenv("MONITORING_PUSH_URL", "").strip().rstrip("/")

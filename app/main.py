@@ -51,6 +51,25 @@ async def _kafka_ingest_loop():
         await asyncio.sleep(poll_seconds)
 
 
+def _resolve_monitoring_datastream_id(reading) -> str | None:
+    """Resolve a reading's FROST datastream id for the primary base URL.
+
+    Mirrors the resolution chain used by ``client.push_observations`` so the
+    monitoring push and the FROST push agree on the same id:
+      sensor_id::observed_property  →  stream_key  →  sensor_id.
+
+    TGV Kafka readings map to pre-existing datastreams by ``stream_key`` (via
+    ``SENSORTHINGS_DATASTREAM_IDS_JSON``), so the sensor_id::op key alone is not
+    enough — the earlier implementation dropped every TGV reading here.
+    """
+    ids = client._datastream_ids or dict(settings.datastream_ids)
+    return (
+        ids.get(client._datastream_key(reading.sensor_id, reading.observed_property))
+        or ids.get(getattr(reading, "stream_key", "") or "")
+        or ids.get(reading.sensor_id)
+    )
+
+
 def _push_to_monitoring(readings: list) -> None:
     """Fire-and-forget push of readings to the monitoring module.
 
@@ -62,23 +81,21 @@ def _push_to_monitoring(readings: list) -> None:
     import requests as req
 
     base_url = client._http.primary_base_url or ""
-    payload = {
-        "readings": [
+    forwarded = []
+    for r in readings:
+        ds_id = _resolve_monitoring_datastream_id(r)
+        if not ds_id:
+            continue
+        forwarded.append(
             {
                 "server_url": base_url,
-                "datastream_id": str(
-                    client._datastream_ids.get(
-                        f"{r.sensor_id}::{r.observed_property}", ""
-                    )
-                ),
+                "datastream_id": str(ds_id),
                 "value": r.value,
                 "timestamp": r.timestamp.isoformat().replace("+00:00", "Z"),
                 "quality": getattr(r, "quality", "good") or "good",
             }
-            for r in readings
-            if client._datastream_ids.get(f"{r.sensor_id}::{r.observed_property}")
-        ],
-    }
+        )
+    payload = {"readings": forwarded}
     if not payload["readings"]:
         return
     try:
