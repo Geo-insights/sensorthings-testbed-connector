@@ -85,8 +85,16 @@ def monitoring_mqtt_push(request: IngestRequest | None = None) -> dict:
 
 
 @router.post("/replay-failed")
-def replay_failed_observations() -> dict:
-    return client.replay_failed_observations()
+def replay_failed_observations(max_lines: int | None = None) -> dict:
+    return client.replay_failed_observations(max_lines)
+
+
+@router.get("/push-health")
+def push_health() -> dict:
+    """Circuit-breaker state per FROST target."""
+    from app.services.sensorthings_client import observation_breaker
+
+    return {"targets": observation_breaker.snapshot()}
 
 
 @router.get("/frost/status")

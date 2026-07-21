@@ -147,17 +147,21 @@ class FrostHTTPClient:
                 if response.ok:
                     return response
                 logger.warning(
-                    "Observation push failed",
-                    extra={"datastream_id": datastream_id, "status_code": response.status_code, "attempt": attempt},
+                    "Observation push failed (datastream=%s status=%s attempt=%d/%d url=%s)",
+                    datastream_id,
+                    response.status_code,
+                    attempt,
+                    max_attempts,
+                    url,
                 )
             except requests.RequestException as exc:
                 logger.warning(
-                    "Observation push raised an exception",
-                    extra={
-                        "datastream_id": datastream_id,
-                        "status_code": getattr(getattr(exc, "response", None), "status_code", None),
-                        "attempt": attempt,
-                    },
+                    "Observation push raised %s (datastream=%s attempt=%d/%d url=%s)",
+                    type(exc).__name__,
+                    datastream_id,
+                    attempt,
+                    max_attempts,
+                    url,
                 )
                 last_response = None
 

@@ -15,6 +15,7 @@ from app.exceptions import (
     ObservationUploadError,
 )
 from app.frost.cache import EntityCache
+from app.frost.circuit_breaker import CircuitBreaker
 from app.frost.entity_manager import EntityManager
 from app.frost.http_client import FrostHTTPClient
 from app.frost.target_stack import TargetStack
@@ -32,6 +33,12 @@ from app.sources.climate_adaptation import CLIMATE_ADAPTATION_ENTITY_SETS
 
 
 logger = logging.getLogger(__name__)
+
+# Per-target circuit breaker shared by push + replay paths.
+observation_breaker = CircuitBreaker(
+    failure_threshold=settings.frost_cb_failure_threshold,
+    cooldown_seconds=settings.frost_cb_cooldown_seconds,
+)
 
 
 class SensorThingsClient:
@@ -62,6 +69,8 @@ class SensorThingsClient:
         self._live_datastream_lookup_cache: dict[str, str] = {}
         self._observed_property_names: dict[str, str] = self._build_observed_property_name_map()
         self._tasking_capability_ids: dict[str, str] = dict(self._cache.collection("tasking_capabilities"))
+        # Targets that answered CreateObservations with 4xx/501 (no dataArray support).
+        self._no_batch_targets: set[str] = set()
 
     @staticmethod
     def _load_base_urls() -> list[str]:
@@ -1190,7 +1199,14 @@ class SensorThingsClient:
         with self._failed_observations_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    def replay_failed_observations(self) -> dict[str, Any]:
+    def _base_url_for_endpoint(self, endpoint: str) -> str | None:
+        """Match an absolute endpoint URL back to a configured target base URL."""
+        for base_url in self._base_urls():
+            if endpoint.startswith(base_url.rstrip("/")):
+                return base_url
+        return None
+
+    def replay_failed_observations(self, max_lines: int | None = None) -> dict[str, Any]:
         if not self._failed_observations_path.exists():
             return {
                 "mode": "live" if settings.sensorthings_base_url else "preview",
@@ -1202,9 +1218,13 @@ class SensorThingsClient:
         lines = self._failed_observations_path.read_text(encoding="utf-8").splitlines()
         kept_lines: list[str] = []
         results: list[dict[str, Any]] = []
+        attempted = 0
 
         for line in lines:
             if not line.strip():
+                continue
+            if max_lines is not None and attempted >= max_lines:
+                kept_lines.append(line)
                 continue
             try:
                 record = json.loads(line)
@@ -1219,8 +1239,17 @@ class SensorThingsClient:
                 kept_lines.append(line)
                 continue
 
+            # Skip targets whose circuit is currently open — retrying now would
+            # just burn timeouts; the next replay pass picks them up.
+            base_url = self._base_url_for_endpoint(endpoint)
+            if base_url and not observation_breaker.allow(base_url):
+                kept_lines.append(line)
+                continue
+
+            headers = self._headers_for_url(base_url) if base_url else self._headers()
+            attempted += 1
             try:
-                response = requests.post(endpoint, json=payload, headers=self._headers(), timeout=self._request_timeout())
+                response = requests.post(endpoint, json=payload, headers=headers, timeout=self._request_timeout())
             except requests.RequestException as exc:
                 kept_lines.append(line)
                 results.append(
@@ -1235,6 +1264,11 @@ class SensorThingsClient:
 
             if response.ok:
                 results.append({"datastream_id": datastream_id, "ok": True, "status_code": response.status_code})
+                continue
+
+            # 409 Conflict = duplicate observation (already delivered) — drop it.
+            if response.status_code == 409:
+                results.append({"datastream_id": datastream_id, "ok": True, "status_code": response.status_code, "duplicate": True})
                 continue
 
             kept_lines.append(line)
@@ -1439,8 +1473,11 @@ class SensorThingsClient:
             last_status = getattr(exc, "last_status", None) or getattr(getattr(exc, "response", None), "status_code", None)
             health_monitor.record_failure(datastream_id, str(exc))
             logger.error(
-                "Final observation push failure",
-                extra={"timestamp": datetime.now(UTC).isoformat(), "datastream_id": datastream_id, "status_code": last_status},
+                "Final observation push failure (datastream=%s status=%s endpoint=%s): %s",
+                datastream_id,
+                last_status,
+                endpoint,
+                exc,
             )
             self._write_failed_observation(
                 {"timestamp": datetime.now(UTC).isoformat(), "datastream_id": datastream_id, "endpoint": endpoint, "payload": payload, "status_code": last_status, "error": str(exc)},
@@ -1451,13 +1488,122 @@ class SensorThingsClient:
             health_monitor.record_success(datastream_id)
         else:
             logger.error(
-                "Final observation push failure",
-                extra={"timestamp": datetime.now(UTC).isoformat(), "datastream_id": datastream_id, "status_code": response.status_code},
+                "Final observation push failure (datastream=%s status=%s endpoint=%s)",
+                datastream_id,
+                response.status_code,
+                endpoint,
             )
             self._write_failed_observation(
                 {"timestamp": datetime.now(UTC).isoformat(), "datastream_id": datastream_id, "endpoint": endpoint, "payload": payload, "status_code": response.status_code, "body": response.text[:500]},
             )
         return {"sensor_id": sensor_id, "datastream_id": datastream_id, "status_code": response.status_code, "ok": response.ok, "body": response.text[:500]}
+
+    def _push_batch_data_array(
+        self,
+        base_url: str,
+        tasks: list[tuple[str, dict[str, Any], str, str]],
+    ) -> tuple[int, list[dict[str, Any]]] | None:
+        """Push observations via the CreateObservations (dataArray) extension.
+
+        One POST per push cycle instead of one per observation. Returns
+        ``(sent, results)`` or ``None`` when the target does not support the
+        extension (caller falls back to per-observation pushes).
+        """
+        normalized = base_url.rstrip("/")
+        if normalized in self._no_batch_targets:
+            return None
+
+        components = ["phenomenonTime", "result", "resultQuality", "parameters"]
+        # Group per datastream, preserving order so the response array maps back.
+        grouped: dict[str, list[tuple[dict[str, Any], str]]] = {}
+        for _ep, payload, ds_id, sensor_id in tasks:
+            grouped.setdefault(ds_id, []).append((payload, sensor_id))
+
+        body = [
+            {
+                "Datastream": {"@iot.id": ds_id},
+                "components": components,
+                "dataArray": [
+                    [
+                        payload.get("phenomenonTime"),
+                        payload.get("result"),
+                        payload.get("resultQuality"),
+                        payload.get("parameters") or {},
+                    ]
+                    for payload, _sid in items
+                ],
+            }
+            for ds_id, items in grouped.items()
+        ]
+        # Flat view in the same order as the response array.
+        flat: list[tuple[str, dict[str, Any], str]] = [
+            (ds_id, payload, sensor_id)
+            for ds_id, items in grouped.items()
+            for payload, sensor_id in items
+        ]
+
+        url = f"{normalized}/CreateObservations"
+        try:
+            response = requests.post(
+                url, json=body, headers=self._headers_for_url(base_url), timeout=self._request_timeout()
+            )
+        except requests.RequestException as exc:
+            # Network failure: dead-letter everything for the replay loop.
+            logger.error(
+                "Batch observation push failed (%d observations, url=%s): %s", len(flat), url, exc
+            )
+            results = []
+            per_obs_endpoint = self._endpoint_for_base_url(base_url, settings.observations_path)
+            for ds_id, payload, sensor_id in flat:
+                health_monitor.record_failure(ds_id, str(exc))
+                self._write_failed_observation(
+                    {"timestamp": datetime.now(UTC).isoformat(), "datastream_id": ds_id, "endpoint": per_obs_endpoint, "payload": payload, "status_code": None, "error": str(exc)},
+                )
+                results.append({"sensor_id": sensor_id, "datastream_id": ds_id, "status_code": None, "ok": False, "error": str(exc)})
+            return 0, results
+
+        if response.status_code in {400, 404, 405, 501}:
+            # Target does not implement the dataArray extension.
+            logger.info(
+                "CreateObservations not supported at %s (status %s); falling back to per-observation pushes",
+                url,
+                response.status_code,
+            )
+            self._no_batch_targets.add(normalized)
+            return None
+
+        results = []
+        sent = 0
+        entries: list[Any] = []
+        if response.ok:
+            try:
+                parsed = response.json()
+                if isinstance(parsed, list):
+                    entries = parsed
+            except ValueError:
+                pass
+
+        per_obs_endpoint = self._endpoint_for_base_url(base_url, settings.observations_path)
+        for i, (ds_id, payload, sensor_id) in enumerate(flat):
+            entry = entries[i] if i < len(entries) else None
+            failed = (not response.ok) or (isinstance(entry, str) and entry.lower().startswith("error"))
+            if failed:
+                error = str(entry) if entry else f"batch status {response.status_code}"
+                health_monitor.record_failure(ds_id, error)
+                self._write_failed_observation(
+                    {"timestamp": datetime.now(UTC).isoformat(), "datastream_id": ds_id, "endpoint": per_obs_endpoint, "payload": payload, "status_code": response.status_code, "error": error},
+                )
+                results.append({"sensor_id": sensor_id, "datastream_id": ds_id, "status_code": response.status_code, "ok": False, "error": error})
+            else:
+                health_monitor.record_success(ds_id)
+                sent += 1
+                results.append({"sensor_id": sensor_id, "datastream_id": ds_id, "status_code": response.status_code, "ok": True})
+
+        if sent < len(flat):
+            logger.warning(
+                "Batch push to %s: %d/%d observations accepted", url, sent, len(flat)
+            )
+        return sent, results
 
     def push_observations(self, readings: list[SensorReading]) -> dict[str, Any]:
         preview = self.build_preview(readings)
@@ -1477,9 +1623,10 @@ class SensorThingsClient:
             endpoint = self._endpoint_for_base_url(base_url, settings.observations_path)
             is_v2 = self._is_v2_url(base_url)
             stack = self._target_stack_for_url(base_url)
+            breaker_open = not observation_breaker.allow(base_url)
 
             # Phase 1: resolve datastream IDs and build payloads (sequential,
-            # touches caches)
+            # touches caches). Skip live HTTP lookups while the breaker is open.
             tasks: list[tuple[str, dict[str, Any], str, str]] = []  # (endpoint, payload, ds_id, sensor_id)
             unresolved: list[dict[str, Any]] = []
             for reading in readings:
@@ -1493,7 +1640,7 @@ class SensorThingsClient:
                         or datastream_ids.get(getattr(reading, "stream_key", "") or "")
                         or datastream_ids.get(reading.sensor_id)
                     )
-                if not datastream_id:
+                if not datastream_id and not breaker_open:
                     datastream_id = self._resolve_datastream_id_live(base_url, reading)
                 if not datastream_id:
                     unresolved.append(
@@ -1521,20 +1668,57 @@ class SensorThingsClient:
                     payload = adapt_observation_payload(payload)
                 tasks.append((endpoint, payload, datastream_id, reading.sensor_id))
 
-            # Phase 2: POST observations in parallel
+            # Circuit open: dead-letter everything in one pass (no HTTP, one log line).
+            if breaker_open:
+                now_iso = datetime.now(UTC).isoformat()
+                for ep, pl, ds_id, sid in tasks:
+                    self._write_failed_observation(
+                        {"timestamp": now_iso, "datastream_id": ds_id, "endpoint": ep, "payload": pl, "status_code": None, "error": "circuit_open"},
+                    )
+                logger.warning(
+                    "Circuit open for %s — %d observations dead-lettered for replay", base_url, len(tasks)
+                )
+                endpoint_results.append(
+                    {"base_url": base_url, "endpoint": endpoint, "sent": 0, "circuit_open": True, "dead_lettered": len(tasks), "results": list(unresolved)}
+                )
+                continue
+
+            # Phase 2: push. Prefer one batched CreateObservations request;
+            # fall back to parallel per-observation POSTs.
             results: list[dict[str, Any]] = list(unresolved)
             sent = 0
             if tasks:
-                with ThreadPoolExecutor(max_workers=min(10, len(tasks))) as pool:
-                    futures = {
-                        pool.submit(self._push_single_observation, ep, pl, ds_id, sid): ds_id
-                        for ep, pl, ds_id, sid in tasks
-                    }
-                    for future in as_completed(futures):
-                        result = future.result()
-                        results.append(result)
-                        if result.get("ok"):
-                            sent += 1
+                batch_result = None
+                if settings.frost_batch_push_enabled and not is_v2:
+                    batch_result = self._push_batch_data_array(base_url, tasks)
+                if batch_result is not None:
+                    sent, batch_results = batch_result
+                    results.extend(batch_results)
+                else:
+                    with ThreadPoolExecutor(max_workers=min(10, len(tasks))) as pool:
+                        futures = {
+                            pool.submit(self._push_single_observation, ep, pl, ds_id, sid): ds_id
+                            for ep, pl, ds_id, sid in tasks
+                        }
+                        for future in as_completed(futures):
+                            result = future.result()
+                            results.append(result)
+                            if result.get("ok"):
+                                sent += 1
+
+                # Cycle-level breaker bookkeeping: a cycle where nothing got
+                # through counts as one failure; anything else closes it.
+                if sent == 0:
+                    first_error = next((r.get("error") for r in results if r.get("error")), None)
+                    if observation_breaker.record_failure(base_url, first_error):
+                        logger.error(
+                            "Circuit opened for %s after %d consecutive failed push cycles (cooldown %.0fs)",
+                            base_url,
+                            settings.frost_cb_failure_threshold,
+                            settings.frost_cb_cooldown_seconds,
+                        )
+                else:
+                    observation_breaker.record_success(base_url)
 
             endpoint_results.append(
                 {"base_url": base_url, "endpoint": endpoint, "sent": sent, "results": results}
@@ -1543,9 +1727,9 @@ class SensorThingsClient:
 
         if len(endpoint_results) == 1:
             only = endpoint_results[0]
-            return {"mode": "live", "endpoint": only["endpoint"], "sent": only["sent"], "results": only["results"]}
+            return {"mode": "live", "endpoint": only["endpoint"], "sent": only["sent"], "total_sent": only["sent"], "results": only["results"]}
 
-        return {"mode": "live", "multi_target": True, "sent": total_sent, "targets": endpoint_results}
+        return {"mode": "live", "multi_target": True, "sent": total_sent, "total_sent": total_sent, "targets": endpoint_results}
 
 
 client = SensorThingsClient()

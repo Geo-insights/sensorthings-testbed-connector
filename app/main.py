@@ -282,6 +282,24 @@ def _get_enabled_polling_sources():
     return sources
 
 
+async def _failed_replay_loop():
+    """Periodically replay dead-lettered observations back to FROST targets."""
+    interval = max(60, settings.failed_replay_interval_seconds)
+    logger.info("DLQ replay loop started (every %ds, max %d/pass)", interval, settings.failed_replay_max_lines)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            summary = await run_in_threadpool(
+                client.replay_failed_observations, settings.failed_replay_max_lines
+            )
+            replayed = summary.get("replayed", 0)
+            remaining = summary.get("remaining", 0)
+            if replayed or remaining:
+                logger.info("DLQ replay: %s replayed, %s remaining", replayed, remaining)
+        except Exception:
+            logger.exception("DLQ replay pass failed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     tasks = []
@@ -290,6 +308,9 @@ async def lifespan(app: FastAPI):
 
     for source in _get_enabled_polling_sources():
         tasks.append(asyncio.create_task(_polling_ingest_loop(source)))
+
+    if settings.failed_replay_enabled and (settings.sensorthings_base_url or settings.sensorthings_base_urls):
+        tasks.append(asyncio.create_task(_failed_replay_loop()))
 
     yield
     for t in tasks:
