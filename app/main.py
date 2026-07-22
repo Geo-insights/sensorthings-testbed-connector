@@ -61,13 +61,28 @@ def _resolve_monitoring_datastream_id(reading) -> str | None:
     TGV Kafka readings map to pre-existing datastreams by ``stream_key`` (via
     ``SENSORTHINGS_DATASTREAM_IDS_JSON``), so the sensor_id::op key alone is not
     enough — the earlier implementation dropped every TGV reading here.
+
+    When the static id map has no entry (e.g. Kafka datastreams that are only
+    resolved live against FROST during the push), fall back to the same live
+    OData lookup ``client.push_observations`` uses, so the monitoring forward
+    agrees with the datastream the observation was actually pushed to.
     """
     ids = client._datastream_ids or dict(settings.datastream_ids)
-    return (
+    ds_id = (
         ids.get(client._datastream_key(reading.sensor_id, reading.observed_property))
         or ids.get(getattr(reading, "stream_key", "") or "")
         or ids.get(reading.sensor_id)
     )
+    if ds_id:
+        return ds_id
+
+    base_url = client._http.primary_base_url or ""
+    if base_url:
+        try:
+            return client._resolve_datastream_id_live(base_url, reading)
+        except Exception:
+            logger.debug("Live datastream resolve failed for monitoring push", exc_info=True)
+    return None
 
 
 def _push_to_monitoring(readings: list) -> None:
