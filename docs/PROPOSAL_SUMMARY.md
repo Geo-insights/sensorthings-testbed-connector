@@ -1,5 +1,7 @@
 # Proposal Summary
 
+> **Historical.** This proposal was written for the initial tender response describing a wastewater digital twin use case. The project subsequently pivoted to climate-adaptation monitoring at The Green Village and Diergaarde Blijdorp.
+
 ## Project title
 
 Sensor interoperability bridge for the Geonovum SensorThings testbed.

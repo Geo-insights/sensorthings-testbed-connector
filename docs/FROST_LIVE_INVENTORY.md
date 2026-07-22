@@ -1,10 +1,6 @@
 # FROST Live Inventory
 
-## Purpose
-
-This document records the `GEO_` entities that were actually created in the live FROST environment during the connector proof-of-path validation on 2026-05-26.
-
-These records were created before real sensor access was available. Treat them as a validated integration scaffold, not as final field truth.
+> **Historical snapshot from 2026-05-26.** This inventory records the original `GEO_` entities created during the initial proof-of-path validation. The live FROST environment has since evolved: TGV Office Lab entities are fed from Kafka, Ohnics air quality and Levellog groundwater entities are registered dynamically, and observations now fan out to multiple targets (v1.1 and v2.0). Query the live FROST servers directly for the current state.
 
 ## Summary
 
@@ -100,7 +96,7 @@ These records were created before real sensor access was available. Treat them a
 
 ## Cleanup guidance
 
-Before changing or deleting anything in the live FROST environment, compare the real TGV and Blijdorp sensor layouts against the draft model in [docs/entity-mapping.md](docs/entity-mapping.md).
+Before changing or deleting anything in the live FROST environment, compare the real TGV and Blijdorp sensor layouts against the entity model in [docs/entity-mapping.md](entity-mapping.md).
 
 Keep the current live entities if the real field setup matches closely enough.
 
