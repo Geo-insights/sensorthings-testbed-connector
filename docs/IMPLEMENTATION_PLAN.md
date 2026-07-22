@@ -1,5 +1,7 @@
 # Implementation Plan
 
+> **Historical.** This was the initial plan written for the tender response. The actual implementation diverged to climate-adaptation sensors at The Green Village and Diergaarde Blijdorp, using Kafka, REST API polling, and direct HTTP bridge integration rather than the Node-RED + Modbus path described below.
+
 ## Goal
 
 Connect one or more sensors or sensor feeds to a central OGC SensorThings API server, validate the reliability of the approach, and provide a reproducible public demonstration.

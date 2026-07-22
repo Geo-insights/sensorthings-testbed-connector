@@ -2,45 +2,51 @@
 
 ## Where we stand
 
-The connector-to-FROST path is now proven.
+The connector is operational and actively ingesting live data from multiple sources.
 
-What has been validated:
+### Validated
 
-- live FROST connectivity
-- HTTP Basic authentication
+- live FROST connectivity to v1.1 and v2.0 targets
+- HTTP Basic authentication and per-target auth
 - `GEO_`-prefixed entity registration
 - site-scoped registration for `tgv` and `blijdorp`
 - repeated live observation delivery
 - bridge-style payload ingestion using a file-backed source for local runs
+- Kafka TGV consumer: real indoor climate data from Confluent Cloud (temperature, humidity, CO2, pressure)
+- Ohnics air quality: live polling of SamenMeten network sensors in Delft (PM2.5, temperature)
+- Levellog groundwater: live polling via CARS Online OData API with OAuth2
+- multi-target observation fan-out (v1.1 + v2.0 servers)
+- circuit breaker per target with automatic recovery
+- batch observation push with chunking (dataArray extension)
+- dead-letter queue with scheduled replay
+- deduplication against latest FROST observations on startup
+- monitoring module direct HTTP push (bypasses 5-minute polling delay)
+- Tasking support: Actuators, TaskingCapabilities, and Tasks per site
 
-What has not been validated yet:
+### Not yet validated
 
-- access to the real TGV sensors
 - access to the real Blijdorp sensors
-- the true payload contract from the field or bridge
-- whether the draft site and datastream model is the final correct representation
+- final Blijdorp sensor setup and pond water quality parameters
+- Rainaway Parkeerplaatsen, Flowsand, and Koers / Zoak / Nus entity sets (registered as scaffolding but not receiving live data)
+- exact sensor make/model metadata for some installations
 
 ## Recommended posture
 
-Hold further live expansion until real sensor or bridge access is available.
+Continue live ingestion from Kafka, Ohnics, and Levellog sources. Hold Blijdorp expansion until real sensor access is available.
 
-This is a good stopping point for the testbed because the integration mechanism is proven, while the remaining uncertainty is now clearly on the source-data side.
+The integration mechanism is proven across three live data sources. The remaining uncertainty is on the Blijdorp source-data side and on finalizing the remaining TGV entity sets.
 
 ## Safe actions during the hold
 
 - prepare presentation material from the validated connector results
-- compare the real field inventory against [docs/entity-mapping.md](docs/entity-mapping.md) when it becomes available
-- capture sample source payloads before making any more live model changes
-- reuse the onboarding checklist in [docs/SENSOR_ONBOARDING_CHECKLIST.md](docs/SENSOR_ONBOARDING_CHECKLIST.md)
+- compare the real field inventory against [docs/entity-mapping.md](entity-mapping.md) when new sensors come online
+- onboard new Ohnics sensors by adjusting `OHNICS_SENSOR_PREFIX`
+- onboard new Levellog installations by adding UUIDs to `LEVELLOG_INSTALLATIONS_JSON`
 
-## First actions once access arrives
+## First actions once Blijdorp access arrives
 
-1. get a real payload sample from the bridge or sensor source
+1. get a real payload sample from the Blijdorp sensor source
 2. run `GET /connector/preview`
-3. run `GET /connector/registration-preview/{site_key}`
-4. decide whether the existing live `GEO_` entities should be reused
+3. run `GET /connector/registration-preview/blijdorp`
+4. decide whether the existing scaffolding `GEO_` entities should be reused or replaced
 5. send a tiny live payload through `POST /connector/ingest`
-
-## Presentation-ready message
-
-The connector is ready for sensor onboarding, but the real field integration should wait for confirmed access to the TGV and Blijdorp sources. The current live FROST entities prove the interoperability approach, not yet the final operational deployment.

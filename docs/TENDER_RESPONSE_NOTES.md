@@ -1,5 +1,7 @@
 # Tender Response Notes
 
+> **Historical.** This document was written for the initial tender response describing a wastewater digital twin use case. The project subsequently pivoted to climate-adaptation monitoring at The Green Village and Diergaarde Blijdorp.
+
 ## Suggested positioning
 
 This proposal focuses on implementation topic 2: connecting sensors to a central SensorThings API server.
