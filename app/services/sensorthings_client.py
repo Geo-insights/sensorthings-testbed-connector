@@ -1705,12 +1705,13 @@ class SensorThingsClient:
             # touches caches). Skip live HTTP lookups while the breaker is open.
             tasks: list[tuple[str, dict[str, Any], str, str]] = []  # (endpoint, payload, ds_id, sensor_id)
             unresolved: list[dict[str, Any]] = []
+            is_primary = not stack or stack.base_url == (self._primary_base_url() or "")
             for reading in readings:
                 datastream_id = None
-                if stack and stack.base_url != (self._primary_base_url() or ""):
+                if stack and not is_primary:
                     ds_key = self._datastream_key(reading.sensor_id, reading.observed_property)
                     datastream_id = stack.cache.get("datastreams", ds_key)
-                if not datastream_id:
+                if not datastream_id and is_primary:
                     datastream_id = (
                         datastream_ids.get(self._datastream_key(reading.sensor_id, reading.observed_property))
                         or datastream_ids.get(getattr(reading, "stream_key", "") or "")
