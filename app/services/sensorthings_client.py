@@ -296,8 +296,13 @@ class SensorThingsClient:
     def _extract_first_iot_id(self, body: Any) -> str | None:
         return FrostHTTPClient.extract_first_iot_id(body)
 
-    def _fetch_datastream_id_by_filter(self, datastreams_endpoint: str, odata_filter: str) -> str | None:
-        return self._entity_manager.find_by_filter(datastreams_endpoint, odata_filter)
+    def _fetch_datastream_id_by_filter(self, datastreams_endpoint: str, odata_filter: str, base_url: str | None = None) -> str | None:
+        em = self._entity_manager
+        if base_url:
+            stack = self._target_stack_for_url(base_url)
+            if stack:
+                em = stack.entity_manager
+        return em.find_by_filter(datastreams_endpoint, odata_filter)
 
     def _resolve_datastream_id_live(self, base_url: str, reading: SensorReading) -> str | None:
         datastreams_endpoint = self._endpoint_for_base_url(base_url, settings.datastreams_path)
@@ -356,7 +361,7 @@ class SensorThingsClient:
             )
 
         for cache_key, query_filter in candidates:
-            datastream_id = self._fetch_datastream_id_by_filter(datastreams_endpoint, query_filter)
+            datastream_id = self._fetch_datastream_id_by_filter(datastreams_endpoint, query_filter, base_url)
             if not datastream_id:
                 continue
             if cache_key:
