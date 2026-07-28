@@ -519,131 +519,138 @@ class SensorThingsClient:
                 "preview": self._build_site_registration_preview([site_config]).model_dump(mode="json"),
             }
 
-        project_id, project_status, project_name = self._get_or_create_project(site_config["site_key"])
-        project_links = [{"@iot.id": project_id}] if project_id else None
-
-        thing_name = self._prefixed_name(site_config["thing"]["name"])
-        thing_payload: dict[str, Any] = {
-            "name": thing_name,
-            "description": site_config["thing"]["description"],
-            "properties": site_config["thing"]["properties"],
-        }
-        if project_links:
-            thing_payload["Projects"] = project_links
-        thing_id, thing_status = self._get_or_create_entity(settings.things_path, thing_name, thing_payload, "things")
-        if not thing_id:
-            return {
-                "site_key": site_config["site_key"],
-                "thing_name": thing_name,
-                "ok": False,
-                "message": f"Unable to register Thing {thing_name}.",
-                "thing_status": thing_status,
-                "project_id": project_id,
-                "project_status": project_status,
-                "project_name": project_name,
-            }
-
-        location_name = self._prefixed_name(site_config["location"]["name"])
-        location_payload: dict[str, Any] = {
-            "name": location_name,
-            "description": site_config["location"]["description"],
-            "encodingType": site_config["location"]["encodingType"],
-            "location": site_config["location"]["location"],
-            "Things": [{"@iot.id": thing_id}],
-        }
-        if project_links:
-            location_payload["Projects"] = project_links
-        location_id, location_status = self._get_or_create_entity(settings.locations_path, location_name, location_payload, "locations")
-
+        # --- Primary target registration ---
+        # Wrapped in try/except so secondary targets still get registered
+        # when the primary is unreachable (e.g. WBD timeout).
+        primary_ok = True
+        primary_error: str | None = None
+        project_id = project_status = project_name = None
+        thing_id = thing_status = location_id = location_status = None
         sensor_ids: dict[str, str | None] = {}
         sensor_results: list[dict[str, Any]] = []
         observed_property_ids: dict[str, str | None] = {}
         datastream_ids: dict[str, str | None] = {}
         datastream_results: list[dict[str, Any]] = []
 
-        for sensor in site_config["sensors"]:
-            sensor_name = self._prefixed_name(sensor["name"])
-            sensor_payload: dict[str, Any] = {
-                "name": sensor_name,
-                "description": sensor["description"],
-                "encodingType": sensor["encodingType"],
-                "metadata": sensor["metadata"],
+        try:
+            project_id, project_status, project_name = self._get_or_create_project(site_config["site_key"])
+            project_links = [{"@iot.id": project_id}] if project_id else None
+
+            thing_name = self._prefixed_name(site_config["thing"]["name"])
+            thing_payload: dict[str, Any] = {
+                "name": thing_name,
+                "description": site_config["thing"]["description"],
+                "properties": site_config["thing"]["properties"],
             }
-            sensor_properties = sensor.get("properties")
-            if isinstance(sensor_properties, dict) and sensor_properties:
-                sensor_payload["properties"] = sensor_properties
             if project_links:
-                sensor_payload["Projects"] = project_links
-            sensor_id, sensor_status = self._get_or_create_entity(settings.sensors_path, sensor_name, sensor_payload, "sensors")
-            sensor_ids[sensor["sensor_id"]] = sensor_id
-            sensor_results.append(
-                {
-                    "sensor_id": sensor["sensor_id"],
-                    "name": sensor_name,
-                    "status": sensor_status,
-                    "@iot.id": sensor_id,
+                thing_payload["Projects"] = project_links
+            thing_id, thing_status = self._get_or_create_entity(settings.things_path, thing_name, thing_payload, "things")
+            if not thing_id:
+                primary_ok = False
+                primary_error = f"Unable to register Thing {thing_name}."
+            else:
+                location_name = self._prefixed_name(site_config["location"]["name"])
+                location_payload: dict[str, Any] = {
+                    "name": location_name,
+                    "description": site_config["location"]["description"],
+                    "encodingType": site_config["location"]["encodingType"],
+                    "location": site_config["location"]["location"],
+                    "Things": [{"@iot.id": thing_id}],
                 }
-            )
-            if not sensor_id:
-                logger.warning("Sensor %s registration failed; skipping its datastreams", sensor_name)
-                continue
+                if project_links:
+                    location_payload["Projects"] = project_links
+                location_id, location_status = self._get_or_create_entity(settings.locations_path, location_name, location_payload, "locations")
 
-            for observed_property in sensor["observed_properties"]:
-                property_payload = site_config["observed_properties"][observed_property]
-                observed_property_record = {
-                    "name": property_payload["name"],
-                    "definition": property_payload["definition"],
-                    "description": property_payload["description"],
-                }
-                observed_property_id, observed_property_status = self._get_or_create_entity(
-                    settings.observed_properties_path,
-                    property_payload["name"],
-                    observed_property_record,
-                    "observed_properties",
-                )
-                observed_property_ids[observed_property] = observed_property_id
-
-                datastream_key = self._datastream_key(sensor["sensor_id"], observed_property)
-                datastream_payload = {
-                    "name": f"{sensor_name} - {property_payload['name']}",
-                    "description": f"{property_payload['name']} observations for {thing_name}",
-                    "observationType": "http://www.opengis.net/def/observationType/OGC-OM/2.0/OM_Measurement",
-                    "unitOfMeasurement": {
-                        "name": property_payload["name"],
-                        "symbol": property_payload["unit"],
-                        "definition": property_payload["definition"],
-                    },
-                    "Thing": {"@iot.id": thing_id},
-                    "Sensor": {"@iot.id": sensor_id},
-                    "ObservedProperty": {"@iot.id": observed_property_id},
-                    "properties": {
-                        "site_key": site_config["site_key"],
-                        "thing_name": thing_name,
-                        "sensor_id": sensor["sensor_id"],
-                        "observed_property": observed_property,
-                        "streamKey": observed_property,
-                    },
-                }
-                datastream_id, datastream_status = self._get_or_create_entity(
-                    settings.datastreams_path,
-                    datastream_key,
-                    datastream_payload,
-                    "datastreams",
-                )
-                datastream_ids[datastream_key] = datastream_id
-                if datastream_id:
-                    self._datastream_ids[datastream_key] = datastream_id
-                datastream_results.append(
-                    {
-                        "datastream_key": datastream_key,
-                        "name": datastream_payload["name"],
-                        "status": datastream_status,
-                        "@iot.id": datastream_id,
+                for sensor in site_config["sensors"]:
+                    sensor_name = self._prefixed_name(sensor["name"])
+                    sensor_payload: dict[str, Any] = {
+                        "name": sensor_name,
+                        "description": sensor["description"],
+                        "encodingType": sensor["encodingType"],
+                        "metadata": sensor["metadata"],
                     }
-                )
+                    sensor_properties = sensor.get("properties")
+                    if isinstance(sensor_properties, dict) and sensor_properties:
+                        sensor_payload["properties"] = sensor_properties
+                    if project_links:
+                        sensor_payload["Projects"] = project_links
+                    sensor_id, sensor_status = self._get_or_create_entity(settings.sensors_path, sensor_name, sensor_payload, "sensors")
+                    sensor_ids[sensor["sensor_id"]] = sensor_id
+                    sensor_results.append(
+                        {
+                            "sensor_id": sensor["sensor_id"],
+                            "name": sensor_name,
+                            "status": sensor_status,
+                            "@iot.id": sensor_id,
+                        }
+                    )
+                    if not sensor_id:
+                        logger.warning("Sensor %s registration failed; skipping its datastreams", sensor_name)
+                        continue
 
-        self._registered_entities["datastreams"].update({key: value for key, value in datastream_ids.items() if value})
-        self._persist_registered_entities()
+                    for observed_property in sensor["observed_properties"]:
+                        property_payload = site_config["observed_properties"][observed_property]
+                        observed_property_record = {
+                            "name": property_payload["name"],
+                            "definition": property_payload["definition"],
+                            "description": property_payload["description"],
+                        }
+                        observed_property_id, observed_property_status = self._get_or_create_entity(
+                            settings.observed_properties_path,
+                            property_payload["name"],
+                            observed_property_record,
+                            "observed_properties",
+                        )
+                        observed_property_ids[observed_property] = observed_property_id
+
+                        datastream_key = self._datastream_key(sensor["sensor_id"], observed_property)
+                        datastream_payload = {
+                            "name": f"{sensor_name} - {property_payload['name']}",
+                            "description": f"{property_payload['name']} observations for {thing_name}",
+                            "observationType": "http://www.opengis.net/def/observationType/OGC-OM/2.0/OM_Measurement",
+                            "unitOfMeasurement": {
+                                "name": property_payload["name"],
+                                "symbol": property_payload["unit"],
+                                "definition": property_payload["definition"],
+                            },
+                            "Thing": {"@iot.id": thing_id},
+                            "Sensor": {"@iot.id": sensor_id},
+                            "ObservedProperty": {"@iot.id": observed_property_id},
+                            "properties": {
+                                "site_key": site_config["site_key"],
+                                "thing_name": thing_name,
+                                "sensor_id": sensor["sensor_id"],
+                                "observed_property": observed_property,
+                                "streamKey": observed_property,
+                            },
+                        }
+                        datastream_id, datastream_status = self._get_or_create_entity(
+                            settings.datastreams_path,
+                            datastream_key,
+                            datastream_payload,
+                            "datastreams",
+                        )
+                        datastream_ids[datastream_key] = datastream_id
+                        if datastream_id:
+                            self._datastream_ids[datastream_key] = datastream_id
+                        datastream_results.append(
+                            {
+                                "datastream_key": datastream_key,
+                                "name": datastream_payload["name"],
+                                "status": datastream_status,
+                                "@iot.id": datastream_id,
+                            }
+                        )
+
+                self._registered_entities["datastreams"].update({key: value for key, value in datastream_ids.items() if value})
+                self._persist_registered_entities()
+        except Exception:
+            primary_ok = False
+            primary_error = "Primary target unreachable (see logs)."
+            logger.exception(
+                "Primary target registration failed for %s; proceeding with secondary targets",
+                site_config["site_key"],
+            )
 
         # Register on additional target stacks (v1.1 and v2.0)
         extra_target_results = self._register_entity_set_on_extra_targets(site_config)
@@ -651,6 +658,7 @@ class SensorThingsClient:
         result: dict[str, Any] = {
             "mode": "live",
             "site_key": site_config["site_key"],
+            "primary_ok": primary_ok,
             "project_id": project_id,
             "project_status": project_status,
             "project_name": project_name,
@@ -664,6 +672,8 @@ class SensorThingsClient:
             "sensor_results": sensor_results,
             "datastream_results": datastream_results,
         }
+        if primary_error:
+            result["primary_error"] = primary_error
         if extra_target_results:
             result["extra_targets"] = extra_target_results
         return result
