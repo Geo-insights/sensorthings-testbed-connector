@@ -354,6 +354,9 @@ class Settings:
     failed_replay_enabled: bool = os.getenv("FAILED_REPLAY_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
     failed_replay_interval_seconds: int = int(os.getenv("FAILED_REPLAY_INTERVAL_SECONDS", "900"))
     failed_replay_max_lines: int = int(os.getenv("FAILED_REPLAY_MAX_LINES", "500"))
+    # Safety bounds for the DLQ file.
+    failed_dlq_max_bytes: int = int(os.getenv("FAILED_DLQ_MAX_BYTES", str(50 * 1024 * 1024)))  # 50 MB
+    failed_dlq_max_age_hours: int = int(os.getenv("FAILED_DLQ_MAX_AGE_HOURS", "48"))
 
 
 settings = Settings()

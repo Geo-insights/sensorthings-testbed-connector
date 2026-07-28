@@ -1,6 +1,9 @@
+from pathlib import Path
+
 from fastapi import APIRouter
 from fastapi.responses import HTMLResponse
 
+from app.config import settings
 from app.services.health_monitor import health_monitor
 
 router = APIRouter(tags=["health"])
@@ -12,8 +15,14 @@ def root() -> dict[str, str]:
 
 
 @router.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def health() -> dict:
+    dlq_path = Path(settings.failed_observations_path)
+    try:
+        dlq_bytes = dlq_path.stat().st_size
+    except FileNotFoundError:
+        dlq_bytes = 0
+    status = "degraded" if dlq_bytes > settings.failed_dlq_max_bytes * 0.9 else "ok"
+    return {"status": status, "dlq_bytes": dlq_bytes, "dlq_max_bytes": settings.failed_dlq_max_bytes}
 
 
 @router.get("/health/report")
