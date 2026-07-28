@@ -234,8 +234,10 @@ def _load_frost_targets() -> tuple[FrostTarget, ...]:
             auth_user = str(item.get("auth_username", "")).strip()
             auth_pass = str(item.get("auth_password", "")).strip()
             auth_tok = str(item.get("auth_token", "")).strip()
-            # Fall back to global auth if per-target auth is not set
-            if not auth_user and not auth_tok:
+            # Fall back to global auth only when no auth fields are present.
+            # Explicitly setting auth_username to "" means "no auth" (public).
+            has_explicit_auth = "auth_username" in item or "auth_token" in item
+            if not has_explicit_auth:
                 auth_user = global_username
                 auth_pass = global_password
                 auth_tok = global_token
