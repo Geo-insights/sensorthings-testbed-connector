@@ -52,6 +52,25 @@ def _as_quality_list(quality: Any) -> Any:
     return [quality]
 
 
+def _coerce_iot_id(value: Any) -> Any:
+    """Convert string entity IDs to int when numeric.
+
+    Some SensorThings implementations (e.g. Collaborall's PHP server) reject
+    ``@iot.id`` values given as strings, expecting native integers.  Standard
+    FROST accepts both, so always sending ints is safe.
+    """
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return value
+    return value
+
+
 # Per-target circuit breaker shared by push + replay paths.
 observation_breaker = CircuitBreaker(
     failure_threshold=settings.frost_cb_failure_threshold,
@@ -534,7 +553,7 @@ class SensorThingsClient:
 
         try:
             project_id, project_status, project_name = self._get_or_create_project(site_config["site_key"])
-            project_links = [{"@iot.id": project_id}] if project_id else None
+            project_links = [{"@iot.id": _coerce_iot_id(project_id)}] if project_id else None
 
             thing_name = self._prefixed_name(site_config["thing"]["name"])
             thing_payload: dict[str, Any] = {
@@ -555,7 +574,7 @@ class SensorThingsClient:
                     "description": site_config["location"]["description"],
                     "encodingType": site_config["location"]["encodingType"],
                     "location": site_config["location"]["location"],
-                    "Things": [{"@iot.id": thing_id}],
+                    "Things": [{"@iot.id": _coerce_iot_id(thing_id)}],
                 }
                 if project_links:
                     location_payload["Projects"] = project_links
@@ -613,9 +632,9 @@ class SensorThingsClient:
                                 "symbol": property_payload["unit"],
                                 "definition": property_payload["definition"],
                             },
-                            "Thing": {"@iot.id": thing_id},
-                            "Sensor": {"@iot.id": sensor_id},
-                            "ObservedProperty": {"@iot.id": observed_property_id},
+                            "Thing": {"@iot.id": _coerce_iot_id(thing_id)},
+                            "Sensor": {"@iot.id": _coerce_iot_id(sensor_id)},
+                            "ObservedProperty": {"@iot.id": _coerce_iot_id(observed_property_id)},
                             "properties": {
                                 "site_key": site_config["site_key"],
                                 "thing_name": thing_name,
@@ -714,7 +733,7 @@ class SensorThingsClient:
             "description": site_config["location"]["description"],
             "encodingType": site_config["location"]["encodingType"],
             "location": site_config["location"]["location"],
-            "Things": [{"@iot.id": thing_id}],
+            "Things": [{"@iot.id": _coerce_iot_id(thing_id)}],
         }
         if is_v2:
             location_payload = adapt_payload(location_payload)
@@ -777,9 +796,9 @@ class SensorThingsClient:
                         "symbol": property_payload["unit"],
                         "definition": property_payload["definition"],
                     },
-                    "Thing": {"@iot.id": thing_id},
-                    "Sensor": {"@iot.id": sensor_id},
-                    "ObservedProperty": {"@iot.id": op_id},
+                    "Thing": {"@iot.id": _coerce_iot_id(thing_id)},
+                    "Sensor": {"@iot.id": _coerce_iot_id(sensor_id)},
+                    "ObservedProperty": {"@iot.id": _coerce_iot_id(op_id)},
                     "properties": {
                         "site_key": site_config["site_key"],
                         "thing_name": thing_name,
@@ -1005,7 +1024,7 @@ class SensorThingsClient:
             capability_payload: dict[str, Any] = {
                 "name": capability_name,
                 "description": str(capability.get("description", f"Tasking capability {capability_key}.")).strip(),
-                "Actuator": {"@iot.id": actuator_id},
+                "Actuator": {"@iot.id": _coerce_iot_id(actuator_id)},
             }
 
             thing_name = str(capability.get("thing_name", "")).strip()
@@ -1024,7 +1043,7 @@ class SensorThingsClient:
                 )
                 continue
 
-            capability_payload["Thing"] = {"@iot.id": thing_id}
+            capability_payload["Thing"] = {"@iot.id": _coerce_iot_id(thing_id)}
 
             tasking_parameters = capability.get("taskingParameters")
             if isinstance(tasking_parameters, dict) and tasking_parameters:
@@ -1164,7 +1183,7 @@ class SensorThingsClient:
         response = requests.post(capability_tasks_endpoint, json=payload, headers=self._headers(), timeout=self._request_timeout())
         if not response.ok:
             fallback_payload = dict(payload)
-            fallback_payload["TaskingCapability"] = {"@iot.id": capability_id}
+            fallback_payload["TaskingCapability"] = {"@iot.id": _coerce_iot_id(capability_id)}
             endpoint = self._endpoint(settings.tasks_path)
             response = requests.post(endpoint, json=fallback_payload, headers=self._headers(), timeout=self._request_timeout())
 
@@ -1666,7 +1685,7 @@ class SensorThingsClient:
 
         body = [
             {
-                "Datastream": {"@iot.id": ds_id},
+                "Datastream": {"@iot.id": _coerce_iot_id(ds_id)},
                 "components": components,
                 "dataArray": [
                     [
@@ -1807,7 +1826,7 @@ class SensorThingsClient:
                     "phenomenonTime": reading.timestamp.isoformat().replace("+00:00", "Z"),
                     "result": reading.value,
                     "resultQuality": _as_quality_list(reading.quality),
-                    "Datastream": {"@iot.id": datastream_id},
+                    "Datastream": {"@iot.id": _coerce_iot_id(datastream_id)},
                     "parameters": {
                         "sensor_id": reading.sensor_id,
                         "sensor_name": reading.sensor_name,
