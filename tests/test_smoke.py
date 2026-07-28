@@ -12,7 +12,10 @@ def test_health_endpoint_is_available():
     response = client.get("/health")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    data = response.json()
+    assert data["status"] in {"ok", "degraded"}
+    assert "dlq_bytes" in data
+    assert "dlq_max_bytes" in data
 
 
 def test_preview_endpoint_returns_demo_payloads():

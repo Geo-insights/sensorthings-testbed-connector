@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
@@ -1218,6 +1219,18 @@ class SensorThingsClient:
 
     def _write_failed_observation(self, record: dict[str, Any]) -> None:
         self._failed_observations_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            current_size = self._failed_observations_path.stat().st_size
+        except FileNotFoundError:
+            current_size = 0
+        if current_size >= settings.failed_dlq_max_bytes:
+            logger.warning(
+                "DLQ at %d bytes (limit %d) — dropping observation for datastream %s",
+                current_size,
+                settings.failed_dlq_max_bytes,
+                record.get("datastream_id", "?"),
+            )
+            return
         with self._failed_observations_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -1237,77 +1250,110 @@ class SensorThingsClient:
                 "message": "No failed observations file found.",
             }
 
-        lines = self._failed_observations_path.read_text(encoding="utf-8").splitlines()
-        kept_lines: list[str] = []
+        tmp_path = self._failed_observations_path.with_suffix(".tmp")
+        # Clean up stale temp file from a prior crash during replay.
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+        max_age_seconds = settings.failed_dlq_max_age_hours * 3600
+        now = datetime.now(UTC)
         results: list[dict[str, Any]] = []
         attempted = 0
+        kept = 0
+        expired = 0
 
-        for line in lines:
-            if not line.strip():
-                continue
-            if max_lines is not None and attempted >= max_lines:
-                kept_lines.append(line)
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                kept_lines.append(line)
-                continue
+        with open(self._failed_observations_path, "r", encoding="utf-8") as infile, \
+             open(tmp_path, "w", encoding="utf-8") as outfile:
+            for line in infile:
+                stripped = line.strip()
+                if not stripped:
+                    continue
 
-            endpoint = record.get("endpoint") or self._endpoint(settings.observations_path)
-            payload = record.get("payload")
-            datastream_id = record.get("datastream_id", "unknown")
-            if not endpoint or not isinstance(payload, dict):
-                kept_lines.append(line)
-                continue
+                # Past the attempt limit: copy remaining lines without parsing.
+                if max_lines is not None and attempted >= max_lines:
+                    outfile.write(stripped + "\n")
+                    kept += 1
+                    continue
 
-            # Skip targets whose circuit is currently open — retrying now would
-            # just burn timeouts; the next replay pass picks them up.
-            base_url = self._base_url_for_endpoint(endpoint)
-            if base_url and not observation_breaker.allow(base_url):
-                kept_lines.append(line)
-                continue
+                try:
+                    record = json.loads(stripped)
+                except json.JSONDecodeError:
+                    outfile.write(stripped + "\n")
+                    kept += 1
+                    continue
 
-            headers = self._headers_for_url(base_url) if base_url else self._headers()
-            attempted += 1
-            try:
-                response = requests.post(endpoint, json=payload, headers=headers, timeout=self._request_timeout())
-            except requests.RequestException as exc:
-                kept_lines.append(line)
-                results.append(
-                    {
-                        "datastream_id": datastream_id,
-                        "ok": False,
-                        "status_code": getattr(getattr(exc, "response", None), "status_code", None),
-                        "error": str(exc),
-                    }
-                )
-                continue
+                # Age-based expiry: drop entries older than the configured max.
+                ts_str = record.get("timestamp")
+                if ts_str and max_age_seconds > 0:
+                    try:
+                        entry_time = datetime.fromisoformat(ts_str)
+                        if (now - entry_time).total_seconds() > max_age_seconds:
+                            expired += 1
+                            continue
+                    except (ValueError, TypeError):
+                        pass
 
-            if response.ok:
-                results.append({"datastream_id": datastream_id, "ok": True, "status_code": response.status_code})
-                continue
+                endpoint = record.get("endpoint") or self._endpoint(settings.observations_path)
+                payload = record.get("payload")
+                datastream_id = record.get("datastream_id", "unknown")
+                if not endpoint or not isinstance(payload, dict):
+                    outfile.write(stripped + "\n")
+                    kept += 1
+                    continue
 
-            # 409 Conflict = duplicate observation (already delivered) — drop it.
-            if response.status_code == 409:
-                results.append({"datastream_id": datastream_id, "ok": True, "status_code": response.status_code, "duplicate": True})
-                continue
+                # Skip targets whose circuit is currently open — retrying now would
+                # just burn timeouts; the next replay pass picks them up.
+                base_url = self._base_url_for_endpoint(endpoint)
+                if base_url and not observation_breaker.allow(base_url):
+                    outfile.write(stripped + "\n")
+                    kept += 1
+                    continue
 
-            # Permanent client error (bad payload / unknown datastream) — drop it
-            # from the queue instead of retrying it on every replay pass forever.
-            if not is_retryable_status(response.status_code):
-                results.append({"datastream_id": datastream_id, "ok": False, "status_code": response.status_code, "dropped": True})
-                continue
+                headers = self._headers_for_url(base_url) if base_url else self._headers()
+                attempted += 1
+                try:
+                    response = requests.post(endpoint, json=payload, headers=headers, timeout=self._request_timeout())
+                except requests.RequestException as exc:
+                    outfile.write(stripped + "\n")
+                    kept += 1
+                    results.append(
+                        {
+                            "datastream_id": datastream_id,
+                            "ok": False,
+                            "status_code": getattr(getattr(exc, "response", None), "status_code", None),
+                            "error": str(exc),
+                        }
+                    )
+                    continue
 
-            kept_lines.append(line)
-            results.append({"datastream_id": datastream_id, "ok": False, "status_code": response.status_code})
+                if response.ok:
+                    results.append({"datastream_id": datastream_id, "ok": True, "status_code": response.status_code})
+                    continue
 
-        self._failed_observations_path.write_text("\n".join(kept_lines) + ("\n" if kept_lines else ""), encoding="utf-8")
+                # 409 Conflict = duplicate observation (already delivered) — drop it.
+                if response.status_code == 409:
+                    results.append({"datastream_id": datastream_id, "ok": True, "status_code": response.status_code, "duplicate": True})
+                    continue
+
+                # Permanent client error (bad payload / unknown datastream) — drop it
+                # from the queue instead of retrying it on every replay pass forever.
+                if not is_retryable_status(response.status_code):
+                    results.append({"datastream_id": datastream_id, "ok": False, "status_code": response.status_code, "dropped": True})
+                    continue
+
+                outfile.write(stripped + "\n")
+                kept += 1
+                results.append({"datastream_id": datastream_id, "ok": False, "status_code": response.status_code})
+
+        os.replace(str(tmp_path), str(self._failed_observations_path))
+        if expired:
+            logger.info("DLQ replay: expired %d entries older than %dh", expired, settings.failed_dlq_max_age_hours)
         return {
             "mode": "live" if settings.sensorthings_base_url else "preview",
             "replayed": sum(1 for result in results if result["ok"]),
             "dropped": sum(1 for result in results if result.get("dropped")),
-            "remaining": len(kept_lines),
+            "expired": expired,
+            "remaining": kept,
             "results": results,
         }
 
@@ -1752,14 +1798,24 @@ class SensorThingsClient:
 
             # Circuit open: dead-letter everything in one pass (no HTTP, one log line).
             if breaker_open:
-                now_iso = datetime.now(UTC).isoformat()
-                for ep, pl, ds_id, sid in tasks:
-                    self._write_failed_observation(
-                        {"timestamp": now_iso, "datastream_id": ds_id, "endpoint": ep, "payload": pl, "status_code": None, "error": "circuit_open"},
+                try:
+                    dlq_size = self._failed_observations_path.stat().st_size
+                except FileNotFoundError:
+                    dlq_size = 0
+                if dlq_size >= settings.failed_dlq_max_bytes:
+                    logger.warning(
+                        "Circuit open for %s — %d observations DROPPED (DLQ full at %d bytes)",
+                        base_url, len(tasks), dlq_size,
                     )
-                logger.warning(
-                    "Circuit open for %s — %d observations dead-lettered for replay", base_url, len(tasks)
-                )
+                else:
+                    now_iso = datetime.now(UTC).isoformat()
+                    for ep, pl, ds_id, sid in tasks:
+                        self._write_failed_observation(
+                            {"timestamp": now_iso, "datastream_id": ds_id, "endpoint": ep, "payload": pl, "status_code": None, "error": "circuit_open"},
+                        )
+                    logger.warning(
+                        "Circuit open for %s — %d observations dead-lettered for replay", base_url, len(tasks)
+                    )
                 endpoint_results.append(
                     {"base_url": base_url, "endpoint": endpoint, "sent": 0, "circuit_open": True, "dead_lettered": len(tasks), "results": list(unresolved)}
                 )
