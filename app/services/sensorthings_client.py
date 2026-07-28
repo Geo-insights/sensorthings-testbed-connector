@@ -584,6 +584,9 @@ class SensorThingsClient:
                     "@iot.id": sensor_id,
                 }
             )
+            if not sensor_id:
+                logger.warning("Sensor %s registration failed; skipping its datastreams", sensor_name)
+                continue
 
             for observed_property in sensor["observed_properties"]:
                 property_payload = site_config["observed_properties"][observed_property]
@@ -730,6 +733,12 @@ class SensorThingsClient:
                 settings.sensors_path, sensor_name, sensor_payload, "sensors"
             )
             sensor_ids[sensor["sensor_id"]] = sensor_id
+            if not sensor_id:
+                logger.warning(
+                    "Sensor %s failed on %s (%s); skipping its datastreams",
+                    sensor_name, stack.label, stack.version,
+                )
+                continue
 
             for observed_property in sensor["observed_properties"]:
                 property_payload = site_config["observed_properties"][observed_property]
@@ -1214,7 +1223,14 @@ class SensorThingsClient:
             "tasks": tasks,
         }
 
-    def _post_observation(self, endpoint: str, payload: dict[str, Any], datastream_id: str) -> requests.Response:
+    def _post_observation(
+        self, endpoint: str, payload: dict[str, Any], datastream_id: str,
+        base_url: str | None = None,
+    ) -> requests.Response:
+        if base_url:
+            stack = self._target_stack_for_url(base_url)
+            if stack:
+                return stack.http.post_with_retry(endpoint, payload, datastream_id)
         return self._http.post_with_retry(endpoint, payload, datastream_id)
 
     def _write_failed_observation(self, record: dict[str, Any]) -> None:
@@ -1540,10 +1556,11 @@ class SensorThingsClient:
 
     def _push_single_observation(
         self, endpoint: str, payload: dict[str, Any], datastream_id: str, sensor_id: str,
+        base_url: str | None = None,
     ) -> dict[str, Any]:
         """POST one observation with retry. Thread-safe (uses session internally)."""
         try:
-            response = self._post_observation(endpoint, payload, datastream_id)
+            response = self._post_observation(endpoint, payload, datastream_id, base_url=base_url)
         except (ObservationUploadError, requests.RequestException) as exc:
             last_status = getattr(exc, "last_status", None) or getattr(getattr(exc, "response", None), "status_code", None)
             health_monitor.record_failure(datastream_id, str(exc))
@@ -1835,7 +1852,7 @@ class SensorThingsClient:
                 else:
                     with ThreadPoolExecutor(max_workers=min(10, len(tasks))) as pool:
                         futures = {
-                            pool.submit(self._push_single_observation, ep, pl, ds_id, sid): ds_id
+                            pool.submit(self._push_single_observation, ep, pl, ds_id, sid, base_url): ds_id
                             for ep, pl, ds_id, sid in tasks
                         }
                         for future in as_completed(futures):
