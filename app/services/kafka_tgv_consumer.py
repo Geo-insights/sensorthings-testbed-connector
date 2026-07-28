@@ -118,7 +118,8 @@ class KafkaTGVConsumer:
             confluent_kafka.KafkaException: On message-level Kafka errors.
 
         Messages that fail Avro deserialization are logged and skipped.
-        Offsets are committed after a successful batch.
+        Offsets are NOT committed — call :meth:`commit` explicitly after
+        the batch has been fully processed (pushed to FROST / dead-lettered).
         """
         if self._consumer is None:
             raise RuntimeError("KafkaTGVConsumer.connect() must be called before consume_batch()")
@@ -142,9 +143,15 @@ class KafkaTGVConsumer:
                     msg.topic(), msg.partition(), msg.offset(), exc,
                 )
 
-        self._consumer.commit()
-        logger.debug("Consumed and committed batch of %d records", len(values))
+        logger.debug("Consumed batch of %d records (not yet committed)", len(values))
         return values
+
+    def commit(self) -> None:
+        """Commit current offsets to Kafka. Call after the batch has been fully processed."""
+        if self._consumer is None:
+            raise RuntimeError("KafkaTGVConsumer.connect() must be called before commit()")
+        self._consumer.commit()
+        logger.debug("Kafka offsets committed")
 
     # ------------------------------------------------------------------
     # Helpers

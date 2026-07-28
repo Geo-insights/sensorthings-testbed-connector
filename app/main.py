@@ -25,10 +25,13 @@ def _kafka_push_cycle(max_messages: int = 500, timeout: float = 5.0) -> dict:
 
     with KafkaTGVConsumer() as consumer:
         records = consumer.consume_batch(max_messages=max_messages, timeout=timeout)
-    if not records:
-        return {"pulled": 0}
-    readings = avro_batch_to_sensor_readings(records)
-    result = client.push_observations(readings)
+        if not records:
+            return {"pulled": 0}
+        readings = avro_batch_to_sensor_readings(records)
+        result = client.push_observations(readings)
+        # Commit only after push completes — failed observations are safely
+        # in the DLQ, so re-consuming them would just create duplicates.
+        consumer.commit()
     # Forward to monitoring module (fire-and-forget)
     _push_to_monitoring(readings)
     return {"pulled": len(records), "mapped": len(readings), "pushed": result.get("total_sent", 0)}
