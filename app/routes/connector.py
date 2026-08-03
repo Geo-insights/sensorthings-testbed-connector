@@ -350,6 +350,141 @@ def freshness(response: Response) -> dict:
     return result
 
 
+@router.post("/collaborall-write-test")
+def collaborall_write_test(
+    datastream_id: int | None = Query(
+        default=None, description="Override the target datastream; auto-picks a GEO_ stream when omitted."
+    ),
+) -> dict:
+    """Decisive write test against the CollaborAll FROST target (fix-or-drop).
+
+    Posts ONE diagnostic observation to a GEO_ datastream on CollaborAll using
+    the exact payload coercions the push path uses (``resultQuality`` as an
+    array, ``@iot.id`` as an int), then reads the datastream's observation count
+    before/after to classify the outcome:
+
+      * ``landed``           — accepted (2xx) and the count increased.
+      * ``accepted_no_persist`` — accepted (2xx) but the count did not change
+        (server swallows the write; explains "0 things ever populated").
+      * ``rejected``         — non-2xx; ``response_body`` has the server reason.
+
+    This is the signal for the keep-or-drop decision on CollaborAll.
+    """
+    import requests as req
+    from datetime import datetime, timezone
+
+    from app.services.sensorthings_client import _as_quality_list, _coerce_iot_id
+
+    # 1. Locate the CollaborAll target.
+    target = next(
+        (t for t in settings.frost_targets if "collaborall" in t.url.lower()),
+        None,
+    )
+    if target is None:
+        raise HTTPException(status_code=404, detail="No CollaborAll target configured.")
+
+    base = target.url.rstrip("/")
+    headers = {**client._headers_for_url(base), "Content-Type": "application/json"}
+    prefix = settings.entity_name_prefix
+
+    def _count(ds_id: int) -> int | None:
+        try:
+            resp = req.get(
+                f"{base}/Datastreams({ds_id})/Observations",
+                params={"$count": "true", "$top": "0"},
+                headers=headers,
+                timeout=30,
+            )
+            if resp.status_code == 400:  # some servers reject $top=0
+                resp = req.get(
+                    f"{base}/Datastreams({ds_id})/Observations",
+                    params={"$count": "true", "$top": "1"},
+                    headers=headers,
+                    timeout=30,
+                )
+            resp.raise_for_status()
+            body = resp.json()
+            if isinstance(body, dict) and "@iot.count" in body:
+                return int(body["@iot.count"])
+            return len(body.get("value", [])) if isinstance(body, dict) else None
+        except Exception:
+            return None
+
+    # 2. Resolve a datastream to write to.
+    if datastream_id is None:
+        try:
+            resp = req.get(
+                f"{base}/Datastreams",
+                params={
+                    "$filter": f"startswith(name,'{prefix}')",
+                    "$select": "@iot.id,name",
+                    "$top": "1",
+                },
+                headers=headers,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            streams = resp.json().get("value", [])
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Failed to list CollaborAll datastreams: {exc}") from exc
+        if not streams:
+            return {
+                "target": base,
+                "verdict": "no_geo_datastreams",
+                "detail": f"No datastreams starting with '{prefix}' exist on CollaborAll.",
+            }
+        datastream_id = streams[0]["@iot.id"]
+        datastream_name = streams[0].get("name")
+    else:
+        datastream_name = None
+
+    ds_id_int = _coerce_iot_id(datastream_id)
+    count_before = _count(ds_id_int)
+
+    # 3. Build the observation with the same coercions the push path applies.
+    now = datetime.now(timezone.utc)
+    phenom = now.isoformat().replace("+00:00", "Z")
+    payload = {
+        "phenomenonTime": phenom,
+        "resultTime": phenom,
+        "result": 0.0,
+        "resultQuality": _as_quality_list("diagnostic"),
+        "parameters": {"diagnostic": True, "source": "connector-write-test"},
+        "Datastream": {"@iot.id": ds_id_int},
+    }
+
+    # 4. POST it and capture the raw server response.
+    try:
+        post_resp = req.post(f"{base}/Observations", json=payload, headers=headers, timeout=30)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"CollaborAll POST failed: {exc}") from exc
+
+    location = post_resp.headers.get("Location")
+    count_after = _count(ds_id_int)
+
+    if not post_resp.ok:
+        verdict = "rejected"
+    elif count_before is not None and count_after is not None and count_after > count_before:
+        verdict = "landed"
+    elif location:
+        verdict = "landed"
+    else:
+        verdict = "accepted_no_persist"
+
+    return {
+        "target": base,
+        "datastream_id": ds_id_int,
+        "datastream_name": datastream_name,
+        "verdict": verdict,
+        "status_code": post_resp.status_code,
+        "location": location,
+        "count_before": count_before,
+        "count_after": count_after,
+        "response_body": post_resp.text[:1000],
+        "payload_sent": payload,
+    }
+
+
 # --- Diagnostics (temporary) ---
 
 
