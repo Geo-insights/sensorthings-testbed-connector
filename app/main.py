@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -17,6 +18,11 @@ from app.services.sensorthings_client import client
 
 setup_logging(debug=settings.debug)
 logger = logging.getLogger("connector.events")
+
+# Set by POST /connector/kafka-skip-to-latest. The persistent Kafka consumer
+# checks this at the top of each cycle: when set, it seeks all partitions to
+# their high watermark and commits, dropping the backlog and going live.
+_kafka_skip_to_latest = threading.Event()
 
 
 def _consume_and_push_once(consumer, max_messages: int = 500, timeout: float = 5.0) -> dict:
@@ -90,6 +96,19 @@ async def _kafka_ingest_loop():
                 await run_in_threadpool(consumer.connect)
                 last_reconnect_at = time.monotonic()
                 logger.info("Kafka persistent consumer connected")
+            # One-shot skip-to-latest: drop the backlog and go live from the
+            # topic head. Requested via POST /connector/kafka-skip-to-latest.
+            if _kafka_skip_to_latest.is_set():
+                advanced = await run_in_threadpool(consumer.seek_to_end_and_commit)
+                _kafka_skip_to_latest.clear()
+                logger.warning("Kafka skip-to-latest: advanced %d partition(s) to head", advanced)
+                send_alert(
+                    "kafka.skip_to_latest",
+                    f"Skipped Kafka group to latest on {advanced} partition(s); backlog dropped, now live.",
+                    level="info",
+                    context={"partitions": advanced, "group": settings.kafka_tgv_consumer_group},
+                    force=True,
+                )
             summary = await run_in_threadpool(_consume_and_push_once, consumer)
             consecutive_failures = 0
             if summary.get("pulled", 0) > 0:

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import requests as _requests
-from confluent_kafka import Consumer, KafkaError, KafkaException
+from confluent_kafka import Consumer, KafkaError, KafkaException, TopicPartition
 from confluent_kafka.error import SerializationError
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroDeserializer
@@ -152,6 +153,49 @@ class KafkaTGVConsumer:
             raise RuntimeError("KafkaTGVConsumer.connect() must be called before commit()")
         self._consumer.commit()
         logger.debug("Kafka offsets committed")
+
+    def seek_to_end_and_commit(self, assignment_timeout: float = 15.0) -> int:
+        """Skip the consumer group to the latest offsets, dropping any backlog.
+
+        Ensures the consumer has a partition assignment, moves each partition's
+        fetch position to its high watermark via ``seek()`` (so this consumer
+        reads only new messages), then commits those offsets for the group so
+        the skip survives a restart.
+
+        Returns:
+            Number of partitions advanced to the head.
+
+        Raises:
+            RuntimeError: If connect() has not been called.
+        """
+        if self._consumer is None:
+            raise RuntimeError("KafkaTGVConsumer.connect() must be called before seek_to_end_and_commit()")
+
+        deadline = time.monotonic() + assignment_timeout
+        assignment = self._consumer.assignment()
+        while not assignment and time.monotonic() < deadline:
+            # poll() drives the group join so partitions get assigned.
+            self._consumer.poll(0.5)
+            assignment = self._consumer.assignment()
+
+        if not assignment:
+            logger.warning("seek_to_end_and_commit: no partition assignment after %.1fs", assignment_timeout)
+            return 0
+
+        end_tps: list[TopicPartition] = []
+        for tp in assignment:
+            _low, high = self._consumer.get_watermark_offsets(tp, timeout=10.0, cached=False)
+            end_tp = TopicPartition(tp.topic, tp.partition, high)
+            try:
+                self._consumer.seek(end_tp)
+            except KafkaException as exc:
+                logger.warning("seek_to_end_and_commit: seek failed on %s[%s]: %s", tp.topic, tp.partition, exc)
+            end_tps.append(end_tp)
+
+        if end_tps:
+            self._consumer.commit(offsets=end_tps, asynchronous=False)
+        logger.info("Kafka group skipped to latest on %d partition(s)", len(end_tps))
+        return len(end_tps)
 
     # ------------------------------------------------------------------
     # Helpers
