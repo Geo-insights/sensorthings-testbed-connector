@@ -1286,6 +1286,41 @@ class SensorThingsClient:
                 return base_url
         return None
 
+    def _observation_exists_at(
+        self, obs_endpoint: str, headers: dict[str, str], datastream_id: Any, phenomenon_time: str
+    ) -> bool | None:
+        """Return True if an Observation already exists for (datastream, phenomenonTime).
+
+        Used by the DLQ replay path to avoid re-creating an observation whose
+        original POST timed out *after* the server committed it — a duplicate a
+        stock FROST (which doesn't enforce uniqueness) would silently accept.
+        Returns ``None`` when the check is indeterminate (network/parse error or
+        unknown datastream) so the caller falls back to writing rather than risk
+        data loss.
+        """
+        ds_ref = _coerce_iot_id(datastream_id)
+        if ds_ref in (None, "", "unknown"):
+            return None
+        params = {
+            "$filter": f"Datastream/@iot.id eq {ds_ref} and phenomenonTime eq {phenomenon_time}",
+            "$top": "1",
+            "$select": "@iot.id",
+        }
+        try:
+            response = requests.get(obs_endpoint, params=params, headers=headers, timeout=self._request_timeout())
+        except requests.RequestException:
+            return None
+        if not response.ok:
+            return None
+        try:
+            body = response.json()
+        except ValueError:
+            return None
+        value = body.get("value") if isinstance(body, dict) else None
+        if not isinstance(value, list):
+            return None
+        return len(value) > 0
+
     def replay_failed_observations(self, max_lines: int | None = None) -> dict[str, Any]:
         if not self._failed_observations_path.exists():
             return {
@@ -1355,6 +1390,24 @@ class SensorThingsClient:
                     continue
 
                 headers = self._headers_for_url(base_url) if base_url else self._headers()
+
+                # Dedup probe: a write that timed out after the server committed it
+                # would be duplicated on replay against a server that doesn't enforce
+                # (Datastream, phenomenonTime) uniqueness. Check once here — the replay
+                # path is rare and low-volume, so the round-trip cost that would be
+                # prohibitive on the hot path is acceptable. An indeterminate result
+                # falls through to a normal POST (never drop, so no data loss).
+                if settings.frost_replay_dedup_probe:
+                    phenomenon_time = payload.get("phenomenonTime")
+                    ds_ref = None
+                    if isinstance(payload.get("Datastream"), dict):
+                        ds_ref = payload["Datastream"].get("@iot.id")
+                    if ds_ref is None:
+                        ds_ref = datastream_id
+                    if phenomenon_time and self._observation_exists_at(endpoint, headers, ds_ref, str(phenomenon_time)) is True:
+                        results.append({"datastream_id": datastream_id, "ok": True, "status_code": 200, "duplicate": True})
+                        continue
+
                 attempted += 1
                 try:
                     response = requests.post(endpoint, json=payload, headers=headers, timeout=self._request_timeout())
@@ -1537,6 +1590,32 @@ class SensorThingsClient:
             "projects": _advertises("Projects"),
             "tasking": _advertises("Tasking") or _advertises("Tasks"),
             "opencitysense": _advertises("OpenCitySense"),
+            "data_array": _advertises("data-array") or _advertises("dataArray") or _advertises("DataArrayValue"),
+            "mqtt": _advertises("mqtt"),
+            "batch_request": _advertises("batch"),
+        }
+
+        # Write-path capabilities a producer must discover to be both fast and
+        # safe (cf. testbed discussions #22/#23): whether bulk dataArray insert is
+        # available, whether the server lets a client supply entity ids (v2), and
+        # how duplicate (Datastream, phenomenonTime) writes are handled.
+        normalized = root_url.rstrip("/")
+        is_v2 = stack.is_v2 if stack else False
+        batch_observed_unsupported = normalized in self._no_batch_targets
+        write_capabilities = {
+            "create_observations_dataArray": {
+                "advertised": extensions["data_array"],
+                "observed_unsupported": batch_observed_unsupported,
+                "in_use": settings.frost_batch_push_enabled and not is_v2 and not batch_observed_unsupported,
+            },
+            # v2 lets a client supply @iot.id, turning entity upsert from
+            # check-then-act into an idempotent write at a deterministic id.
+            "client_specified_id": is_v2,
+            # We POST optimistically and treat 409 Conflict as already-delivered,
+            # which only deduplicates when the server enforces uniqueness. The DLQ
+            # replay path probes explicitly (FROST_REPLAY_DEDUP_PROBE) to stay safe
+            # on servers that accept duplicate observations.
+            "observation_duplicate_handling": "optimistic-write; 409-as-delivered (server-dependent)",
         }
 
         return {
@@ -1549,6 +1628,7 @@ class SensorThingsClient:
             "collections": collections,
             "conformance": conformance,
             "extensions": extensions,
+            "write_capabilities": write_capabilities,
         }
 
     def check_capabilities(self) -> dict[str, Any]:

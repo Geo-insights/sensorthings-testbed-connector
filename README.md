@@ -241,6 +241,30 @@ For the WBD-RD FROST environment, use `SENSORTHINGS_AUTH_USERNAME` and `SENSORTH
 | `FAILED_REPLAY_ENABLED` | Enable scheduled dead-letter queue replay, default `true` |
 | `FAILED_REPLAY_INTERVAL_SECONDS` | DLQ replay interval, default `900` |
 | `FAILED_REPLAY_MAX_LINES` | Max observations per replay cycle, default `500` |
+| `FROST_REPLAY_DEDUP_PROBE` | Probe for an existing `(Datastream, phenomenonTime)` before re-posting a dead-letter entry, so replay can't duplicate on servers that don't enforce observation uniqueness, default `true` |
+
+### Observation delivery semantics
+
+The connector writes observations **optimistically**: it POSTs (single or, by
+default, batched via the `CreateObservations` dataArray extension) without a
+pre-write existence probe, and treats an `HTTP 409 Conflict` as "already
+delivered". This keeps the hot path free of the round-trip-per-observation cost
+that a `GET ?$filter=phenomenonTime eq ...` probe would add.
+
+This deduplicates correctly **only when the target server enforces uniqueness on
+`(Datastream, phenomenonTime)` and returns 409**. Standard FROST does not enforce
+this by default, so two safeguards apply:
+
+- The live streaming/polling paths seed the last-pushed timestamp per datastream
+  from FROST on startup (`_seed_timestamps_from_frost`) and drop readings at or
+  before it — a forward-only cursor that needs one query per datastream per run
+  rather than one per observation.
+- The dead-letter replay path probes for an existing `(Datastream,
+  phenomenonTime)` before re-posting (`FROST_REPLAY_DEDUP_PROBE`, default `true`),
+  so a write that timed out after the server committed it is not duplicated.
+
+Back-dated corrections (a new value for a `phenomenonTime` already stored) are
+not handled — the connector's sources are forward-only.
 
 ### Configuration notes
 
