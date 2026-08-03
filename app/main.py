@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -18,40 +19,137 @@ setup_logging(debug=settings.debug)
 logger = logging.getLogger("connector.events")
 
 
-def _kafka_push_cycle(max_messages: int = 500, timeout: float = 5.0) -> dict:
-    """Run one Kafka consume → FROST push cycle (blocking)."""
-    from app.services.kafka_tgv_consumer import KafkaTGVConsumer
+def _consume_and_push_once(consumer, max_messages: int = 500, timeout: float = 5.0) -> dict:
+    """Consume one batch from an already-connected persistent consumer, push to
+    FROST, and commit. Blocking; call via run_in_threadpool."""
     from app.sources.tgv_kafka_mapping import avro_batch_to_sensor_readings
 
-    with KafkaTGVConsumer() as consumer:
-        records = consumer.consume_batch(max_messages=max_messages, timeout=timeout)
-        if not records:
-            return {"pulled": 0}
-        readings = avro_batch_to_sensor_readings(records)
-        result = client.push_observations(readings)
-        # Commit only after push completes — failed observations are safely
-        # in the DLQ, so re-consuming them would just create duplicates.
-        consumer.commit()
+    records = consumer.consume_batch(max_messages=max_messages, timeout=timeout)
+    if not records:
+        return {"pulled": 0}
+    readings = avro_batch_to_sensor_readings(records)
+    result = client.push_observations(readings)
+    # Commit only after push completes — failed observations are safely in the
+    # DLQ, so re-consuming them would just create duplicates.
+    consumer.commit()
     # Forward to monitoring module (fire-and-forget)
     _push_to_monitoring(readings)
     return {"pulled": len(records), "mapped": len(readings), "pushed": result.get("total_sent", 0)}
 
 
+def _kafka_stale_threshold(poll_seconds: int) -> int:
+    """Seconds of no Kafka data after which the source is considered stalled."""
+    if settings.kafka_stale_seconds > 0:
+        return settings.kafka_stale_seconds
+    return poll_seconds + max(0, settings.freshness_grace_seconds)
+
+
 async def _kafka_ingest_loop():
-    """Background loop: consume Kafka and push to FROST every KAFKA_TGV_POLL_SECONDS."""
-    poll_seconds = max(10, int(settings.kafka_tgv_poll_seconds))
-    logger.info("Kafka ingest loop started (every %ds)", poll_seconds)
+    """Background loop with a single persistent Kafka consumer.
+
+    One long-lived consumer stays subscribed across cycles and is polled
+    frequently (well within ``max.poll.interval.ms``) to keep group membership
+    stable. This removes the per-cycle join/rebalance churn of the old
+    create/subscribe/close-every-300s design — that pattern could exceed the
+    max poll interval, get the consumer evicted from the group, and drop data.
+
+    Self-healing: on any cycle error the consumer is torn down and rebuilt on
+    the next iteration (auto-reconnect, with capped backoff). A stall watchdog
+    fires a critical alert and forces a reconnect when no data arrives past the
+    stale threshold, and a distinct alert fires on Kafka auth/authorization
+    failures so a rotated Confluent key surfaces immediately instead of as a
+    silent multi-day flatline.
+    """
+    from app.services.alerting import send_alert
+    from app.services.health_monitor import health_monitor
+    from app.services.kafka_tgv_consumer import KafkaTGVConsumer
+
+    # Poll frequently regardless of the configured cycle interval so the
+    # consumer keeps sending heartbeats and stays in the group.
+    poll_seconds = max(5, min(30, int(settings.kafka_tgv_poll_seconds)))
+    stale_threshold = _kafka_stale_threshold(max(10, int(settings.kafka_tgv_poll_seconds)))
+    logger.info(
+        "Kafka ingest loop started (persistent consumer, poll every %ds, stall threshold %ds)",
+        poll_seconds, stale_threshold,
+    )
+
+    def _drop_consumer(c) -> None:
+        try:
+            c.close()
+        except Exception:
+            pass
+
+    consumer = None
+    consecutive_failures = 0
+    last_reconnect_at = 0.0
+
     while True:
         try:
-            summary = await run_in_threadpool(_kafka_push_cycle)
+            if consumer is None:
+                consumer = KafkaTGVConsumer()
+                await run_in_threadpool(consumer.connect)
+                last_reconnect_at = time.monotonic()
+                logger.info("Kafka persistent consumer connected")
+            summary = await run_in_threadpool(_consume_and_push_once, consumer)
+            consecutive_failures = 0
             if summary.get("pulled", 0) > 0:
+                health_monitor.record_source_success("kafka")
                 logger.info(
                     "Kafka push: pulled=%s mapped=%s pushed=%s",
                     summary.get("pulled"), summary.get("mapped"), summary.get("pushed"),
                 )
-        except Exception:
-            logger.exception("Kafka ingest cycle failed")
+        except Exception as exc:
+            consecutive_failures += 1
+            logger.exception("Kafka ingest cycle failed (failure #%d)", consecutive_failures)
+            health_monitor.record_source_error("kafka", f"{type(exc).__name__}: {exc}")
+            if _is_kafka_auth_error(exc):
+                send_alert(
+                    "kafka.auth_failure",
+                    "Kafka authentication/authorization failed — check the Confluent "
+                    "API key/secret (likely rotated or revoked).",
+                    level="critical",
+                    context={"error": f"{type(exc).__name__}: {exc}", "group": settings.kafka_tgv_consumer_group},
+                    dedup_key="kafka.auth_failure",
+                )
+            # Auto-reconnect: tear down; the next iteration rebuilds the consumer.
+            if consumer is not None:
+                await run_in_threadpool(_drop_consumer, consumer)
+                consumer = None
+            # Capped backoff that grows with consecutive failures.
+            await asyncio.sleep(min(60, poll_seconds * consecutive_failures))
+            continue
+
+        # Stall watchdog — fires even when cycles "succeed" but return 0 records.
+        age = health_monitor.source_age_seconds("kafka")
+        if age is not None and age > stale_threshold:
+            send_alert(
+                "kafka.stall",
+                f"No Kafka observations for {int(age)}s (threshold {stale_threshold}s). "
+                "Reconnecting consumer; check upstream producer and Confluent topic.",
+                level="critical",
+                context={"age_seconds": round(age, 1), "threshold_seconds": stale_threshold},
+                dedup_key="kafka.stall",
+            )
+            # Force a reconnect at most once per stale window (independent of
+            # whether the alert webhook is configured), so a genuinely-idle
+            # upstream doesn't cause a reconnect storm every cycle.
+            now = time.monotonic()
+            if (now - last_reconnect_at) > stale_threshold and consumer is not None:
+                logger.warning("Kafka stall detected (%ds) — reconnecting consumer", int(age))
+                await run_in_threadpool(_drop_consumer, consumer)
+                consumer = None
+                last_reconnect_at = now
+
         await asyncio.sleep(poll_seconds)
+
+
+def _is_kafka_auth_error(exc: BaseException) -> bool:
+    """Heuristic: does this exception look like a Kafka auth/authorization failure?"""
+    text = f"{type(exc).__name__} {exc}".lower()
+    return any(
+        token in text
+        for token in ("authentication", "authorization", "sasl", "_authentication", "not authorized", "unauthorized")
+    )
 
 
 def _resolve_monitoring_datastream_id(reading) -> str | None:
@@ -284,6 +382,8 @@ async def _polling_ingest_loop(source):
                 if new_readings:
                     result = await run_in_threadpool(client.push_observations, new_readings)
                     _update_timestamps(new_readings, last_timestamps)
+                    from app.services.health_monitor import health_monitor
+                    health_monitor.record_source_success(source.source_name.lower())
                     logger.info(
                         "%s push: readings=%d new=%d pushed=%s",
                         source.source_name,
@@ -295,8 +395,10 @@ async def _polling_ingest_loop(source):
                     await run_in_threadpool(_push_to_monitoring, new_readings)
                 else:
                     logger.debug("%s: all %d readings already pushed, skipping", source.source_name, len(readings))
-        except Exception:
+        except Exception as exc:
             logger.exception("%s polling cycle failed", source.source_name)
+            from app.services.health_monitor import health_monitor
+            health_monitor.record_source_error(source.source_name.lower(), f"{type(exc).__name__}: {exc}")
         await asyncio.sleep(poll_seconds)
 
 
