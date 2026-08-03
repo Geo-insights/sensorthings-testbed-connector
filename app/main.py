@@ -140,23 +140,38 @@ async def _kafka_ingest_loop():
             await asyncio.sleep(min(60, poll_seconds * consecutive_failures))
             continue
 
-        # Stall watchdog — fires even when cycles "succeed" but return 0 records.
+        # Stall watchdog — fires when cycles "succeed" but return 0 records, AND
+        # (critically) when the consumer has connected but never delivered a
+        # single message since the last (re)connect. In that case
+        # ``source_age_seconds`` is None, so the old ``age is not None`` guard
+        # skipped the watchdog entirely: a consumer that stalls (e.g. a
+        # rebalance stall) before its first push would stay wedged forever. Fall
+        # back to "seconds since the consumer last connected" so a never-delivered
+        # stall is still detected and reconnected.
+        now = time.monotonic()
         age = health_monitor.source_age_seconds("kafka")
-        if age is not None and age > stale_threshold:
+        stalled_for = age if age is not None else (now - last_reconnect_at)
+        if stalled_for > stale_threshold:
             send_alert(
                 "kafka.stall",
-                f"No Kafka observations for {int(age)}s (threshold {stale_threshold}s). "
+                f"No Kafka observations for {int(stalled_for)}s (threshold {stale_threshold}s). "
                 "Reconnecting consumer; check upstream producer and Confluent topic.",
                 level="critical",
-                context={"age_seconds": round(age, 1), "threshold_seconds": stale_threshold},
+                context={
+                    "age_seconds": round(stalled_for, 1),
+                    "threshold_seconds": stale_threshold,
+                    "ever_delivered": age is not None,
+                },
                 dedup_key="kafka.stall",
             )
             # Force a reconnect at most once per stale window (independent of
             # whether the alert webhook is configured), so a genuinely-idle
             # upstream doesn't cause a reconnect storm every cycle.
-            now = time.monotonic()
             if (now - last_reconnect_at) > stale_threshold and consumer is not None:
-                logger.warning("Kafka stall detected (%ds) — reconnecting consumer", int(age))
+                logger.warning(
+                    "Kafka stall detected (%ds, ever_delivered=%s) — reconnecting consumer",
+                    int(stalled_for), age is not None,
+                )
                 await run_in_threadpool(_drop_consumer, consumer)
                 consumer = None
                 last_reconnect_at = now
