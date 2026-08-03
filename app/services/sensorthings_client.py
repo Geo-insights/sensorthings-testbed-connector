@@ -741,6 +741,27 @@ class SensorThingsClient:
             settings.locations_path, location_name, location_payload, "locations"
         )
 
+        # Explicitly link Thing -> Location via the Thing's Locations navigation.
+        # Some FROST implementations (notably the CollaborAll PHP v1.1 server)
+        # ignore the nested "Things" deep-link on a Location POST, leaving the
+        # Thing with no Location; the server then can't auto-resolve a
+        # FeatureOfInterest and rejects every observation with HTTP 409. A PATCH
+        # on the Thing is honoured by both Java and PHP FROST and is idempotent
+        # where the deep-insert already linked them.
+        if location_id and thing_id:
+            try:
+                thing_endpoint = em._http.endpoint(f"{settings.things_path}({thing_id})")
+                if thing_endpoint:
+                    em._http.patch(
+                        thing_endpoint,
+                        {"Locations": [{"@iot.id": _coerce_iot_id(location_id)}]},
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Thing->Location link PATCH failed on %s (%s): %s",
+                    stack.label, stack.version, exc,
+                )
+
         sensor_ids: dict[str, str | None] = {}
         observed_property_ids: dict[str, str | None] = {}
         datastream_results: list[dict[str, Any]] = []

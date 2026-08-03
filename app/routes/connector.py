@@ -18,6 +18,10 @@ from app.services.monitoring_mqtt_bridge import (
 )
 from app.services.sensorthings_client import client
 
+import logging
+
+logger = logging.getLogger("connector.events")
+
 router = APIRouter(prefix="/connector", tags=["connector"])
 
 
@@ -350,6 +354,32 @@ def freshness(response: Response) -> dict:
     return result
 
 
+@router.post("/kafka-skip-to-latest")
+def kafka_skip_to_latest() -> dict:
+    """Signal the running Kafka consumer to drop its backlog and go live.
+
+    Sets a one-shot flag the persistent consumer checks at the top of its next
+    cycle: it seeks every assigned partition to its high watermark and commits,
+    so the group resumes from the topic head instead of replaying the backlog.
+    Use after a long stall when the old data is not worth backfilling.
+
+    Returns immediately; the skip happens on the consumer's next poll (within
+    one ``poll_seconds`` window). Confirm with ``GET /connector/kafka-diag``
+    (``total_lag`` should drop to ~0).
+    """
+    if not settings.kafka_tgv_enabled:
+        return {"requested": False, "reason": "kafka_tgv_enabled is false — no consumer is running."}
+    from app.main import _kafka_skip_to_latest
+
+    _kafka_skip_to_latest.set()
+    logger.warning("kafka-skip-to-latest requested via API — consumer will drop backlog on next cycle")
+    return {
+        "requested": True,
+        "group": settings.kafka_tgv_consumer_group,
+        "note": "Backlog will be dropped on the consumer's next poll. Verify with GET /connector/kafka-diag (total_lag -> ~0).",
+    }
+
+
 @router.post("/collaborall-write-test")
 def collaborall_write_test(
     datastream_id: int | None = Query(
@@ -482,6 +512,186 @@ def collaborall_write_test(
         "count_after": count_after,
         "response_body": post_resp.text[:1000],
         "payload_sent": payload,
+    }
+
+
+@router.post("/collaborall-fix-locations")
+def collaborall_fix_locations(
+    dry_run: bool = Query(
+        default=False, description="Preview the plan without writing when true."
+    ),
+    limit: int = Query(default=0, description="Cap the number of Things processed (0 = all)."),
+) -> dict:
+    """Repair CollaborAll: link a Location to every GEO_ Thing that lacks one.
+
+    CollaborAll's FROST server rejects every observation with HTTP 409
+    ``its Thing has no Location`` because its GEO_ Things were registered without
+    a linked Location — that server ignores the nested ``Things`` deep-link on a
+    Location POST (the primary Java FROST honours it). Without a Location the
+    server cannot auto-resolve a FeatureOfInterest, so every write fails.
+
+    This mirrors the Thing->Location pairing from the healthy primary target:
+    for each unlinked CollaborAll Thing it finds the same-named Thing on the
+    primary, copies its Location (creating it on CollaborAll if missing), and
+    links it via a PATCH on the Thing's ``Locations`` navigation. Idempotent —
+    Things that already have a Location are skipped.
+    """
+    import re
+    import requests as req
+
+    from app.services.sensorthings_client import _coerce_iot_id
+
+    collab = next((t for t in settings.frost_targets if "collaborall" in t.url.lower()), None)
+    if collab is None:
+        raise HTTPException(status_code=404, detail="No CollaborAll target configured.")
+    base_c = collab.url.rstrip("/")
+    headers_c = {**client._headers_for_url(base_c), "Content-Type": "application/json"}
+
+    base_p = client._http.primary_base_url.rstrip("/")
+    headers_p = client._headers()
+    prefix = settings.entity_name_prefix
+
+    # List CollaborAll GEO_ Things with their current Locations.
+    try:
+        resp = req.get(
+            f"{base_c}/Things",
+            params={
+                "$filter": f"startswith(name,'{prefix}')",
+                "$expand": "Locations($select=@iot.id,name)",
+                "$select": "@iot.id,name",
+                "$top": "1000",
+            },
+            headers=headers_c,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        things = resp.json().get("value", [])
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to list CollaborAll Things: {exc}") from exc
+
+    def _primary_location_for(thing_name: str) -> dict | None:
+        """The Location of the same-named Thing on the primary (healthy) target."""
+        try:
+            r = req.get(
+                f"{base_p}/Things",
+                params={
+                    "$filter": f"name eq '{thing_name}'",
+                    "$expand": "Locations($select=name,description,encodingType,location)",
+                    "$select": "@iot.id,name",
+                    "$top": "1",
+                },
+                headers=headers_p,
+                timeout=30,
+            )
+            r.raise_for_status()
+            vals = r.json().get("value", [])
+        except Exception:
+            return None
+        if not vals:
+            return None
+        locs = vals[0].get("Locations", [])
+        return locs[0] if locs else None
+
+    def _find_collab_location(name: str) -> int | None:
+        try:
+            r = req.get(
+                f"{base_c}/Locations",
+                params={"$filter": f"name eq '{name}'", "$select": "@iot.id", "$top": "1"},
+                headers=headers_c,
+                timeout=30,
+            )
+            r.raise_for_status()
+            vals = r.json().get("value", [])
+        except Exception:
+            return None
+        return vals[0]["@iot.id"] if vals else None
+
+    def _id_from_response(r) -> int | None:
+        try:
+            body = r.json()
+            if isinstance(body, dict) and body.get("@iot.id") is not None:
+                return _coerce_iot_id(body["@iot.id"])
+        except Exception:
+            pass
+        m = re.search(r"\((\d+)\)\s*$", r.headers.get("Location", ""))
+        return int(m.group(1)) if m else None
+
+    results: list[dict] = []
+    linked = created = skipped = failed = processed = 0
+    for thing in things:
+        if limit and processed >= limit:
+            break
+        tname = thing.get("name")
+        tid = thing.get("@iot.id")
+        if thing.get("Locations"):
+            skipped += 1
+            continue
+        processed += 1
+        loc = _primary_location_for(tname)
+        if not loc:
+            failed += 1
+            results.append({"thing": tname, "thing_id": tid, "status": "no_primary_location"})
+            continue
+        loc_name = loc.get("name")
+        if dry_run:
+            results.append({"thing": tname, "thing_id": tid, "status": "would_link", "location_name": loc_name})
+            continue
+        loc_id = _find_collab_location(loc_name)
+        loc_created = False
+        if loc_id is None:
+            try:
+                cr = req.post(
+                    f"{base_c}/Locations",
+                    json={
+                        "name": loc_name,
+                        "description": loc.get("description") or loc_name,
+                        "encodingType": loc.get("encodingType") or "application/geo+json",
+                        "location": loc.get("location"),
+                    },
+                    headers=headers_c,
+                    timeout=30,
+                )
+                cr.raise_for_status()
+                loc_id = _id_from_response(cr)
+                loc_created = True
+            except Exception as exc:
+                failed += 1
+                results.append({"thing": tname, "thing_id": tid, "status": "location_create_failed", "error": str(exc)[:300]})
+                continue
+        if loc_id is None:
+            failed += 1
+            results.append({"thing": tname, "thing_id": tid, "status": "location_id_unresolved"})
+            continue
+        try:
+            pr = req.patch(
+                f"{base_c}/Things({tid})",
+                json={"Locations": [{"@iot.id": _coerce_iot_id(loc_id)}]},
+                headers=headers_c,
+                timeout=30,
+            )
+        except Exception as exc:
+            failed += 1
+            results.append({"thing": tname, "thing_id": tid, "status": "link_error", "error": str(exc)[:300]})
+            continue
+        if not pr.ok:
+            failed += 1
+            results.append({"thing": tname, "thing_id": tid, "status": "link_failed", "status_code": pr.status_code, "body": pr.text[:300]})
+            continue
+        linked += 1
+        if loc_created:
+            created += 1
+        results.append({"thing": tname, "thing_id": tid, "status": "linked", "location_id": loc_id, "location_created": loc_created})
+
+    return {
+        "target": base_c,
+        "primary": base_p,
+        "dry_run": dry_run,
+        "geo_things": len(things),
+        "already_linked_skipped": skipped,
+        "linked": linked,
+        "locations_created": created,
+        "failed": failed,
+        "results": results,
     }
 
 
