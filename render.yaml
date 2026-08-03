@@ -3,6 +3,12 @@ services:
     name: sensorthings-testbed-connector
     runtime: docker
     plan: starter  # $7/mo, always-on (free tier spins down after 15min idle)
+    # Liveness probe. Render only auto-restarts on process *crash*, not on a
+    # hung event loop. Pointing the health check at /health (always 200 while
+    # the ASGI loop can respond) makes Render restart the instance when the loop
+    # freezes and stops answering — the one failure mode the in-process Kafka
+    # watchdog cannot self-heal because it runs on that same frozen loop.
+    healthCheckPath: /health
     envVars:
       - key: KAFKA_TGV_ENABLED
         value: "true"
