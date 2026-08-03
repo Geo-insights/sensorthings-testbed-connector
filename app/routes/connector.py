@@ -695,6 +695,70 @@ def collaborall_fix_locations(
     }
 
 
+@router.post("/dlq-clear")
+def dlq_clear(
+    confirm: bool = Query(default=False, description="Must be true to actually truncate the DLQ."),
+    keep_bytes: int = Query(
+        default=0,
+        ge=0,
+        description="Keep this many bytes of the most recent DLQ tail (line-aligned); 0 = clear all.",
+    ),
+) -> dict:
+    """Truncate the dead-letter queue to free disk space (full-disk recovery).
+
+    ``failed_observations.jsonl`` can grow until it fills the mounted disk when a
+    target rejects writes for an extended period (e.g. the CollaborAll 409
+    storm before Locations were linked). A full disk then fails every disk write
+    — registration cache, the DLQ itself — degrading the whole service.
+
+    Without ``confirm=true`` this only reports the current size. With it, the
+    file is truncated, optionally preserving the last ``keep_bytes`` (rounded up
+    to the next newline so no partial JSON line survives). The truncate happens
+    first, so space is freed even when the disk is full.
+    """
+    from pathlib import Path
+
+    p = Path(settings.failed_observations_path)
+    try:
+        size_before = p.stat().st_size
+    except FileNotFoundError:
+        return {"cleared": False, "reason": "DLQ file does not exist", "size_bytes": 0}
+
+    if not confirm:
+        return {"cleared": False, "size_bytes": size_before, "note": "Pass confirm=true to truncate."}
+
+    tail = b""
+    if keep_bytes > 0 and size_before > keep_bytes:
+        try:
+            with p.open("rb") as handle:
+                handle.seek(size_before - keep_bytes)
+                tail = handle.read()
+            # Drop a leading partial line so only whole JSON records remain.
+            nl = tail.find(b"\n")
+            if nl != -1:
+                tail = tail[nl + 1:]
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to read DLQ tail: {exc}") from exc
+
+    try:
+        # Open in write mode truncates to 0 first (frees the space), then we
+        # write back the preserved tail (small enough to fit).
+        with p.open("wb") as handle:
+            if tail:
+                handle.write(tail)
+        size_after = p.stat().st_size
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to truncate DLQ: {exc}") from exc
+
+    logger.warning("DLQ truncated via API: freed %d bytes (kept %d)", size_before - size_after, size_after)
+    return {
+        "cleared": True,
+        "freed_bytes": size_before - size_after,
+        "size_before": size_before,
+        "size_after": size_after,
+    }
+
+
 # --- Diagnostics (temporary) ---
 
 
