@@ -75,6 +75,10 @@ class KafkaTGVConsumer:
             "sasl.password": settings.kafka_tgv_api_password,
             "auto.offset.reset": "latest",
             "enable.auto.commit": "false",
+            # Headroom so a slow push (large batch x multiple FROST targets)
+            # doesn't exceed the poll interval and get the consumer evicted
+            # from the group (MAXPOLL), which silently stops all consumption.
+            "max.poll.interval.ms": settings.kafka_tgv_max_poll_interval_ms,
         })
         self._consumer.subscribe(
             [settings.kafka_tgv_topic],
