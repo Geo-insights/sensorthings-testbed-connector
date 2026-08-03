@@ -323,6 +323,16 @@ class Settings:
     kafka_tgv_client_id: str = os.getenv("KAFKA_TGV_CLIENT_ID_CONSUMER", "geo-insights-consumer").strip()
     kafka_tgv_topic: str = os.getenv("KAFKA_TGV_TOPIC", "tud_gv_officelab-climate").strip()
     kafka_tgv_poll_seconds: int = int(os.getenv("KAFKA_TGV_POLL_SECONDS", "300"))
+    # Max messages pulled+pushed per consume cycle. Must be small enough that a
+    # full push (batch size x FROST targets) completes well within
+    # max.poll.interval.ms, or librdkafka evicts the consumer from the group
+    # (MAXPOLL) and it silently stops consuming. Large backlogs + a slow target
+    # are exactly what triggers this, so keep the batch modest.
+    kafka_tgv_batch_max_messages: int = int(os.getenv("KAFKA_TGV_BATCH_MAX_MESSAGES", "100"))
+    # librdkafka max.poll.interval.ms (ms). If the app doesn't call consume()
+    # within this window the broker evicts the consumer. Default 15 min gives a
+    # slow push plenty of headroom over the 5 min librdkafka default.
+    kafka_tgv_max_poll_interval_ms: int = int(os.getenv("KAFKA_TGV_MAX_POLL_INTERVAL_MS", "900000"))
     kafka_tgv_device_mapping: dict[str, dict[str, str]] = field(default_factory=_load_tgv_device_mapping)
     # --- Ohnics air quality source ---
     ohnics_enabled: bool = os.getenv("OHNICS_ENABLED", "false").lower() in {"1", "true", "yes", "on"}

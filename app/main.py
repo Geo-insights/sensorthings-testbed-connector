@@ -109,7 +109,9 @@ async def _kafka_ingest_loop():
                     context={"partitions": advanced, "group": settings.kafka_tgv_consumer_group},
                     force=True,
                 )
-            summary = await run_in_threadpool(_consume_and_push_once, consumer)
+            summary = await run_in_threadpool(
+                _consume_and_push_once, consumer, settings.kafka_tgv_batch_max_messages
+            )
             consecutive_failures = 0
             if summary.get("pulled", 0) > 0:
                 health_monitor.record_source_success("kafka")
