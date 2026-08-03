@@ -4,6 +4,7 @@ from typing import Literal
 from fastapi import APIRouter
 from fastapi import HTTPException
 from fastapi import Query
+from fastapi import Response
 from fastapi import UploadFile
 
 from app.config import settings
@@ -18,6 +19,15 @@ from app.services.monitoring_mqtt_bridge import (
 from app.services.sensorthings_client import client
 
 router = APIRouter(prefix="/connector", tags=["connector"])
+
+
+def _looks_like_auth_error(exc: BaseException) -> bool:
+    """Heuristic: does this Kafka exception look like an auth/authorization failure?"""
+    text = f"{type(exc).__name__} {exc}".lower()
+    return any(
+        token in text
+        for token in ("authentication", "authorization", "sasl", "not authorized", "unauthorized")
+    )
 
 
 @router.get("/preview")
@@ -197,6 +207,147 @@ def kafka_push(
         "failed": failed,
         "detail": push_result,
     }
+
+
+@router.get("/kafka-diag")
+def kafka_diagnostics() -> dict:
+    """Metadata-only Kafka health probe (no consume, no commit, no rebalance).
+
+    Reports, per partition of the TGV topic:
+      * ``high`` watermark  — the latest produced offset (is the topic producing?)
+      * ``committed``       — our consumer group's committed offset
+      * ``lag``             — high - committed (unconsumed backlog)
+
+    This distinguishes *upstream-producer-stopped* (high frozen, lag 0) from
+    *connector-consumer-stalled* (lag > 0 and growing) without needing the
+    Confluent console. Safe: it only issues metadata/offset requests using the
+    group already permitted by the API-key ACL.
+    """
+    if not settings.kafka_tgv_enabled:
+        raise HTTPException(
+            status_code=503,
+            detail="Kafka TGV source is disabled. Set KAFKA_TGV_ENABLED=true.",
+        )
+
+    from confluent_kafka import Consumer, KafkaException, TopicPartition
+
+    topic = settings.kafka_tgv_topic
+    consumer = Consumer({
+        "group.id": settings.kafka_tgv_consumer_group,
+        "client.id": f"{settings.kafka_tgv_client_id}-diag",
+        "bootstrap.servers": settings.kafka_tgv_bootstrap_servers,
+        "sasl.mechanisms": "PLAIN",
+        "security.protocol": "SASL_SSL",
+        "sasl.username": settings.kafka_tgv_api_key,
+        "sasl.password": settings.kafka_tgv_api_password,
+        "enable.auto.commit": "false",
+    })
+
+    try:
+        try:
+            md = consumer.list_topics(topic, timeout=10.0)
+        except KafkaException as exc:
+            return {
+                "connect_ok": False,
+                "auth_error": _looks_like_auth_error(exc),
+                "error": str(exc),
+                "group": settings.kafka_tgv_consumer_group,
+                "topic": topic,
+                "guidance": (
+                    "Kafka metadata request failed. If auth_error is true the "
+                    "Confluent API key/secret is likely rotated or revoked."
+                ),
+            }
+
+        topic_md = md.topics.get(topic)
+        if topic_md is None or topic_md.error is not None:
+            return {
+                "connect_ok": True,
+                "topic": topic,
+                "error": f"Topic not found or error: {getattr(topic_md, 'error', 'missing')}",
+            }
+
+        partitions: list[dict] = []
+        total_high = 0
+        total_lag = 0
+        tps = [TopicPartition(topic, p) for p in topic_md.partitions.keys()]
+        committed = {tp.partition: tp for tp in consumer.committed(tps, timeout=10.0)}
+
+        for p in sorted(topic_md.partitions.keys()):
+            tp = TopicPartition(topic, p)
+            low, high = consumer.get_watermark_offsets(tp, timeout=10.0, cached=False)
+            comm = committed.get(p)
+            comm_offset = comm.offset if comm is not None else -1001
+            has_commit = comm_offset is not None and comm_offset >= 0
+            lag = (high - comm_offset) if has_commit else None
+            total_high += high
+            if lag is not None:
+                total_lag += lag
+            partitions.append({
+                "partition": p,
+                "low": low,
+                "high": high,
+                "committed": comm_offset if has_commit else None,
+                "lag": lag,
+            })
+
+        if total_lag > 0:
+            guidance = (
+                "Unconsumed backlog present (lag > 0): the producer is/was active "
+                "but the connector consumer is behind or stalled \u2014 investigate the "
+                "ingest loop / consumer, not the upstream producer."
+            )
+        else:
+            guidance = (
+                "No backlog (lag 0). Call this endpoint again in ~30\u201360s: if the "
+                "'high' watermark is unchanged the upstream producer is idle/stopped; "
+                "if 'high' increased the pipeline is healthy and caught up."
+            )
+
+        return {
+            "connect_ok": True,
+            "auth_error": False,
+            "topic": topic,
+            "group": settings.kafka_tgv_consumer_group,
+            "partition_count": len(partitions),
+            "total_high_watermark": total_high,
+            "total_lag": total_lag,
+            "partitions": partitions,
+            "guidance": guidance,
+        }
+    finally:
+        try:
+            consumer.close()
+        except Exception:
+            pass
+
+
+@router.get("/freshness")
+def freshness(response: Response) -> dict:
+    """Per-source liveness for external uptime monitoring.
+
+    Returns each enabled source's age since its last successful push and a
+    ``stale`` flag against its expected interval. Responds HTTP 503 when any
+    source is stale so a pull-based uptime monitor (or the monitoring module)
+    catches stalls even if the outbound alert webhook can't fire (e.g. the
+    process is degraded).
+    """
+    from app.main import _kafka_stale_threshold
+    from app.services.health_monitor import health_monitor
+
+    grace = max(0, settings.freshness_grace_seconds)
+    thresholds: dict[str, float] = {}
+    if settings.kafka_tgv_enabled:
+        thresholds["kafka"] = _kafka_stale_threshold(max(10, int(settings.kafka_tgv_poll_seconds)))
+    if settings.ohnics_enabled:
+        thresholds["ohnics"] = settings.ohnics_poll_seconds + grace
+    if settings.levellog_enabled:
+        thresholds["levellog"] = settings.levellog_poll_seconds + grace
+
+    result = health_monitor.source_freshness(thresholds)
+    if result["any_stale"]:
+        response.status_code = 503
+    return result
 
 
 # --- Diagnostics (temporary) ---

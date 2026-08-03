@@ -22,6 +22,11 @@ class HealthMonitor:
         self._last_push_time: dict[str, float] = {}
         self._last_failure_time: dict[str, float] = {}
         self._start_time = time.monotonic()
+        # Per-source wall-clock freshness (survives meaning across the process
+        # lifetime; used by the Kafka watchdog and /connector/freshness).
+        self._source_last_success: dict[str, float] = {}
+        self._source_success_counts: dict[str, int] = {}
+        self._source_last_error: dict[str, str] = {}
 
     def record_success(self, datastream_id: str) -> None:
         with self._lock:
@@ -32,6 +37,68 @@ class HealthMonitor:
         with self._lock:
             self._failure_counts[datastream_id] = self._failure_counts.get(datastream_id, 0) + 1
             self._last_failure_time[datastream_id] = time.monotonic()
+
+    # ------------------------------------------------------------------
+    # Per-source freshness (wall clock)
+    # ------------------------------------------------------------------
+
+    def record_source_success(self, source: str) -> None:
+        """Record that ``source`` (e.g. ``"kafka"``, ``"ohnics"``) just delivered data."""
+        with self._lock:
+            self._source_last_success[source] = time.time()
+            self._source_success_counts[source] = self._source_success_counts.get(source, 0) + 1
+            self._source_last_error.pop(source, None)
+
+    def record_source_error(self, source: str, error: str = "") -> None:
+        """Record that ``source`` failed a cycle (does not update last-success)."""
+        with self._lock:
+            self._source_last_error[source] = error
+
+    def source_age_seconds(self, source: str) -> float | None:
+        """Seconds since ``source`` last delivered data, or None if never seen."""
+        with self._lock:
+            last = self._source_last_success.get(source)
+        return None if last is None else max(0.0, time.time() - last)
+
+    def source_freshness(self, thresholds: dict[str, float]) -> dict[str, Any]:
+        """Return per-source freshness against the given stale thresholds.
+
+        Args:
+            thresholds: Mapping of source name -> max allowed age in seconds.
+
+        Returns a dict with ``sources`` (per-source detail) and ``any_stale``.
+        A source that has a threshold but has never delivered is reported stale
+        only if the process has been up longer than its threshold (avoids a
+        false alarm during the first cycle after a deploy).
+        """
+        now_wall = time.time()
+        uptime = time.monotonic() - self._start_time
+        with self._lock:
+            last_success = dict(self._source_last_success)
+            counts = dict(self._source_success_counts)
+            last_error = dict(self._source_last_error)
+
+        sources: dict[str, Any] = {}
+        any_stale = False
+        for source, threshold in thresholds.items():
+            last = last_success.get(source)
+            age = None if last is None else max(0.0, now_wall - last)
+            if age is None:
+                stale = uptime > threshold
+            else:
+                stale = age > threshold
+            any_stale = any_stale or stale
+            sources[source] = {
+                "last_success_utc": (
+                    datetime.fromtimestamp(last, UTC).isoformat() if last is not None else None
+                ),
+                "age_seconds": round(age, 1) if age is not None else None,
+                "threshold_seconds": round(threshold, 1),
+                "success_count": counts.get(source, 0),
+                "last_error": last_error.get(source),
+                "stale": stale,
+            }
+        return {"any_stale": any_stale, "sources": sources}
 
     def check_stale_sensors(self, threshold_seconds: float = 3600.0) -> list[str]:
         """Return datastream IDs that haven't had a successful push within the threshold."""

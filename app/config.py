@@ -365,6 +365,21 @@ class Settings:
     # Safety bounds for the DLQ file.
     failed_dlq_max_bytes: int = int(os.getenv("FAILED_DLQ_MAX_BYTES", str(50 * 1024 * 1024)))  # 50 MB
     failed_dlq_max_age_hours: int = int(os.getenv("FAILED_DLQ_MAX_AGE_HOURS", "48"))
+    # --- Alerting (best-effort outbound webhook) ---
+    # Optional. When set, stall / auth-failure / auto-reconnect events are POSTed
+    # as a signed JSON envelope (Slack-compatible ``text`` field included). No-op
+    # when empty. Mirrors the monitoring module's webhook delivery pattern.
+    alert_webhook_url: str = os.getenv("ALERT_WEBHOOK_URL", "").strip()
+    alert_webhook_secret: str = os.getenv("ALERT_WEBHOOK_SECRET", "").strip()
+    # Per-event-key cooldown so a persistent condition doesn't spam the webhook.
+    alert_min_interval_seconds: int = int(os.getenv("ALERT_MIN_INTERVAL_SECONDS", "1800"))
+    # --- Freshness / stall detection ---
+    # A source is considered "stale" when no successful push has happened within
+    # (expected interval + grace). Used by the Kafka watchdog and /connector/freshness.
+    freshness_grace_seconds: int = int(os.getenv("FRESHNESS_GRACE_SECONDS", "600"))
+    # Explicit override for the Kafka source stall threshold (seconds). When 0,
+    # derived from kafka_tgv_poll_seconds + freshness_grace_seconds.
+    kafka_stale_seconds: int = int(os.getenv("KAFKA_STALE_SECONDS", "0"))
 
 
 settings = Settings()
