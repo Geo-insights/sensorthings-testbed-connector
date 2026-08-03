@@ -69,7 +69,7 @@ CLIMATE_ADAPTATION_ENTITY_SETS: list[dict[str, Any]] = [
                 "name": "CO2 concentration",
                 "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#mole_fraction_of_carbon_dioxide_in_air",
                 "description": "Indoor CO2 concentration.",
-                "unit": "ppm",
+                "unit": "[ppm]",  # UCUM: parts per million
             },
             "pressure": {
                 "name": "Air pressure",
@@ -127,7 +127,7 @@ CLIMATE_ADAPTATION_ENTITY_SETS: list[dict[str, Any]] = [
                 "name": "Wind direction",
                 "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#wind_from_direction",
                 "description": "Wind direction in degrees from north.",
-                "unit": "degrees",
+                "unit": "deg",  # UCUM: degree of angle
             },
             "precipitation": {
                 "name": "Precipitation",
