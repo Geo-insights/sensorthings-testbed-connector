@@ -104,6 +104,13 @@ class SensorThingsClient:
         self._datastream_ids: dict[str, str] = dict(settings.datastream_ids)
         self._datastream_ids.update(self._cache.collection("datastreams"))
         self._live_datastream_lookup_cache: dict[str, str] = {}
+        # Sensors we recently failed to resolve live, keyed by their most
+        # specific lookup key -> monotonic expiry. Prevents a per-push storm of
+        # serial HTTP GETs for sensors with no datastream on a target (each
+        # unresolvable sensor otherwise re-ran up to ~5 filter queries every
+        # push cycle, which dominated push latency for large coalesced batches).
+        self._live_datastream_lookup_negative: dict[str, float] = {}
+        self._live_lookup_negative_ttl: float = 300.0
         self._observed_property_names: dict[str, str] = self._build_observed_property_name_map()
         self._tasking_capability_ids: dict[str, str] = dict(self._cache.collection("tasking_capabilities"))
         # Targets that answered CreateObservations with 4xx/501 (no dataArray support).
@@ -342,6 +349,17 @@ class SensorThingsClient:
             if cache_key and cache_key in self._live_datastream_lookup_cache:
                 return self._live_datastream_lookup_cache[cache_key]
 
+        # Negative cache: skip the live HTTP lookup entirely for sensors we
+        # recently failed to resolve, so an unresolvable sensor costs one lookup
+        # per TTL instead of one per push cycle.
+        neg_key = next((key for key in cache_keys if key), "")
+        if neg_key:
+            neg_expiry = self._live_datastream_lookup_negative.get(neg_key)
+            if neg_expiry is not None:
+                if neg_expiry > time.monotonic():
+                    return None
+                del self._live_datastream_lookup_negative[neg_key]
+
         candidates: list[tuple[str, str]] = []
         if device_eui and stream_key:
             candidates.append(
@@ -388,6 +406,9 @@ class SensorThingsClient:
                 self._live_datastream_lookup_cache[cache_key] = datastream_id
             return datastream_id
 
+        # Remember the failure so the next push cycle doesn't repeat the storm.
+        if neg_key:
+            self._live_datastream_lookup_negative[neg_key] = time.monotonic() + self._live_lookup_negative_ttl
         return None
 
     def _create_entity(self, path: str, payload: dict[str, Any]) -> tuple[str | None, requests.Response]:
