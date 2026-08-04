@@ -374,10 +374,37 @@ class Settings:
     # Circuit breaker: skip a target after N consecutive failed push cycles.
     frost_cb_failure_threshold: int = int(os.getenv("FROST_CB_FAILURE_THRESHOLD", "3"))
     frost_cb_cooldown_seconds: float = field(default_factory=lambda: _load_float("FROST_CB_COOLDOWN_SECONDS", "600"))
+    # --- FROST push concurrency & async worker (throughput / decoupling) ---
+    # Push the FROST_BATCH_MAX_OBSERVATIONS-sized chunks of one large
+    # CreateObservations batch concurrently per target instead of sequentially,
+    # so a multi-chunk cycle isn't gated by each chunk's serial position behind
+    # the slowest target.
+    frost_batch_max_concurrency: int = int(os.getenv("FROST_BATCH_MAX_CONCURRENCY", "4"))
+    # Decouple the (slow, multi-target) FROST push from the Kafka consume loop.
+    # When enabled, the consume loop forwards to monitoring, hands readings to a
+    # background worker queue, commits, and immediately consumes the next batch —
+    # so Kafka stays live and the FROST mirror catches up asynchronously. FROST
+    # failures are still dead-lettered (DLQ + replay) and the monitoring forward
+    # is idempotent, so committing before the push completes is at-least-once,
+    # not at-most-once.
+    frost_async_push_enabled: bool = os.getenv("FROST_ASYNC_PUSH_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    # Max reading-batches buffered for the worker. When full the consume loop
+    # blocks up to frost_worker_enqueue_timeout_seconds (backpressure) then
+    # pushes inline so nothing is dropped.
+    frost_worker_queue_max: int = int(os.getenv("FROST_WORKER_QUEUE_MAX", "50"))
+    # The worker coalesces queued batches up to this many readings into one push
+    # to amortise the per-request/round-trip cost against slow targets.
+    frost_worker_coalesce_max: int = int(os.getenv("FROST_WORKER_COALESCE_MAX", "2000"))
+    frost_worker_enqueue_timeout_seconds: float = field(default_factory=lambda: _load_float("FROST_WORKER_ENQUEUE_TIMEOUT_SECONDS", "30"))
+    # Alert when the worker queue depth stays at/above this fraction of its max.
+    frost_worker_backlog_alert_ratio: float = field(default_factory=lambda: _load_float("FROST_WORKER_BACKLOG_ALERT_RATIO", "0.8"))
     # Scheduled replay of the failed-observations dead-letter queue.
     failed_replay_enabled: bool = os.getenv("FAILED_REPLAY_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
     failed_replay_interval_seconds: int = int(os.getenv("FAILED_REPLAY_INTERVAL_SECONDS", "900"))
     failed_replay_max_lines: int = int(os.getenv("FAILED_REPLAY_MAX_LINES", "500"))
+    # Alert when the DLQ isn't draining: remaining entries after a replay pass
+    # stay at/above this. 0 disables the alert.
+    failed_replay_backlog_alert: int = int(os.getenv("FAILED_REPLAY_BACKLOG_ALERT", "2000"))
     # Before re-posting a dead-letter observation, probe for an existing
     # (Datastream, phenomenonTime). Prevents replay from duplicating a write that
     # timed out after the server committed it, on servers that don't enforce

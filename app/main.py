@@ -36,15 +36,32 @@ def _consume_and_push_once(consumer, max_messages: int = 500, timeout: float = 5
     readings = avro_batch_to_sensor_readings(records)
     # Forward to the monitoring module FIRST, before the (potentially slow,
     # multi-target) FROST push below, so downstream freshness is not gated by
-    # FROST push latency. Fire-and-forget + idempotent: if the FROST push fails
-    # we do not commit and simply re-forward next cycle (monitoring dedups via
-    # ON CONFLICT DO NOTHING).
+    # FROST push latency. Fire-and-forget + idempotent: monitoring dedups via
+    # ON CONFLICT DO NOTHING.
     _push_to_monitoring(readings)
-    result = client.push_observations(readings)
-    # Commit only after push completes — failed observations are safely in the
-    # DLQ, so re-consuming them would just create duplicates.
+    if settings.frost_async_push_enabled:
+        # Decoupled path: hand the readings to the background FROST worker and
+        # return immediately so the consume loop can pull the next batch. Kafka
+        # stays live regardless of how slow the SensorThings push is. Committing
+        # after the hand-off is at-least-once: FROST failures are dead-lettered
+        # by push_observations (DLQ + replay). Backpressure: if the worker queue
+        # is full we push inline instead of dropping.
+        from app.services.frost_worker import frost_worker
+
+        queued = frost_worker.enqueue(readings, settings.frost_worker_enqueue_timeout_seconds)
+        if not queued:
+            frost_worker.record_inline_fallback()
+            client.push_observations(readings)
+        pushed: int | str = "queued" if queued else "inline"
+    else:
+        # Legacy coupled path: push inline before commit.
+        result = client.push_observations(readings)
+        pushed = result.get("total_sent", 0)
+    # Commit only after the push has been handed off (async) or completed
+    # (inline) — failed observations are safely in the DLQ, so re-consuming them
+    # would just create duplicates.
     consumer.commit()
-    # How far behind real time is the newest observation we just pushed? A large
+    # How far behind real time is the newest observation we just handled? A large
     # value means we're replaying a stale backlog (e.g. after a long stall), so
     # downstream consumers see an old "latest" timestamp.
     newest = max((r.timestamp for r in readings if r.timestamp is not None), default=None)
@@ -52,7 +69,7 @@ def _consume_and_push_once(consumer, max_messages: int = 500, timeout: float = 5
     return {
         "pulled": len(records),
         "mapped": len(readings),
-        "pushed": result.get("total_sent", 0),
+        "pushed": pushed,
         "lag_seconds": lag_seconds,
     }
 
@@ -275,8 +292,9 @@ def _resolve_monitoring_datastream_id(reading) -> str | None:
 def _push_to_monitoring(readings: list) -> None:
     """Fire-and-forget push of readings to the monitoring module.
 
-    Runs after observations are successfully pushed to FROST. Failures are
-    logged but never block the main ingest loop.
+    Runs before the (slow, multi-target) FROST push so monitoring freshness is
+    not gated by FROST latency. Failures are logged but never block the main
+    ingest loop; monitoring dedups via ON CONFLICT so re-forwarding is safe.
     """
     if not settings.monitoring_push_url or not settings.monitoring_push_key:
         return
@@ -516,11 +534,21 @@ def _get_enabled_polling_sources():
 
 
 async def _failed_replay_loop():
-    """Periodically replay dead-lettered observations back to FROST targets."""
+    """Periodically replay dead-lettered observations back to FROST targets.
+
+    Self-healing: when a pass hits its per-pass line cap and more remain, the
+    loop comes back sooner (``min(interval, 60s)``) to drain faster instead of
+    waiting the full interval. If the backlog stays above the configured alert
+    threshold, a deduplicated alert fires so a stuck DLQ surfaces.
+    """
+    from app.services.alerting import send_alert
+
     interval = max(60, settings.failed_replay_interval_seconds)
     logger.info("DLQ replay loop started (every %ds, max %d/pass)", interval, settings.failed_replay_max_lines)
+    drain_fast = False
+    backlog_alerting = False
     while True:
-        await asyncio.sleep(interval)
+        await asyncio.sleep(min(interval, 60) if drain_fast else interval)
         try:
             summary = await run_in_threadpool(
                 client.replay_failed_observations, settings.failed_replay_max_lines
@@ -530,6 +558,29 @@ async def _failed_replay_loop():
             dropped = summary.get("dropped", 0)
             if replayed or remaining or dropped:
                 logger.info("DLQ replay: %s replayed, %s dropped, %s remaining", replayed, dropped, remaining)
+            # More than one pass' worth is still queued — come back sooner.
+            drain_fast = remaining >= settings.failed_replay_max_lines
+            alert_threshold = settings.failed_replay_backlog_alert
+            if alert_threshold > 0 and remaining >= alert_threshold:
+                backlog_alerting = True
+                send_alert(
+                    "dlq.backlog",
+                    f"Dead-letter queue not draining: {remaining} observations still "
+                    f"queued after a replay pass (threshold {alert_threshold}).",
+                    level="warning",
+                    context={"remaining": remaining, "replayed": replayed, "dropped": dropped},
+                    dedup_key="dlq.backlog",
+                )
+            elif backlog_alerting and remaining == 0:
+                backlog_alerting = False
+                send_alert(
+                    "dlq.backlog",
+                    "Dead-letter queue drained — all replayed observations delivered.",
+                    level="info",
+                    context={"remaining": 0},
+                    dedup_key="dlq.backlog",
+                    force=True,
+                )
         except Exception:
             logger.exception("DLQ replay pass failed")
 
@@ -537,18 +588,46 @@ async def _failed_replay_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     tasks = []
+    has_frost_target = bool(settings.sensorthings_base_url or settings.sensorthings_base_urls)
+
+    # Start the background FROST push worker before the ingest loops so they can
+    # hand off immediately (Phase 2 decoupling).
+    if settings.frost_async_push_enabled and has_frost_target:
+        from app.services.frost_worker import frost_worker
+
+        frost_worker.start(
+            settings.frost_worker_queue_max,
+            settings.frost_worker_coalesce_max,
+            settings.frost_worker_backlog_alert_ratio,
+        )
+
+    # Warm the datastream-id cache so the first cycles don't do a serial live
+    # OData lookup per reading (Phase 1c). Best-effort; never blocks startup.
+    if has_frost_target:
+        try:
+            warmed = await run_in_threadpool(client.warm_datastream_cache)
+            logger.info("Datastream cache warm-up complete (%d ids)", warmed)
+        except Exception:
+            logger.warning("Datastream cache warm-up failed (non-fatal)", exc_info=True)
+
     if settings.kafka_tgv_enabled:
         tasks.append(asyncio.create_task(_kafka_ingest_loop()))
 
     for source in _get_enabled_polling_sources():
         tasks.append(asyncio.create_task(_polling_ingest_loop(source)))
 
-    if settings.failed_replay_enabled and (settings.sensorthings_base_url or settings.sensorthings_base_urls):
+    if settings.failed_replay_enabled and has_frost_target:
         tasks.append(asyncio.create_task(_failed_replay_loop()))
 
     yield
     for t in tasks:
         t.cancel()
+    # Drain and stop the FROST worker so in-flight readings are flushed on a
+    # graceful shutdown instead of lost.
+    if settings.frost_async_push_enabled and has_frost_target:
+        from app.services.frost_worker import frost_worker
+
+        await run_in_threadpool(frost_worker.stop)
 
 
 app = FastAPI(

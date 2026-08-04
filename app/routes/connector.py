@@ -354,6 +354,34 @@ def freshness(response: Response) -> dict:
     return result
 
 
+@router.get("/frost-status")
+def frost_status() -> dict:
+    """Background FROST push worker + dead-letter queue status.
+
+    Surfaces the async push worker's queue depth, throughput, last push
+    duration and FROST-side lag (distinct from Kafka lag), plus the current DLQ
+    size — so a stalled/backlogged mirror is visible without reading logs.
+    """
+    from app.services.frost_worker import frost_worker
+
+    dlq_path = Path(settings.failed_observations_path)
+    try:
+        dlq_bytes = dlq_path.stat().st_size
+    except FileNotFoundError:
+        dlq_bytes = 0
+
+    return {
+        "async_push_enabled": settings.frost_async_push_enabled,
+        "worker": frost_worker.stats(),
+        "dlq": {
+            "bytes": dlq_bytes,
+            "max_bytes": settings.failed_dlq_max_bytes,
+            "replay_enabled": settings.failed_replay_enabled,
+            "replay_interval_seconds": settings.failed_replay_interval_seconds,
+        },
+    }
+
+
 @router.post("/kafka-skip-to-latest")
 def kafka_skip_to_latest() -> dict:
     """Signal the running Kafka consumer to drop its backlog and go live.
