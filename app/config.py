@@ -327,11 +327,14 @@ class Settings:
     # full push (batch size x FROST targets) completes well within
     # max.poll.interval.ms, or librdkafka evicts the consumer from the group
     # (MAXPOLL) and it silently stops consuming. Large backlogs + a slow target
-    # are exactly what triggers this. Now that FROST targets are pushed
-    # concurrently and observations go out via the dataArray batch extension
-    # (including v2.0), a cycle completes far faster, so a larger batch is safe
-    # and is needed to keep pace with the upstream producer / drain a backlog.
-    kafka_tgv_batch_max_messages: int = int(os.getenv("KAFKA_TGV_BATCH_MAX_MESSAGES", "500"))
+    # are exactly what triggers this. FROST push throughput (~200 obs/min
+    # against the slowest target), NOT Kafka consume, is the bottleneck, so a
+    # bigger batch only makes each push longer: 100 msgs (~900 obs) pushes in
+    # ~5 min; 500 msgs (~4500 obs) can exceed the 15 min max-poll window and get
+    # the consumer evicted. Keep this modest and let auto-skip-on-lag handle
+    # catastrophic backlogs instead of a huge batch. Also keeps each cycle's
+    # observation count under the monitoring push cap (2000).
+    kafka_tgv_batch_max_messages: int = int(os.getenv("KAFKA_TGV_BATCH_MAX_MESSAGES", "100"))
     # librdkafka max.poll.interval.ms (ms). If the app doesn't call consume()
     # within this window the broker evicts the consumer. Default 15 min gives a
     # slow push plenty of headroom over the 5 min librdkafka default.

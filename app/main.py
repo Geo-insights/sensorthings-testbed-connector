@@ -34,12 +34,16 @@ def _consume_and_push_once(consumer, max_messages: int = 500, timeout: float = 5
     if not records:
         return {"pulled": 0}
     readings = avro_batch_to_sensor_readings(records)
+    # Forward to the monitoring module FIRST, before the (potentially slow,
+    # multi-target) FROST push below, so downstream freshness is not gated by
+    # FROST push latency. Fire-and-forget + idempotent: if the FROST push fails
+    # we do not commit and simply re-forward next cycle (monitoring dedups via
+    # ON CONFLICT DO NOTHING).
+    _push_to_monitoring(readings)
     result = client.push_observations(readings)
     # Commit only after push completes — failed observations are safely in the
     # DLQ, so re-consuming them would just create duplicates.
     consumer.commit()
-    # Forward to monitoring module (fire-and-forget)
-    _push_to_monitoring(readings)
     # How far behind real time is the newest observation we just pushed? A large
     # value means we're replaying a stale backlog (e.g. after a long stall), so
     # downstream consumers see an old "latest" timestamp.
@@ -296,19 +300,29 @@ def _push_to_monitoring(readings: list) -> None:
     payload = {"readings": forwarded}
     if not payload["readings"]:
         return
-    try:
-        resp = req.post(
-            f"{settings.monitoring_push_url}/readings/push",
-            json=payload,
-            headers={"X-Connector-Key": settings.monitoring_push_key},
-            timeout=10,
-        )
-        if resp.ok:
-            logger.debug("Monitoring push: %d readings forwarded", len(payload["readings"]))
-        else:
-            logger.warning("Monitoring push failed: %s %s", resp.status_code, resp.text[:200])
-    except Exception:
-        logger.warning("Monitoring push failed (connection error)", exc_info=True)
+    # The monitoring /readings/push endpoint caps each request at 2000 readings.
+    # A single Kafka cycle can map to more than that, which previously returned
+    # 422 and dropped the WHOLE cycle's data. Chunk so every reading is
+    # delivered regardless of batch size.
+    chunk_size = 1000
+    forwarded_count = 0
+    for start in range(0, len(forwarded), chunk_size):
+        chunk = forwarded[start : start + chunk_size]
+        try:
+            resp = req.post(
+                f"{settings.monitoring_push_url}/readings/push",
+                json={"readings": chunk},
+                headers={"X-Connector-Key": settings.monitoring_push_key},
+                timeout=10,
+            )
+            if resp.ok:
+                forwarded_count += len(chunk)
+            else:
+                logger.warning("Monitoring push failed: %s %s", resp.status_code, resp.text[:200])
+        except Exception:
+            logger.warning("Monitoring push failed (connection error)", exc_info=True)
+    if forwarded_count:
+        logger.debug("Monitoring push: %d readings forwarded", forwarded_count)
 
 
 def _dedup_readings(
