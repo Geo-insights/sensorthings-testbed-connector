@@ -1756,23 +1756,39 @@ class SensorThingsClient:
         # the server timeout (a 4500-obs batch read-times-out at 15s).
         max_obs = settings.frost_batch_max_observations
         if max_obs > 0 and len(tasks) > max_obs:
+            # Push the chunks concurrently (bounded) so a large cycle isn't gated
+            # by each chunk's serial position; each chunk is an independent
+            # CreateObservations POST to the same target. This is the dominant
+            # per-cycle cost for big backlogs, so parallelising it (rather than
+            # the old sequential loop) is the main throughput win.
+            chunks = [tasks[i:i + max_obs] for i in range(0, len(tasks), max_obs)]
+            max_conc = max(1, settings.frost_batch_max_concurrency)
+            outcomes: list[tuple[int, list[dict[str, Any]]] | None] = [None] * len(chunks)
+            with ThreadPoolExecutor(max_workers=min(max_conc, len(chunks))) as pool:
+                futures = {
+                    pool.submit(self._push_batch_data_array, base_url, chunk): idx
+                    for idx, chunk in enumerate(chunks)
+                }
+                for future in as_completed(futures):
+                    outcomes[futures[future]] = future.result()
+            # Every chunk reported "unsupported": nothing was sent, so let the
+            # caller fall back to per-observation pushes for the whole batch.
+            if all(outcome is None for outcome in outcomes):
+                return None
             total_sent = 0
             all_results: list[dict[str, Any]] = []
-            for i in range(0, len(tasks), max_obs):
-                outcome = self._push_batch_data_array(base_url, tasks[i:i + max_obs])
+            per_obs_endpoint = self._endpoint_for_base_url(base_url, settings.observations_path)
+            for idx, outcome in enumerate(outcomes):
                 if outcome is None:
-                    # Target doesn't support the dataArray extension. If nothing
-                    # was sent yet, let the caller fall back to per-observation
-                    # pushes for the whole batch; otherwise dead-letter the rest.
-                    if not all_results:
-                        return None
-                    per_obs_endpoint = self._endpoint_for_base_url(base_url, settings.observations_path)
-                    for _ep, payload, ds_id, sensor_id in tasks[i:]:
+                    # This chunk's target rejected the dataArray extension while
+                    # other chunks succeeded — dead-letter its observations for
+                    # the replay loop instead of losing them.
+                    for _ep, payload, ds_id, sensor_id in chunks[idx]:
                         self._write_failed_observation(
                             {"timestamp": datetime.now(UTC).isoformat(), "datastream_id": ds_id, "endpoint": per_obs_endpoint, "payload": payload, "status_code": None, "error": "batch_unsupported_midway"},
                         )
                         all_results.append({"sensor_id": sensor_id, "datastream_id": ds_id, "status_code": None, "ok": False, "error": "batch_unsupported_midway"})
-                    break
+                    continue
                 sent_c, res_c = outcome
                 total_sent += sent_c
                 all_results.extend(res_c)
@@ -1890,6 +1906,54 @@ class SensorThingsClient:
                 "Batch push to %s: %d/%d observations accepted", url, sent, len(flat)
             )
         return sent, results
+
+    def warm_datastream_cache(self, max_datastreams: int = 2000) -> int:
+        """Pre-populate the datastream-id cache from the primary FROST target.
+
+        The push and monitoring-forward paths resolve datastream ids from
+        ``self._datastream_ids`` first, falling back to a per-reading serial
+        live OData lookup. Fetching the datastreams once at startup avoids that
+        cold-cache walk on the first cycles after a (re)deploy. Best-effort:
+        logs and returns 0 on any failure, never raises.
+        """
+        base_url = self._primary_base_url()
+        if not base_url:
+            return 0
+        endpoint = self._endpoint_for_base_url(base_url, settings.datastreams_path)
+        try:
+            resp = requests.get(
+                endpoint,
+                params={"$select": "@iot.id,name,properties", "$top": str(max_datastreams)},
+                headers=self._headers_for_url(base_url),
+                timeout=self._request_timeout(),
+            )
+            resp.raise_for_status()
+            values = resp.json().get("value", [])
+        except Exception:
+            logger.debug("Datastream cache warm-up fetch failed", exc_info=True)
+            return 0
+
+        warmed = 0
+        for ds in values:
+            ds_id = ds.get("@iot.id") or ds.get("id")
+            if not ds_id:
+                continue
+            props = ds.get("properties") or {}
+            sensor_id = str(props.get("sensor_id") or "").strip()
+            observed_property = str(props.get("observed_property") or props.get("streamKey") or "").strip()
+            stream_key = str(props.get("streamKey") or props.get("observed_property") or "").strip()
+            keys = [
+                self._datastream_key(sensor_id, observed_property) if sensor_id and observed_property else "",
+                stream_key,
+                sensor_id,
+            ]
+            for key in keys:
+                if key and key not in self._datastream_ids:
+                    self._datastream_ids[key] = str(ds_id)
+                    warmed += 1
+        if warmed:
+            logger.info("Datastream cache warmed: %d id(s) from %s", warmed, base_url)
+        return warmed
 
     def push_observations(self, readings: list[SensorReading]) -> dict[str, Any]:
         preview = self.build_preview(readings)
