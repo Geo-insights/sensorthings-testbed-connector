@@ -1779,6 +1779,26 @@ class SensorThingsClient:
             return total_sent, all_results
 
         components = ["phenomenonTime", "result", "resultQuality", "parameters"]
+        is_v2 = self._is_v2_url(base_url)
+        # v2.0 observation payloads have already been adapted upstream
+        # (parameters -> properties, resultQuality dropped, @iot.id -> id), so
+        # the dataArray columns and the Datastream reference differ from v1.1.
+        if is_v2:
+            components = ["phenomenonTime", "result", "properties"]
+
+        def _data_row(payload: dict[str, Any]) -> list[Any]:
+            if is_v2:
+                return [payload.get("phenomenonTime"), payload.get("result"), payload.get("properties") or {}]
+            return [
+                payload.get("phenomenonTime"),
+                payload.get("result"),
+                payload.get("resultQuality"),
+                payload.get("parameters") or {},
+            ]
+
+        def _ds_ref(ds_id: str) -> dict[str, Any]:
+            return {"id": _coerce_iot_id(ds_id)} if is_v2 else {"@iot.id": _coerce_iot_id(ds_id)}
+
         # Group per datastream, preserving order so the response array maps back.
         grouped: dict[str, list[tuple[dict[str, Any], str]]] = {}
         for _ep, payload, ds_id, sensor_id in tasks:
@@ -1786,17 +1806,9 @@ class SensorThingsClient:
 
         body = [
             {
-                "Datastream": {"@iot.id": _coerce_iot_id(ds_id)},
+                "Datastream": _ds_ref(ds_id),
                 "components": components,
-                "dataArray": [
-                    [
-                        payload.get("phenomenonTime"),
-                        payload.get("result"),
-                        payload.get("resultQuality"),
-                        payload.get("parameters") or {},
-                    ]
-                    for payload, _sid in items
-                ],
+                "dataArray": [_data_row(payload) for payload, _sid in items],
             }
             for ds_id, items in grouped.items()
         ]
@@ -1893,7 +1905,8 @@ class SensorThingsClient:
 
         endpoint_results: list[dict[str, Any]] = []
         total_sent = 0
-        for base_url in base_urls:
+
+        def _push_target(base_url: str) -> tuple[dict[str, Any], int]:
             endpoint = self._endpoint_for_base_url(base_url, settings.observations_path)
             is_v2 = self._is_v2_url(base_url)
             stack = self._target_stack_for_url(base_url)
@@ -1963,10 +1976,10 @@ class SensorThingsClient:
                     logger.warning(
                         "Circuit open for %s — %d observations dead-lettered for replay", base_url, len(tasks)
                     )
-                endpoint_results.append(
-                    {"base_url": base_url, "endpoint": endpoint, "sent": 0, "circuit_open": True, "dead_lettered": len(tasks), "results": list(unresolved)}
+                return (
+                    {"base_url": base_url, "endpoint": endpoint, "sent": 0, "circuit_open": True, "dead_lettered": len(tasks), "results": list(unresolved)},
+                    0,
                 )
-                continue
 
             # Phase 2: push. Prefer one batched CreateObservations request;
             # fall back to parallel per-observation POSTs.
@@ -1974,7 +1987,7 @@ class SensorThingsClient:
             sent = 0
             if tasks:
                 batch_result = None
-                if settings.frost_batch_push_enabled and not is_v2:
+                if settings.frost_batch_push_enabled and (not is_v2 or settings.frost_v2_batch_push_enabled):
                     batch_result = self._push_batch_data_array(base_url, tasks)
                 if batch_result is not None:
                     sent, batch_results = batch_result
@@ -2005,10 +2018,30 @@ class SensorThingsClient:
                 else:
                     observation_breaker.record_success(base_url)
 
-            endpoint_results.append(
-                {"base_url": base_url, "endpoint": endpoint, "sent": sent, "results": results}
+            return (
+                {"base_url": base_url, "endpoint": endpoint, "sent": sent, "results": results},
+                sent,
             )
+
+        # Push to all FROST targets concurrently. The per-target work (resolve +
+        # batch or parallel per-observation POST) is independent, so a slow
+        # target (e.g. a v2.0 server doing per-observation inserts, or a
+        # timing-out secondary) no longer serializes the whole ingest cycle.
+        # Results are re-ordered to match ``base_urls`` for deterministic output.
+        if len(base_urls) == 1:
+            result, sent = _push_target(base_urls[0])
+            endpoint_results.append(result)
             total_sent += sent
+        else:
+            results_by_url: dict[str, tuple[dict[str, Any], int]] = {}
+            with ThreadPoolExecutor(max_workers=len(base_urls)) as pool:
+                futures = {pool.submit(_push_target, base_url): base_url for base_url in base_urls}
+                for future in as_completed(futures):
+                    results_by_url[futures[future]] = future.result()
+            for base_url in base_urls:
+                result, sent = results_by_url[base_url]
+                endpoint_results.append(result)
+                total_sent += sent
 
         if len(endpoint_results) == 1:
             only = endpoint_results[0]

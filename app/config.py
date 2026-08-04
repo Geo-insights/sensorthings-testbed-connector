@@ -327,8 +327,11 @@ class Settings:
     # full push (batch size x FROST targets) completes well within
     # max.poll.interval.ms, or librdkafka evicts the consumer from the group
     # (MAXPOLL) and it silently stops consuming. Large backlogs + a slow target
-    # are exactly what triggers this, so keep the batch modest.
-    kafka_tgv_batch_max_messages: int = int(os.getenv("KAFKA_TGV_BATCH_MAX_MESSAGES", "100"))
+    # are exactly what triggers this. Now that FROST targets are pushed
+    # concurrently and observations go out via the dataArray batch extension
+    # (including v2.0), a cycle completes far faster, so a larger batch is safe
+    # and is needed to keep pace with the upstream producer / drain a backlog.
+    kafka_tgv_batch_max_messages: int = int(os.getenv("KAFKA_TGV_BATCH_MAX_MESSAGES", "500"))
     # librdkafka max.poll.interval.ms (ms). If the app doesn't call consume()
     # within this window the broker evicts the consumer. Default 15 min gives a
     # slow push plenty of headroom over the 5 min librdkafka default.
@@ -354,6 +357,12 @@ class Settings:
     # --- Observation push reliability ---
     # Batch pushes via the SensorThings CreateObservations (dataArray) extension.
     frost_batch_push_enabled: bool = os.getenv("FROST_BATCH_PUSH_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    # Also batch-push to v2.0 targets (Fraunhofer FROST-StaV2Core). Kept as a
+    # separate kill-switch because the v2.0 dataArray format is less battle-
+    # tested; disable to fall back to per-observation POSTs for v2.0 only. A
+    # target that rejects CreateObservations is remembered and auto-falls-back
+    # regardless of this flag.
+    frost_v2_batch_push_enabled: bool = os.getenv("FROST_V2_BATCH_PUSH_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
     # Cap observations per CreateObservations request so a large backlog doesn't
     # exceed the server timeout (a 4500-obs batch read-times-out at 15s).
     frost_batch_max_observations: int = int(os.getenv("FROST_BATCH_MAX_OBSERVATIONS", "500"))
@@ -390,6 +399,14 @@ class Settings:
     # Explicit override for the Kafka source stall threshold (seconds). When 0,
     # derived from kafka_tgv_poll_seconds + freshness_grace_seconds.
     kafka_stale_seconds: int = int(os.getenv("KAFKA_STALE_SECONDS", "0"))
+    # Backlog-staleness guard. When the newest observation pushed in a cycle is
+    # older than this many seconds, the consumer is replaying a stale backlog
+    # (downstream sees an old "latest" timestamp). 0 disables the check.
+    kafka_max_lag_seconds: int = int(os.getenv("KAFKA_MAX_LAG_SECONDS", "3600"))
+    # When True, exceeding kafka_max_lag_seconds auto-triggers skip-to-latest
+    # (drops the backlog to go live). When False (default) it only alerts — a
+    # human decides, since skipping discards the un-pushed backlog.
+    kafka_auto_skip_on_lag: bool = os.getenv("KAFKA_AUTO_SKIP_ON_LAG", "false").lower() in {"1", "true", "yes", "on"}
 
 
 settings = Settings()

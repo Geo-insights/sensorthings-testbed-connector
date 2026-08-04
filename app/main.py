@@ -3,7 +3,7 @@ import logging
 import threading
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -40,7 +40,17 @@ def _consume_and_push_once(consumer, max_messages: int = 500, timeout: float = 5
     consumer.commit()
     # Forward to monitoring module (fire-and-forget)
     _push_to_monitoring(readings)
-    return {"pulled": len(records), "mapped": len(readings), "pushed": result.get("total_sent", 0)}
+    # How far behind real time is the newest observation we just pushed? A large
+    # value means we're replaying a stale backlog (e.g. after a long stall), so
+    # downstream consumers see an old "latest" timestamp.
+    newest = max((r.timestamp for r in readings if r.timestamp is not None), default=None)
+    lag_seconds = (datetime.now(UTC) - newest).total_seconds() if newest is not None else None
+    return {
+        "pulled": len(records),
+        "mapped": len(readings),
+        "pushed": result.get("total_sent", 0),
+        "lag_seconds": lag_seconds,
+    }
 
 
 def _kafka_stale_threshold(poll_seconds: int) -> int:
@@ -115,10 +125,46 @@ async def _kafka_ingest_loop():
             consecutive_failures = 0
             if summary.get("pulled", 0) > 0:
                 health_monitor.record_source_success("kafka")
+                lag_seconds = summary.get("lag_seconds")
                 logger.info(
-                    "Kafka push: pulled=%s mapped=%s pushed=%s",
+                    "Kafka push: pulled=%s mapped=%s pushed=%s lag=%ss",
                     summary.get("pulled"), summary.get("mapped"), summary.get("pushed"),
+                    int(lag_seconds) if lag_seconds is not None else "?",
                 )
+                # Backlog-staleness guard: if the newest observation we just
+                # pushed is far behind real time, we're replaying a stale
+                # backlog (downstream sees an old "latest"). Optionally auto-skip
+                # to the topic head to go live; otherwise alert a human.
+                if (
+                    lag_seconds is not None
+                    and settings.kafka_max_lag_seconds > 0
+                    and lag_seconds > settings.kafka_max_lag_seconds
+                    and not _kafka_skip_to_latest.is_set()
+                ):
+                    lag_ctx = {
+                        "lag_seconds": int(lag_seconds),
+                        "threshold_seconds": settings.kafka_max_lag_seconds,
+                    }
+                    if settings.kafka_auto_skip_on_lag:
+                        _kafka_skip_to_latest.set()
+                        send_alert(
+                            "kafka.lag",
+                            f"Kafka observation lag {int(lag_seconds)}s exceeds "
+                            f"{settings.kafka_max_lag_seconds}s \u2014 auto-skipping backlog to go live.",
+                            level="warning",
+                            context=lag_ctx,
+                            dedup_key="kafka.lag",
+                        )
+                    else:
+                        send_alert(
+                            "kafka.lag",
+                            f"Kafka observation lag {int(lag_seconds)}s exceeds "
+                            f"{settings.kafka_max_lag_seconds}s \u2014 replaying stale backlog. "
+                            "Consider POST /connector/kafka-skip-to-latest.",
+                            level="warning",
+                            context=lag_ctx,
+                            dedup_key="kafka.lag",
+                        )
         except Exception as exc:
             consecutive_failures += 1
             logger.exception("Kafka ingest cycle failed (failure #%d)", consecutive_failures)
