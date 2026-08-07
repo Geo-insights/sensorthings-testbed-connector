@@ -55,3 +55,14 @@ pytest tests/ -q
 See ../gi-skills/skills/connector-review/SKILL.md
 See ../gi-skills/skills/ogc-check/SKILL.md
 See ../gi-skills/skills/security-check/SKILL.md
+
+## Workflow skills
+See ../gi-skills/skills/office-hours/SKILL.md
+See ../gi-skills/skills/spec/SKILL.md
+See ../gi-skills/skills/impact/SKILL.md
+See ../gi-skills/skills/plan/SKILL.md
+See ../gi-skills/skills/review/SKILL.md
+See ../gi-skills/skills/preflight/SKILL.md
+See ../gi-skills/skills/ship/SKILL.md
+See ../gi-skills/skills/retro/SKILL.md
+See ../gi-skills/skills/learn/SKILL.md
