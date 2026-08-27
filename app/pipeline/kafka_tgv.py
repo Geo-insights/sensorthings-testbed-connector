@@ -8,6 +8,7 @@ from typing import Any
 
 from app.models import SensorReading
 from app.pipeline.base import Decapsulator, Deserializer, Parser
+from app.sta.canonical import resolve
 
 logger = logging.getLogger("connector.debug")
 
@@ -76,13 +77,25 @@ class TGVMeasurementParser(Parser):
         except (OSError, ValueError, OverflowError):
             ts = datetime.now(UTC)
 
+        canonical = resolve(mapping["observed_property"])
+        if canonical is None:
+            raise ValueError(
+                f"Mapping for {device_id}/{measurement_id} uses non-canonical "
+                f"observed_property {mapping['observed_property']!r}"
+            )
+        meta = canonical.meta
         unit_from_avro = raw.get("unit") or None
+        if unit_from_avro and unit_from_avro != meta.unit:
+            logger.info(
+                "Avro unit %r for %s/%s disagrees with canonical %r — using canonical",
+                unit_from_avro, device_id, measurement_id, meta.unit,
+            )
 
         return SensorReading(
             sensor_id=mapping["sensor_id"],
             sensor_name=mapping.get("sensor_name", mapping["sensor_id"]),
-            observed_property=mapping["observed_property"],
-            unit=unit_from_avro or mapping.get("unit", "1"),
+            observed_property=canonical.value,
+            unit=meta.unit,
             value=value,
             timestamp=ts,
             quality="good",
@@ -90,5 +103,5 @@ class TGVMeasurementParser(Parser):
             thing_name=mapping["thing_name"],
             device_eui=device_id,
             stream_key=measurement_id,
-            observed_property_name=mapping.get("observed_property_name"),
+            observed_property_name=meta.display_name,
         )

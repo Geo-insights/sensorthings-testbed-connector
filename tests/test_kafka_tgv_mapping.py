@@ -133,7 +133,7 @@ def test_avro_record_maps_temperature():
     r = readings[0]
     assert r.observed_property == "temperature"
     assert r.value == 22.0
-    assert r.unit == "Cel"
+    assert r.unit == "°C"
     assert r.thing_name == "TGV Office Lab"
 
 
@@ -175,20 +175,22 @@ def test_avro_record_unknown_measurement_id_skipped():
     assert avro_record_to_sensor_readings(record) == []
 
 
-def test_avro_record_avro_unit_takes_precedence_over_mapping():
+def test_avro_record_canonical_unit_overrides_avro_unit():
+    """Canonical unit always wins over an Avro-supplied unit string; the
+    connector normalizes at the backend (per Geonovum discussion #24)."""
     record = _make_record(measurements=[
         {"measurement_id": "temperature", "value": 295.15, "unit": "K", "measurement_description": None}
     ])
     readings = avro_record_to_sensor_readings(record)
-    assert readings[0].unit == "K"
+    assert readings[0].unit == "°C"
 
 
-def test_avro_record_uses_mapping_unit_when_avro_unit_is_none():
+def test_avro_record_uses_canonical_unit_when_avro_unit_is_none():
     record = _make_record(measurements=[
         {"measurement_id": "temperature", "value": 22.0, "unit": None, "measurement_description": None}
     ])
     readings = avro_record_to_sensor_readings(record)
-    assert readings[0].unit == "Cel"
+    assert readings[0].unit == "°C"
 
 
 def test_avro_record_timestamp_ms_to_utc_datetime():
@@ -233,13 +235,14 @@ def test_avro_record_quality_is_good():
 
 
 def test_avro_record_override_mapping_applied():
+    """Override mapping controls thing/sensor routing; unit still comes from
+    canonical (the ``unit`` field on the mapping is ignored)."""
     custom_mapping = {
         "*/temperature": {
             "thing_name": "Custom Thing",
             "sensor_id": "custom-sensor",
             "observed_property": "temperature",
-            "observed_property_name": "Temperature",
-            "unit": "K",
+            "unit": "K",  # ignored — canonical wins
         }
     }
     record = _make_record(measurements=[
@@ -247,7 +250,7 @@ def test_avro_record_override_mapping_applied():
     ])
     readings = avro_record_to_sensor_readings(record, override_mapping=custom_mapping)
     assert readings[0].thing_name == "Custom Thing"
-    assert readings[0].unit == "K"
+    assert readings[0].unit == "°C"
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +266,7 @@ def test_avro_batch_aggregates_multiple_records():
             {"measurement_id": "humidity", "value": 50.0, "unit": "%", "measurement_description": None}
         ]),
     ]
-    readings = avro_batch_to_sensor_readings(records)
+    readings = avro_batch_to_sensor_readings(records, override_mapping=_DEFAULT_DEVICE_MAPPING)
     assert len(readings) == 2
 
 
@@ -274,7 +277,7 @@ def test_avro_batch_bad_record_does_not_crash_batch():
             {"measurement_id": "temperature", "value": 22.0, "unit": "Cel", "measurement_description": None}
         ]),
     ]
-    readings = avro_batch_to_sensor_readings(records)
+    readings = avro_batch_to_sensor_readings(records, override_mapping=_DEFAULT_DEVICE_MAPPING)
     # Bad record is skipped; good record is mapped
     assert len(readings) == 1
 

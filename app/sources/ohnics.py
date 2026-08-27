@@ -6,31 +6,26 @@ The 5min.json endpoint returns the latest 5-minute readings for all sensors.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from typing import Any
 
 from app.models import SensorReading
+from app.sta.canonical import resolve
 
-# CF Convention definitions for air quality observed properties
-OBSERVED_PROPERTIES: dict[str, dict[str, str]] = {
-    "pm25": {
-        "name": "PM2.5 concentration",
-        "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#mass_concentration_of_pm2p5_ambient_aerosol_particles_in_air",
-        "description": "Particulate matter concentration (PM2.5) in ambient air.",
-        "unit": "ug/m3",
-    },
-    "air_temperature": {
-        "name": "Air temperature",
-        "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#air_temperature",
-        "description": "Outdoor air temperature at sensor location.",
-        "unit": "Cel",
-    },
+logger = logging.getLogger(__name__)
+
+# Source-specific descriptions per canonical observed property. Unit + display
+# name + CF definition all come from canonical.py at read time.
+_DESCRIPTIONS: dict[str, str] = {
+    "pm2_5": "Particulate matter concentration (PM2.5) in ambient air.",
+    "air_temperature": "Outdoor air temperature at sensor location.",
 }
 
-# Mapping from Ohnics JSON field names to our observed property keys.
+# Mapping from Ohnics JSON field names to canonical observed property keys.
 # Confirmed from live API: P2 = PM2.5, T = temperature.
 FIELD_TO_PROPERTY: dict[str, str] = {
-    "P2": "pm25",
+    "P2": "pm2_5",
     "T": "air_temperature",
 }
 
@@ -42,7 +37,7 @@ def build_entity_set(
     measured_properties: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build a CLIMATE_ADAPTATION_ENTITY_SETS-format dict for one Ohnics sensor."""
-    props = measured_properties or ["pm25", "air_temperature"]
+    props = measured_properties or ["pm2_5", "air_temperature"]
     return {
         "site_key": "delft",
         "site_name": "Delft",
@@ -74,7 +69,7 @@ def build_entity_set(
                 "properties": {},
             }
         ],
-        "observed_properties": {k: v for k, v in OBSERVED_PROPERTIES.items() if k in props},
+        "observed_properties": {k: v for k, v in _DESCRIPTIONS.items() if k in props},
     }
 
 
@@ -113,19 +108,26 @@ def parse_sensor_readings(sensor_data: dict[str, Any]) -> list[SensorReading]:
         except (ValueError, TypeError):
             continue
 
-        prop_def = OBSERVED_PROPERTIES[prop_key]
+        canonical = resolve(prop_key)
+        if canonical is None:
+            logger.warning(
+                "Ohnics field %r maps to non-canonical property %r — skipping",
+                field_key, prop_key,
+            )
+            continue
+        meta = canonical.meta
         readings.append(
             SensorReading(
                 sensor_id=f"ohnics-{name}",
                 sensor_name=f"Ohnics {name} sensor",
-                observed_property=prop_key,
-                unit=prop_def["unit"],
+                observed_property=canonical.value,
+                unit=meta.unit,
                 value=float_val,
                 timestamp=ts,
                 quality="good",
                 location="delft",
                 thing_name=f"Ohnics {name}",
-                observed_property_name=prop_def["name"],
+                observed_property_name=meta.display_name,
             )
         )
     return readings

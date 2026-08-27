@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import logging
 import random
 from datetime import UTC, datetime
 from typing import Any
 
 from app.models import SensorReading
+from app.sta.canonical import resolve
 from app.sta.models import (
     STADatastream,
     STALocation,
@@ -13,6 +15,8 @@ from app.sta.models import (
     STAThing,
     UnitOfMeasurement,
 )
+
+logger = logging.getLogger(__name__)
 
 
 CLIMATE_ADAPTATION_ENTITY_SETS: list[dict[str, Any]] = [
@@ -53,30 +57,10 @@ CLIMATE_ADAPTATION_ENTITY_SETS: list[dict[str, Any]] = [
             }
         ],
         "observed_properties": {
-            "temperature": {
-                "name": "Air temperature",
-                "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#air_temperature",
-                "description": "Indoor air temperature.",
-                "unit": "Cel",
-            },
-            "humidity": {
-                "name": "Relative humidity",
-                "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#relative_humidity",
-                "description": "Indoor relative humidity.",
-                "unit": "%",
-            },
-            "co2": {
-                "name": "CO2 concentration",
-                "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#mole_fraction_of_carbon_dioxide_in_air",
-                "description": "Indoor CO2 concentration.",
-                "unit": "[ppm]",  # UCUM: parts per million
-            },
-            "pressure": {
-                "name": "Air pressure",
-                "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#air_pressure",
-                "description": "Indoor air pressure.",
-                "unit": "hPa",
-            },
+            "temperature": "Indoor air temperature.",
+            "humidity": "Indoor relative humidity.",
+            "co2": "Indoor CO2 concentration.",
+            "pressure": "Indoor air pressure.",
         },
     },
     {
@@ -111,30 +95,10 @@ CLIMATE_ADAPTATION_ENTITY_SETS: list[dict[str, Any]] = [
             }
         ],
         "observed_properties": {
-            "air_temperature": {
-                "name": "Air temperature",
-                "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#air_temperature",
-                "description": "Outdoor air temperature.",
-                "unit": "Cel",
-            },
-            "wind_speed": {
-                "name": "Wind speed",
-                "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#wind_speed",
-                "description": "Wind speed.",
-                "unit": "km/h",
-            },
-            "wind_direction": {
-                "name": "Wind direction",
-                "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#wind_from_direction",
-                "description": "Wind direction in degrees from north.",
-                "unit": "deg",  # UCUM: degree of angle
-            },
-            "precipitation": {
-                "name": "Precipitation",
-                "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#precipitation_amount",
-                "description": "Daily rainfall.",
-                "unit": "mm",
-            },
+            "air_temperature": "Outdoor air temperature.",
+            "wind_speed": "Wind speed.",
+            "wind_direction": "Wind direction in degrees from north.",
+            "precipitation": "Daily rainfall.",
         },
     },
     {
@@ -169,12 +133,7 @@ CLIMATE_ADAPTATION_ENTITY_SETS: list[dict[str, Any]] = [
             }
         ],
         "observed_properties": {
-            "air_pressure": {
-                "name": "Air pressure",
-                "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#air_pressure",
-                "description": "Atmospheric air pressure.",
-                "unit": "hPa",
-            },
+            "air_pressure": "Atmospheric air pressure.",
         },
     },
     {
@@ -209,18 +168,8 @@ CLIMATE_ADAPTATION_ENTITY_SETS: list[dict[str, Any]] = [
             }
         ],
         "observed_properties": {
-            "solar_radiation": {
-                "name": "Solar radiation",
-                "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#surface_downwelling_shortwave_flux_in_air",
-                "description": "Solar radiation.",
-                "unit": "W/m2",
-            },
-            "relative_humidity": {
-                "name": "Relative humidity",
-                "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#relative_humidity",
-                "description": "Outdoor relative humidity.",
-                "unit": "%",
-            },
+            "solar_radiation": "Solar radiation.",
+            "relative_humidity": "Outdoor relative humidity.",
         },
     },
 ]
@@ -263,23 +212,31 @@ def entity_set_to_sta_models(
         sensors.append(sensor)
 
         for op_key in sensor_def["observed_properties"]:
+            canonical = resolve(op_key)
+            if canonical is None:
+                logger.warning(
+                    "Unknown observed property %r on %s — skipping datastream",
+                    op_key, sensor_def["name"],
+                )
+                continue
+            meta = canonical.meta
+            description = entity_set["observed_properties"].get(op_key, meta.display_name)
+
             if op_key not in observed_properties:
-                op_def = entity_set["observed_properties"][op_key]
                 observed_properties[op_key] = STAObservedProperty(
-                    name=op_def["name"],
-                    definition=op_def["definition"],
-                    description=op_def["description"],
+                    name=meta.display_name,
+                    definition=meta.definition,
+                    description=description,
                 )
 
-            op_def = entity_set["observed_properties"][op_key]
             datastreams.append(
                 STADatastream(
-                    name=f"{sensor_def['name']} - {op_def['name']}",
-                    description=f"{op_def['name']} observations for {entity_set['thing']['name']}",
+                    name=f"{sensor_def['name']} - {meta.display_name}",
+                    description=f"{meta.display_name} observations for {entity_set['thing']['name']}",
                     unitOfMeasurement=UnitOfMeasurement(
-                        name=op_def["name"],
-                        symbol=op_def["unit"],
-                        definition=op_def["definition"],
+                        name=meta.display_name,
+                        symbol=meta.unit,
+                        definition=meta.definition,
                     ),
                 )
             )
@@ -309,14 +266,20 @@ def generate_demo_readings() -> list[SensorReading]:
         location = entity_set["site_key"]
         for sensor in entity_set["sensors"]:
             for observed_property in sensor["observed_properties"]:
-                property_definition = entity_set["observed_properties"][observed_property]
+                canonical = resolve(observed_property)
+                if canonical is None:
+                    logger.warning(
+                        "Unknown observed property %r on %s — skipping demo reading",
+                        observed_property, sensor["name"],
+                    )
+                    continue
                 low, high = ranges.get(observed_property, (0.0, 1.0))
                 readings.append(
                     SensorReading(
                         sensor_id=sensor["sensor_id"],
                         sensor_name=sensor["name"],
                         observed_property=observed_property,
-                        unit=property_definition["unit"],
+                        unit=canonical.meta.unit,
                         value=round(rng.uniform(low, high), 3),
                         timestamp=now,
                         quality="good",

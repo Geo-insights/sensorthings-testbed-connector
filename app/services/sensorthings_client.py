@@ -31,9 +31,41 @@ from app.models import (
 )
 from app.services.health_monitor import health_monitor
 from app.sources.climate_adaptation import CLIMATE_ADAPTATION_ENTITY_SETS
+from app.sta.canonical import resolve
 
 
 logger = logging.getLogger(__name__)
+
+
+def _canonical_property_payload(
+    observed_property_key: str,
+    observed_properties: dict[str, Any] | None,
+) -> dict[str, str] | None:
+    """Return the {name, definition, description, unit} payload for an observed
+    property, sourced from the canonical dictionary.
+
+    ``observed_properties`` is the entity-set's ``observed_properties`` map. Its
+    value may be a plain description string (current shape) or a legacy nested
+    dict; only the description is read from it — name, unit, and definition
+    always come from canonical.py. Returns ``None`` if the key doesn't resolve.
+    """
+    canonical = resolve(observed_property_key)
+    if canonical is None:
+        return None
+    meta = canonical.meta
+    raw = (observed_properties or {}).get(observed_property_key)
+    if isinstance(raw, dict):
+        description = raw.get("description") or meta.display_name
+    elif isinstance(raw, str) and raw:
+        description = raw
+    else:
+        description = meta.display_name
+    return {
+        "name": meta.display_name,
+        "definition": meta.definition,
+        "description": description,
+        "unit": meta.unit,
+    }
 
 
 def _as_quality_list(quality: Any) -> Any:
@@ -458,7 +490,15 @@ class SensorThingsClient:
                     }
                 )
                 for observed_property in sensor["observed_properties"]:
-                    property_payload = site_config["observed_properties"][observed_property]
+                    property_payload = _canonical_property_payload(
+                        observed_property, site_config.get("observed_properties"),
+                    )
+                    if property_payload is None:
+                        logger.warning(
+                            "Skipping datastream preview for non-canonical observed_property %r on %s",
+                            observed_property, sensor_name,
+                        )
+                        continue
                     if observed_property not in seen_properties:
                         seen_properties.add(observed_property)
                         observed_properties.append(
@@ -629,7 +669,15 @@ class SensorThingsClient:
                         continue
 
                     for observed_property in sensor["observed_properties"]:
-                        property_payload = site_config["observed_properties"][observed_property]
+                        property_payload = _canonical_property_payload(
+                            observed_property, site_config.get("observed_properties"),
+                        )
+                        if property_payload is None:
+                            logger.warning(
+                                "Skipping datastream registration for non-canonical observed_property %r on %s",
+                                observed_property, sensor_name,
+                            )
+                            continue
                         observed_property_record = {
                             "name": property_payload["name"],
                             "definition": property_payload["definition"],
@@ -812,7 +860,15 @@ class SensorThingsClient:
                 continue
 
             for observed_property in sensor["observed_properties"]:
-                property_payload = site_config["observed_properties"][observed_property]
+                property_payload = _canonical_property_payload(
+                    observed_property, site_config.get("observed_properties"),
+                )
+                if property_payload is None:
+                    logger.warning(
+                        "Skipping datastream registration for non-canonical observed_property %r on %s (target %s)",
+                        observed_property, sensor_name, stack.label,
+                    )
+                    continue
                 op_record: dict[str, Any] = {
                     "name": property_payload["name"],
                     "definition": property_payload["definition"],

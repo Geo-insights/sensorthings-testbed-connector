@@ -6,40 +6,35 @@ from typing import Any
 
 from app.config import settings
 from app.models import SensorReading
+from app.sta.canonical import resolve
 
 logger = logging.getLogger(__name__)
 
 # Default mapping: key format is "<device_id>/<measurement_id>" or "*/<measurement_id>" (wildcard device).
 # These keys must match the actual measurement_id values arriving on the Kafka topic.
 # Override at runtime via KAFKA_TGV_DEVICE_MAPPING_JSON env var without a code change.
+# observed_property MUST be a canonical name (see app/sta/canonical.py); unit +
+# display name are looked up through canonical.resolve(), never carried here.
 _DEFAULT_DEVICE_MAPPING: dict[str, dict[str, str]] = {
     "*/temperature": {
         "thing_name": "TGV Office Lab",
         "sensor_id": "tgv-officelab-climate",
         "observed_property": "temperature",
-        "observed_property_name": "Air temperature",
-        "unit": "Cel",
     },
     "*/humidity": {
         "thing_name": "TGV Office Lab",
         "sensor_id": "tgv-officelab-climate",
         "observed_property": "humidity",
-        "observed_property_name": "Relative humidity",
-        "unit": "%",
     },
     "*/co2": {
         "thing_name": "TGV Office Lab",
         "sensor_id": "tgv-officelab-climate",
         "observed_property": "co2",
-        "observed_property_name": "CO2 concentration",
-        "unit": "ppm",
     },
     "*/pressure": {
         "thing_name": "TGV Office Lab",
         "sensor_id": "tgv-officelab-climate",
         "observed_property": "pressure",
-        "observed_property_name": "Air pressure",
-        "unit": "hPa",
     },
 }
 
@@ -136,12 +131,26 @@ def avro_record_to_sensor_readings(
             logger.debug("No mapping for %s/%s — skipping", device_id, measurement_id)
             continue
 
+        canonical = resolve(mapping["observed_property"])
+        if canonical is None:
+            logger.warning(
+                "Mapping for %s/%s uses non-canonical observed_property %r — skipping",
+                device_id, measurement_id, mapping["observed_property"],
+            )
+            continue
+        meta = canonical.meta
+        if unit_from_avro and unit_from_avro != meta.unit:
+            logger.info(
+                "Avro unit %r for %s/%s disagrees with canonical %r — using canonical",
+                unit_from_avro, device_id, measurement_id, meta.unit,
+            )
+
         readings.append(
             SensorReading(
                 sensor_id=mapping["sensor_id"],
                 sensor_name=mapping.get("sensor_name", mapping["sensor_id"]),
-                observed_property=mapping["observed_property"],
-                unit=unit_from_avro or mapping.get("unit", "1"),
+                observed_property=canonical.value,
+                unit=meta.unit,
                 value=numeric_value,
                 timestamp=ts,
                 quality="good",
@@ -149,7 +158,7 @@ def avro_record_to_sensor_readings(
                 thing_name=mapping["thing_name"],
                 device_eui=device_id,
                 stream_key=measurement_id,
-                observed_property_name=mapping.get("observed_property_name"),
+                observed_property_name=meta.display_name,
             )
         )
 

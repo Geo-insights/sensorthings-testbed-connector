@@ -6,18 +6,19 @@ The API uses OData conventions with /api/{Type}/{installationId} for time-series
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from typing import Any
 
 from app.models import SensorReading
+from app.sta.canonical import CanonicalDatastream, resolve
 
-OBSERVED_PROPERTIES: dict[str, dict[str, str]] = {
-    "water_level": {
-        "name": "Groundwater level",
-        "definition": "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#water_surface_height_above_reference_datum",
-        "description": "Groundwater level relative to reference datum.",
-        "unit": "m",
-    },
+logger = logging.getLogger(__name__)
+
+# Source-specific descriptions per canonical observed property. Unit + display
+# name + CF definition all come from canonical.py at read time.
+_DESCRIPTIONS: dict[str, str] = {
+    "water_level": "Groundwater level relative to reference datum.",
 }
 
 
@@ -60,7 +61,7 @@ def build_entity_set(
                 "properties": {},
             }
         ],
-        "observed_properties": OBSERVED_PROPERTIES,
+        "observed_properties": dict(_DESCRIPTIONS),
     }
 
 
@@ -80,20 +81,23 @@ def parse_logdata_readings(
     A legacy list-of-dicts shape is still handled as a fallback so the parser
     keeps working if a given installation type returns objects instead.
     """
-    prop_def = OBSERVED_PROPERTIES["water_level"]
+    canonical = resolve("water_level")
+    if canonical is None:  # unreachable given canonical.py, but keeps mypy honest
+        return []
+    meta = canonical.meta
 
     def _emit(ts: datetime, value: float) -> SensorReading:
         return SensorReading(
             sensor_id=f"tgv-levellog-{installation_id[:8]}",
             sensor_name=f"Levellog {installation_name} sensor",
-            observed_property="water_level",
-            unit=prop_def["unit"],
+            observed_property=canonical.value,
+            unit=meta.unit,
             value=value,
             timestamp=ts,
             quality="good",
             location="tgv",
             thing_name=f"Levellog {installation_name}",
-            observed_property_name=prop_def["name"],
+            observed_property_name=meta.display_name,
         )
 
     def _parse_ts(raw: Any) -> datetime | None:

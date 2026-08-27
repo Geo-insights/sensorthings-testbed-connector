@@ -31,4 +31,4 @@ def test_entity_sets_use_canonical_names():
 def test_meta_lookup():
     meta = CanonicalDatastream.TEMPERATURE.meta
     assert meta.display_name == "Air temperature"
-    assert meta.unit == "Cel"
+    assert meta.unit == "°C"
