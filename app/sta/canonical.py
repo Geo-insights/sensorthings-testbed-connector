@@ -1,8 +1,13 @@
 """Canonical datastream names and metadata.
 
-Enforces consistent observation field names from configuration
-through normalization to FROST upload.  Each member carries its
-canonical display name, unit symbol, and CF conventions definition URL.
+Single source of truth for observed-property names, unit symbols, and CF
+Conventions definition URLs across every source mapper. Source mappers must
+resolve raw incoming names through :func:`resolve` and read the unit symbol
+from ``.meta`` — never pass a source-provided unit string through to FROST.
+
+Unit symbols follow pragmatic UCUM (``°C`` not ``Cel``, ``ppm`` not
+``[ppm]``, ``deg`` not ``degrees``) so dashboards stay readable while every
+target FROST server sees identical strings across sources.
 """
 
 from __future__ import annotations
@@ -17,20 +22,26 @@ class DatastreamMeta(NamedTuple):
     definition: str
 
 
+_CF = "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html"
+
+
 class CanonicalDatastream(str, Enum):
     """Allowed observation field names across the entire system."""
 
     TEMPERATURE = "temperature"
+    AIR_TEMPERATURE = "air_temperature"
     HUMIDITY = "humidity"
+    RELATIVE_HUMIDITY = "relative_humidity"
     CO2 = "co2"
     PRESSURE = "pressure"
-    AIR_TEMPERATURE = "air_temperature"
+    AIR_PRESSURE = "air_pressure"
     WIND_SPEED = "wind_speed"
     WIND_DIRECTION = "wind_direction"
     PRECIPITATION = "precipitation"
-    AIR_PRESSURE = "air_pressure"
     SOLAR_RADIATION = "solar_radiation"
-    RELATIVE_HUMIDITY = "relative_humidity"
+    WATER_LEVEL = "water_level"
+    PM2_5 = "pm2_5"
+    PM10 = "pm10"
 
     @property
     def meta(self) -> DatastreamMeta:
@@ -39,47 +50,92 @@ class CanonicalDatastream(str, Enum):
 
 _META: dict[CanonicalDatastream, DatastreamMeta] = {
     CanonicalDatastream.TEMPERATURE: DatastreamMeta(
-        "Air temperature", "Cel",
-        "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#air_temperature",
+        "Air temperature", "°C", f"{_CF}#air_temperature",
+    ),
+    CanonicalDatastream.AIR_TEMPERATURE: DatastreamMeta(
+        "Air temperature", "°C", f"{_CF}#air_temperature",
     ),
     CanonicalDatastream.HUMIDITY: DatastreamMeta(
-        "Relative humidity", "%",
-        "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#relative_humidity",
+        "Relative humidity", "%", f"{_CF}#relative_humidity",
+    ),
+    CanonicalDatastream.RELATIVE_HUMIDITY: DatastreamMeta(
+        "Relative humidity", "%", f"{_CF}#relative_humidity",
     ),
     CanonicalDatastream.CO2: DatastreamMeta(
         "CO2 concentration", "ppm",
-        "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#mole_fraction_of_carbon_dioxide_in_air",
+        f"{_CF}#mole_fraction_of_carbon_dioxide_in_air",
     ),
     CanonicalDatastream.PRESSURE: DatastreamMeta(
-        "Air pressure", "hPa",
-        "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#air_pressure",
-    ),
-    CanonicalDatastream.AIR_TEMPERATURE: DatastreamMeta(
-        "Air temperature", "Cel",
-        "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#air_temperature",
-    ),
-    CanonicalDatastream.WIND_SPEED: DatastreamMeta(
-        "Wind speed", "km/h",
-        "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#wind_speed",
-    ),
-    CanonicalDatastream.WIND_DIRECTION: DatastreamMeta(
-        "Wind direction", "degrees",
-        "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#wind_from_direction",
-    ),
-    CanonicalDatastream.PRECIPITATION: DatastreamMeta(
-        "Precipitation", "mm",
-        "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#precipitation_amount",
+        "Air pressure", "hPa", f"{_CF}#air_pressure",
     ),
     CanonicalDatastream.AIR_PRESSURE: DatastreamMeta(
-        "Air pressure", "hPa",
-        "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#air_pressure",
+        "Air pressure", "hPa", f"{_CF}#air_pressure",
+    ),
+    # km/h retained: TGV sensors emit km/h; relabelling to m/s without value
+    # conversion would silently corrupt observations. Follow-up: value
+    # conversion via anchor points (per @znetsixe generalFunctions/convert).
+    CanonicalDatastream.WIND_SPEED: DatastreamMeta(
+        "Wind speed", "km/h", f"{_CF}#wind_speed",
+    ),
+    CanonicalDatastream.WIND_DIRECTION: DatastreamMeta(
+        "Wind direction", "deg", f"{_CF}#wind_from_direction",
+    ),
+    CanonicalDatastream.PRECIPITATION: DatastreamMeta(
+        "Precipitation", "mm", f"{_CF}#precipitation_amount",
     ),
     CanonicalDatastream.SOLAR_RADIATION: DatastreamMeta(
         "Solar radiation", "W/m2",
-        "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#surface_downwelling_shortwave_flux_in_air",
+        f"{_CF}#surface_downwelling_shortwave_flux_in_air",
     ),
-    CanonicalDatastream.RELATIVE_HUMIDITY: DatastreamMeta(
-        "Relative humidity", "%",
-        "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html#relative_humidity",
+    CanonicalDatastream.WATER_LEVEL: DatastreamMeta(
+        "Groundwater level", "m",
+        f"{_CF}#water_surface_height_above_reference_datum",
+    ),
+    CanonicalDatastream.PM2_5: DatastreamMeta(
+        "PM2.5 concentration", "ug/m3",
+        f"{_CF}#mass_concentration_of_pm2p5_ambient_aerosol_particles_in_air",
+    ),
+    CanonicalDatastream.PM10: DatastreamMeta(
+        "PM10 concentration", "ug/m3",
+        f"{_CF}#mass_concentration_of_pm10_ambient_aerosol_particles_in_air",
     ),
 }
+
+
+_ALIASES: dict[str, CanonicalDatastream] = {
+    "temp": CanonicalDatastream.TEMPERATURE,
+    "t": CanonicalDatastream.TEMPERATURE,
+    "airtemperature": CanonicalDatastream.AIR_TEMPERATURE,
+    "rh": CanonicalDatastream.RELATIVE_HUMIDITY,
+    "co2concentration": CanonicalDatastream.CO2,
+    "airpressure": CanonicalDatastream.AIR_PRESSURE,
+    "windspeed": CanonicalDatastream.WIND_SPEED,
+    "winddirection": CanonicalDatastream.WIND_DIRECTION,
+    "solarradiation": CanonicalDatastream.SOLAR_RADIATION,
+    "waterlevel": CanonicalDatastream.WATER_LEVEL,
+    "groundwaterlevel": CanonicalDatastream.WATER_LEVEL,
+    "pm25": CanonicalDatastream.PM2_5,
+    "pm2.5": CanonicalDatastream.PM2_5,
+    "p2": CanonicalDatastream.PM2_5,
+}
+
+
+def resolve(raw_name: str) -> CanonicalDatastream | None:
+    """Map a raw observed-property name to its canonical enum member.
+
+    Returns ``None`` if the name doesn't match a canonical member or a known
+    alias — callers should log a WARNING and drop the observation rather than
+    invent a datastream on the fly.
+    """
+    if not raw_name:
+        return None
+    key = raw_name.strip().lower().replace("-", "_").replace(" ", "_")
+    try:
+        return CanonicalDatastream(key)
+    except ValueError:
+        return _ALIASES.get(key) or _ALIASES.get(key.replace("_", ""))
+
+
+assert set(_META.keys()) == set(CanonicalDatastream), (
+    "Every CanonicalDatastream member must have a _META entry"
+)

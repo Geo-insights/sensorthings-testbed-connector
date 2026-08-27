@@ -38,6 +38,7 @@ Same as main Geo Insights project:
 - **Entity caches are persistent** — stored on Render's persistent disk; losing them means re-registering all entities
 - **Kafka consumer is single-threaded** — runs in a background thread, decoupled from FROST push via queue
 - **Circuit breaker on FROST targets** — unreachable targets are temporarily bypassed, not retried indefinitely
+- **Unit + name normalization at the source boundary** — `app/sta/canonical.py` is the single source of truth for observed-property names, UCUM unit symbols, and CF definition URLs. Every source mapper (`app/sources/*`, `app/pipeline/kafka_tgv.py`) resolves raw names through `canonical.resolve()` and reads unit + display name from `.meta`. Upstream units (e.g. Avro payload `unit` field) are logged when they disagree with canonical but never propagated; canonical always wins. Aligns with the backend-side enforcement position in [Geonovum discussion #24](https://github.com/Geonovum/testbed-sensordata-2026/discussions/24).
 
 ## Entry points
 ```bash
