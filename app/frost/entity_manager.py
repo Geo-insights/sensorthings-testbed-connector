@@ -141,6 +141,102 @@ class EntityManager:
             self._cache.put(collection, name, entity_id)
         return entity_id, f"created:{response.status_code}"
 
+    # -- Batch operations (FROST JSON Batch) --------------------------------
+
+    def batch_find_by_name(
+        self,
+        entries: list[tuple[str, str, str]],
+    ) -> dict[str, str | None]:
+        """Find multiple entities by name in a single ``/$batch`` request.
+
+        *entries* is a list of ``(ref_id, path, name)`` tuples.
+
+        Returns a dict of ``ref_id → @iot.id`` for found entities. Missing
+        entities map to ``None``.
+        """
+        if not entries:
+            return {}
+
+        requests_payload: list[dict[str, Any]] = []
+        for ref_id, path, name in entries:
+            safe_name = name.replace("'", "''")
+            requests_payload.append({
+                "id": ref_id,
+                "method": "get",
+                "url": f"{path.lstrip('/')}?$filter=name eq '{safe_name}'&$top=1",
+            })
+
+        body = self._http.post_batch(requests_payload)
+        return self._extract_batch_ids(entries, body)
+
+    def batch_create(
+        self,
+        entries: list[tuple[str, str, str, dict[str, Any]]],
+    ) -> dict[str, str | None]:
+        """Create multiple entities in a single ``/$batch`` request.
+
+        *entries* is a list of ``(ref_id, path, collection, payload)`` tuples.
+        Payloads may use ``$ref_id`` back-references for linked entity IDs.
+
+        Returns a dict of ``ref_id → @iot.id`` for created entities. Updates
+        the local cache on success.
+        """
+        if not entries:
+            return {}
+
+        requests_payload: list[dict[str, Any]] = []
+        for ref_id, path, _collection, payload in entries:
+            requests_payload.append({
+                "id": ref_id,
+                "method": "post",
+                "url": path.lstrip("/"),
+                "body": payload,
+            })
+
+        body = self._http.post_batch(requests_payload)
+        result = self._extract_batch_ids(
+            [(ref_id, path, "") for ref_id, path, _, _ in entries],
+            body,
+        )
+
+        # Update cache for successfully created entities
+        for ref_id, _path, collection, payload in entries:
+            iot_id = result.get(ref_id)
+            if iot_id:
+                cache_key = str(payload.get("name", ref_id))
+                self._cache.put(collection, cache_key, iot_id)
+
+        return result
+
+    def _extract_batch_ids(
+        self,
+        entries: list[tuple[str, str, str]],
+        body: dict[str, Any] | None,
+    ) -> dict[str, str | None]:
+        """Parse a batch response body and extract @iot.id per ref_id."""
+        result: dict[str, str | None] = {ref_id: None for ref_id, _, _ in entries}
+        if not body or "responses" not in body:
+            return result
+
+        for resp in body["responses"]:
+            ref_id = resp.get("id", "")
+            status = resp.get("status", 0)
+            resp_body = resp.get("body")
+            if not isinstance(resp_body, dict):
+                continue
+
+            iot_id: str | None = None
+            if 200 <= status < 300:
+                # POST → direct @iot.id; GET collection → first item's @iot.id
+                iot_id = self._http.extract_iot_id_from_body(resp_body)
+                if iot_id is None:
+                    iot_id = self._http.extract_first_iot_id(resp_body)
+
+            if iot_id and ref_id in result:
+                result[ref_id] = iot_id
+
+        return result
+
     # -- OData filter queries ----------------------------------------------
 
     def find_by_filter(self, endpoint: str, odata_filter: str) -> str | None:

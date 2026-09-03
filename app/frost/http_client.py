@@ -104,6 +104,53 @@ class FrostHTTPClient:
         except requests.RequestException as exc:
             raise FrostConnectionError(url, cause=exc) from exc
 
+    def get_landing_page(self) -> dict[str, Any] | None:
+        """GET the STA service root and return the parsed JSON body.
+
+        Returns None on any network or parse error so callers can fall back
+        gracefully (e.g. assume no optional capabilities).
+        """
+        base = self.primary_base_url
+        if not base:
+            return None
+        try:
+            response = self._session.get(base, timeout=self._timeout)
+        except requests.RequestException:
+            return None
+        if not response.ok:
+            return None
+        try:
+            body = response.json()
+        except ValueError:
+            return None
+        return body if isinstance(body, dict) else None
+
+    def post_batch(self, requests_payload: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """POST a JSON Batch request to ``/$batch``.
+
+        Uses the FROST JSON Batch format (OData 4.01 style). Returns the parsed
+        response body or None on error.
+        """
+        endpoint = self.endpoint("/$batch")
+        if not endpoint:
+            return None
+        try:
+            response = self._session.post(
+                endpoint,
+                json={"requests": requests_payload},
+                timeout=max(self._timeout, 30.0),
+            )
+        except requests.RequestException:
+            return None
+        if not response.ok:
+            logger.warning("Batch request to %s returned %s", endpoint, response.status_code)
+            return None
+        try:
+            body = response.json()
+        except ValueError:
+            return None
+        return body if isinstance(body, dict) else None
+
     # -- Response helpers --------------------------------------------------
 
     @staticmethod
@@ -122,6 +169,15 @@ class FrostHTTPClient:
         match = re.search(r"\(([^)]+)\)$", location)
         if match:
             return match.group(1).strip("'")
+        return None
+
+    @staticmethod
+    def extract_iot_id_from_body(body: dict[str, Any]) -> str | None:
+        """Extract @iot.id directly from a parsed entity dict."""
+        if body.get("@iot.id") is not None:
+            return str(body["@iot.id"])
+        if body.get("id") is not None:
+            return str(body["id"])
         return None
 
     @staticmethod
