@@ -772,8 +772,19 @@ class SensorThingsClient:
         """Register a full entity set on a single target stack.
 
         Builds v1.1 payloads and adapts them for the target's API version.
+        Uses FROST JSON Batch when the target advertises support (2 HTTP
+        round-trips instead of ~N sequential calls, race-free).
         Skips Projects/Tasking extensions for v2.0 targets.
         """
+        if stack.capabilities.json_batch:
+            try:
+                return self._register_entity_set_on_stack_batch(stack, site_config)
+            except Exception as exc:
+                logger.warning(
+                    "Batch registration failed on %s, falling back to sequential: %s",
+                    stack.label, exc,
+                )
+
         em = stack.entity_manager
         is_v2 = stack.is_v2
 
@@ -928,31 +939,251 @@ class SensorThingsClient:
             "datastream_results": datastream_results,
         }
 
+    def _register_entity_set_on_stack_batch(
+        self, stack: TargetStack, site_config: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Register a full entity set using FROST JSON Batch (2 round-trips).
+
+        Phase 1: batch-find all entities by name.
+        Phase 2: batch-create missing entities with back-references.
+        """
+        em = stack.entity_manager
+        is_v2 = stack.is_v2
+
+        # -- Build entity descriptors -----------------------------------------
+        thing_name = self._prefixed_name(site_config["thing"]["name"])
+        thing_payload: dict[str, Any] = {
+            "name": thing_name,
+            "description": site_config["thing"]["description"],
+            "properties": site_config["thing"]["properties"],
+        }
+        if is_v2:
+            thing_payload = adapt_payload(thing_payload)
+
+        location_name = self._prefixed_name(site_config["location"]["name"])
+        location_payload: dict[str, Any] = {
+            "name": location_name,
+            "description": site_config["location"]["description"],
+            "encodingType": site_config["location"]["encodingType"],
+            "location": site_config["location"]["location"],
+        }
+        if is_v2:
+            location_payload = adapt_payload(location_payload)
+
+        # Collect all find entries: (ref_id, path, name)
+        find_entries: list[tuple[str, str, str]] = [
+            ("thing", settings.things_path, thing_name),
+            ("location", settings.locations_path, location_name),
+        ]
+
+        # ref_id -> (path, collection, payload_builder_or_payload)
+        sensor_ref_ids: dict[str, str] = {}      # sensor_id -> ref_id
+        op_ref_ids: dict[str, str] = {}           # observed_property -> ref_id
+        ds_descriptors: list[dict[str, Any]] = []  # for Phase 2
+
+        for sensor in site_config["sensors"]:
+            sensor_name = self._prefixed_name(sensor["name"])
+            s_ref = f"sensor_{sensor['sensor_id']}"
+            sensor_ref_ids[sensor["sensor_id"]] = s_ref
+            find_entries.append((s_ref, settings.sensors_path, sensor_name))
+
+            for observed_property in sensor["observed_properties"]:
+                prop = _canonical_property_payload(
+                    observed_property, site_config.get("observed_properties"),
+                )
+                if prop is None:
+                    continue
+                op_ref = f"op_{observed_property}"
+                if observed_property not in op_ref_ids:
+                    op_ref_ids[observed_property] = op_ref
+                    find_entries.append((op_ref, settings.observed_properties_path, prop["name"]))
+
+                ds_key = self._datastream_key(sensor["sensor_id"], observed_property)
+                ds_name = f"{sensor_name} - {prop['name']}"
+                find_entries.append((f"ds_{ds_key}", settings.datastreams_path, ds_name))
+                ds_descriptors.append({
+                    "ds_ref": f"ds_{ds_key}",
+                    "ds_key": ds_key,
+                    "ds_name": ds_name,
+                    "sensor_ref": s_ref,
+                    "op_ref": op_ref,
+                    "prop": prop,
+                    "sensor_id": sensor["sensor_id"],
+                    "sensor_name": sensor_name,
+                    "observed_property": observed_property,
+                })
+
+        # -- Phase 1: batch find ----------------------------------------------
+        found = em.batch_find_by_name(find_entries)
+
+        # -- Phase 2: batch create missing ------------------------------------
+        to_create: list[tuple[str, str, str, dict[str, Any]]] = []
+
+        def _id_or_ref(ref_id: str) -> Any:
+            """Return a concrete ID if found, else a $ref back-reference."""
+            iot_id = found.get(ref_id)
+            return _coerce_iot_id(iot_id) if iot_id else f"${ref_id}"
+
+        if not found.get("thing"):
+            to_create.append(("thing", settings.things_path, "things", thing_payload))
+
+        if not found.get("location"):
+            location_payload["Things"] = [{"@iot.id": _id_or_ref("thing")}]
+            to_create.append(("location", settings.locations_path, "locations", location_payload))
+
+        for sensor in site_config["sensors"]:
+            s_ref = sensor_ref_ids[sensor["sensor_id"]]
+            if not found.get(s_ref):
+                s_payload: dict[str, Any] = {
+                    "name": self._prefixed_name(sensor["name"]),
+                    "description": sensor["description"],
+                    "encodingType": sensor["encodingType"],
+                    "metadata": sensor["metadata"],
+                }
+                sensor_properties = sensor.get("properties")
+                if isinstance(sensor_properties, dict) and sensor_properties:
+                    s_payload["properties"] = sensor_properties
+                if is_v2:
+                    s_payload = adapt_payload(s_payload)
+                to_create.append((s_ref, settings.sensors_path, "sensors", s_payload))
+
+        for observed_property, op_ref in op_ref_ids.items():
+            if not found.get(op_ref):
+                prop = _canonical_property_payload(
+                    observed_property, site_config.get("observed_properties"),
+                )
+                if prop is None:
+                    continue
+                op_record: dict[str, Any] = {
+                    "name": prop["name"],
+                    "definition": prop["definition"],
+                    "description": prop["description"],
+                }
+                if is_v2:
+                    op_record = adapt_payload(op_record)
+                to_create.append((op_ref, settings.observed_properties_path, "observed_properties", op_record))
+
+        datastream_results: list[dict[str, Any]] = []
+        for desc in ds_descriptors:
+            if found.get(desc["ds_ref"]):
+                datastream_results.append({
+                    "datastream_key": desc["ds_key"],
+                    "name": desc["ds_name"],
+                    "status": "existing",
+                    "id": found[desc["ds_ref"]],
+                })
+                continue
+            ds_payload: dict[str, Any] = {
+                "name": desc["ds_name"],
+                "description": f"{desc['prop']['name']} observations for {thing_name}",
+                "observationType": "http://www.opengis.net/def/observationType/OGC-OM/2.0/OM_Measurement",
+                "unitOfMeasurement": {
+                    "name": desc["prop"]["name"],
+                    "symbol": desc["prop"]["unit"],
+                    "definition": desc["prop"]["definition"],
+                },
+                "Thing": {"@iot.id": _id_or_ref("thing")},
+                "Sensor": {"@iot.id": _id_or_ref(desc["sensor_ref"])},
+                "ObservedProperty": {"@iot.id": _id_or_ref(desc["op_ref"])},
+                "properties": {
+                    "site_key": site_config["site_key"],
+                    "thing_name": thing_name,
+                    "sensor_id": desc["sensor_id"],
+                    "observed_property": desc["observed_property"],
+                    "streamKey": desc["observed_property"],
+                },
+            }
+            if is_v2:
+                ds_payload = adapt_datastream_payload(ds_payload)
+            to_create.append((desc["ds_ref"], settings.datastreams_path, "datastreams", ds_payload))
+
+        created: dict[str, str | None] = {}
+        if to_create:
+            created = em.batch_create(to_create)
+
+        # Merge found + created
+        all_ids = {k: v for k, v in {**found, **created}.items() if v}
+
+        thing_id = all_ids.get("thing")
+        location_id = all_ids.get("location")
+
+        # Thing→Location PATCH (same workaround as sequential path)
+        if location_id and thing_id:
+            try:
+                thing_endpoint = em._http.endpoint(f"{settings.things_path}({thing_id})")
+                if thing_endpoint:
+                    em._http.patch(
+                        thing_endpoint,
+                        {"Locations": [{"@iot.id": _coerce_iot_id(location_id)}]},
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Thing->Location link PATCH failed on %s (%s): %s",
+                    stack.label, stack.version, exc,
+                )
+
+        # Build datastream results for newly created ones
+        for desc in ds_descriptors:
+            if desc["ds_ref"] not in created:
+                continue
+            ds_id = created.get(desc["ds_ref"])
+            datastream_results.append({
+                "datastream_key": desc["ds_key"],
+                "name": desc["ds_name"],
+                "status": f"created:{201 if ds_id else 'error'}",
+                "id": ds_id,
+            })
+
+        logger.info(
+            "Batch registration on %s: %d found, %d created (2 HTTP round-trips)",
+            stack.label, len(found) - list(found.values()).count(None),
+            len(created) - list(created.values()).count(None),
+        )
+
+        return {
+            "target": stack.label,
+            "version": stack.version,
+            "ok": bool(thing_id),
+            "thing_id": thing_id,
+            "thing_status": "existing" if found.get("thing") else "created",
+            "location_id": location_id,
+            "location_status": "existing" if found.get("location") else "created",
+            "datastream_results": datastream_results,
+            "batch": True,
+        }
+
     def _register_entity_set_on_extra_targets(
         self, site_config: dict[str, Any]
     ) -> list[dict[str, Any]]:
-        """Register entity set on all non-primary target stacks."""
-        results: list[dict[str, Any]] = []
+        """Register entity set on all non-primary target stacks in parallel.
+
+        Each target has its own TargetStack (HTTP client, cache, entity manager)
+        with no shared mutable state, so parallel registration is safe.
+        """
         primary_url = self._primary_base_url()
-        for stack in self._target_stacks:
-            if stack.base_url == primary_url:
-                continue
+        extra_stacks = [s for s in self._target_stacks if s.base_url != primary_url]
+        if not extra_stacks:
+            return []
+
+        def _register_on(stack: TargetStack) -> dict[str, Any]:
             try:
                 result = self._register_entity_set_on_stack(stack, site_config)
-                results.append(result)
                 logger.info(
                     "Registered entity set on %s (%s): %s",
                     stack.label, stack.version, "ok" if result.get("ok") else "failed",
                 )
+                return result
             except Exception:
                 logger.exception("Failed to register entities on %s", stack.label)
-                results.append({
+                return {
                     "target": stack.label,
                     "version": stack.version,
                     "ok": False,
                     "message": "Exception during registration (see logs).",
-                })
-        return results
+                }
+
+        with ThreadPoolExecutor(max_workers=len(extra_stacks)) as pool:
+            return list(pool.map(_register_on, extra_stacks))
 
     def register_demo_entities(self, readings: list[SensorReading] | None = None) -> dict[str, Any]:
         _ = readings
@@ -1650,81 +1881,65 @@ class SensorThingsClient:
         }
 
     def _check_capabilities_for_base_url(self, root_url: str) -> dict[str, Any]:
-        headers = self._headers_for_url(root_url)
         stack = self._target_stack_for_url(root_url)
 
-        try:
-            response = requests.get(root_url, headers=headers, timeout=self._request_timeout())
-        except requests.RequestException as exc:
+        # Reuse the capabilities discovered at startup by TargetStack rather
+        # than re-probing the landing page on every call.
+        if stack is None:
             return {
                 "mode": "live",
                 "reachable": False,
-                "status_code": getattr(getattr(exc, "response", None), "status_code", None),
                 "root_url": root_url,
-                "error": str(exc),
+                "error": "No TargetStack configured for this URL",
             }
 
-        try:
-            body = response.json()
-        except ValueError:
-            body = {}
-
-        collections: list[str] = []
-        conformance: list[str] = []
-        if isinstance(body, dict):
-            if isinstance(body.get("value"), list):
-                collections = [item.get("name") for item in body["value"] if isinstance(item, dict) and item.get("name")]
-            server_settings = body.get("serverSettings")
-            if isinstance(server_settings, dict) and isinstance(server_settings.get("conformance"), list):
-                conformance = [str(item) for item in server_settings["conformance"]]
-
-        def _advertises(token: str) -> bool:
-            token_lower = token.lower()
-            return any(token_lower in name.lower() for name in collections) or any(
-                token_lower in item.lower() for item in conformance
-            )
+        caps = stack.capabilities
+        is_v2 = stack.is_v2
+        normalized = root_url.rstrip("/")
+        batch_observed_unsupported = normalized in self._no_batch_targets
 
         extensions = {
-            "projects": _advertises("Projects"),
-            "tasking": _advertises("Tasking") or _advertises("Tasks"),
-            "opencitysense": _advertises("OpenCitySense"),
-            "data_array": _advertises("data-array") or _advertises("dataArray") or _advertises("DataArrayValue"),
-            "mqtt": _advertises("mqtt"),
-            "batch_request": _advertises("batch"),
+            "projects": caps.projects,
+            "tasking": caps.tasking,
+            "opencitysense": any("opencitysense" in c.lower() for c in caps.conformance),
+            "data_array": caps.data_array,
+            "mqtt": caps.mqtt,
+            "batch_request": caps.json_batch,
         }
 
-        # Write-path capabilities a producer must discover to be both fast and
-        # safe (cf. testbed discussions #22/#23): whether bulk dataArray insert is
-        # available, whether the server lets a client supply entity ids (v2), and
-        # how duplicate (Datastream, phenomenonTime) writes are handled.
-        normalized = root_url.rstrip("/")
-        is_v2 = stack.is_v2 if stack else False
-        batch_observed_unsupported = normalized in self._no_batch_targets
         write_capabilities = {
             "create_observations_dataArray": {
-                "advertised": extensions["data_array"],
+                "advertised": caps.data_array,
                 "observed_unsupported": batch_observed_unsupported,
                 "in_use": settings.frost_batch_push_enabled and not is_v2 and not batch_observed_unsupported,
             },
-            # v2 lets a client supply @iot.id, turning entity upsert from
-            # check-then-act into an idempotent write at a deterministic id.
+            "json_batch_registration": {
+                "advertised": caps.json_batch,
+                "in_use": caps.json_batch,
+            },
             "client_specified_id": is_v2,
-            # We POST optimistically and treat 409 Conflict as already-delivered,
-            # which only deduplicates when the server enforces uniqueness. The DLQ
-            # replay path probes explicitly (FROST_REPLAY_DEDUP_PROBE) to stay safe
-            # on servers that accept duplicate observations.
             "observation_duplicate_handling": "optimistic-write; 409-as-delivered (server-dependent)",
         }
 
+        # Quick reachability probe — HEAD is cheaper than GET.
+        reachable = False
+        status_code = None
+        try:
+            response = requests.head(root_url, headers=self._headers_for_url(root_url), timeout=self._request_timeout())
+            reachable = response.ok
+            status_code = response.status_code
+        except requests.RequestException:
+            pass
+
         return {
             "mode": "live",
-            "reachable": response.ok,
-            "status_code": response.status_code,
+            "reachable": reachable,
+            "status_code": status_code,
             "root_url": root_url,
-            "configured_version": stack.version if stack else "v1.1",
-            "label": stack.label if stack else None,
-            "collections": collections,
-            "conformance": conformance,
+            "configured_version": stack.version,
+            "label": stack.label,
+            "collections": caps.collections,
+            "conformance": caps.conformance,
             "extensions": extensions,
             "write_capabilities": write_capabilities,
         }
