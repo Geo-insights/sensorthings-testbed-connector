@@ -15,26 +15,101 @@ logger = logging.getLogger(__name__)
 # Override at runtime via KAFKA_TGV_DEVICE_MAPPING_JSON env var without a code change.
 # observed_property MUST be a canonical name (see app/sta/canonical.py); unit +
 # display name are looked up through canonical.resolve(), never carried here.
+# Measurement IDs match the Davis Vantage Pro2 register names on the Kafka
+# topic ``tud_gv_officelab-climate`` (single device: "Weather Station").
+# The env-var override ``KAFKA_TGV_DEVICE_MAPPING_JSON`` takes precedence
+# when set; this default covers the same 9 streams so the connector works
+# out-of-the-box without the env var.
 _DEFAULT_DEVICE_MAPPING: dict[str, dict[str, str]] = {
-    "*/temperature": {
+    # --- TGV Office Lab (indoor climate) ---
+    "*/Inside Temperature": {
         "thing_name": "TGV Office Lab",
         "sensor_id": "tgv-officelab-climate",
         "observed_property": "temperature",
     },
-    "*/humidity": {
+    "*/Inside Relative Humidity": {
         "thing_name": "TGV Office Lab",
         "sensor_id": "tgv-officelab-climate",
         "observed_property": "humidity",
     },
-    "*/co2": {
-        "thing_name": "TGV Office Lab",
-        "sensor_id": "tgv-officelab-climate",
-        "observed_property": "co2",
+    # --- Climate Davis (outdoor weather station) ---
+    "*/Outside Temperature": {
+        "thing_name": "Climate Davis",
+        "sensor_id": "tgv-climate-davis-weather-station",
+        "observed_property": "air_temperature",
     },
-    "*/pressure": {
-        "thing_name": "TGV Office Lab",
-        "sensor_id": "tgv-officelab-climate",
-        "observed_property": "pressure",
+    "*/Wind Speed": {
+        "thing_name": "Climate Davis",
+        "sensor_id": "tgv-climate-davis-weather-station",
+        "observed_property": "wind_speed",
+    },
+    "*/Wind Direction": {
+        "thing_name": "Climate Davis",
+        "sensor_id": "tgv-climate-davis-weather-station",
+        "observed_property": "wind_direction",
+    },
+    "*/Daily Rain": {
+        "thing_name": "Climate Davis",
+        "sensor_id": "tgv-climate-davis-weather-station",
+        "observed_property": "precipitation",
+    },
+    # --- Weather Climatics (rooftop station) ---
+    "*/Barometric Pressure": {
+        "thing_name": "Weather Climatics",
+        "sensor_id": "tgv-weather-climatics-rooftop-station",
+        "observed_property": "air_pressure",
+    },
+    # --- Hitteplein (climate station) ---
+    "*/Solar Radiation": {
+        "thing_name": "Hitteplein",
+        "sensor_id": "tgv-hitteplein-climate-station",
+        "observed_property": "solar_radiation",
+    },
+    "*/Outside Relative Humidity": {
+        "thing_name": "Hitteplein",
+        "sensor_id": "tgv-hitteplein-climate-station",
+        "observed_property": "relative_humidity",
+    },
+    # --- Additional Davis measurements ---
+    "*/Dew Point": {
+        "thing_name": "Climate Davis",
+        "sensor_id": "tgv-climate-davis-weather-station",
+        "observed_property": "dew_point",
+    },
+    "*/Heat Index": {
+        "thing_name": "Climate Davis",
+        "sensor_id": "tgv-climate-davis-weather-station",
+        "observed_property": "heat_index",
+    },
+    "*/Wind Chill": {
+        "thing_name": "Climate Davis",
+        "sensor_id": "tgv-climate-davis-weather-station",
+        "observed_property": "wind_chill",
+    },
+    "*/10 Minutes Average Wind Gust": {
+        "thing_name": "Climate Davis",
+        "sensor_id": "tgv-climate-davis-weather-station",
+        "observed_property": "wind_gust",
+    },
+    "*/Rain Rate": {
+        "thing_name": "Climate Davis",
+        "sensor_id": "tgv-climate-davis-weather-station",
+        "observed_property": "rain_rate",
+    },
+    "*/Ultraviolet Radiation Index": {
+        "thing_name": "Climate Davis",
+        "sensor_id": "tgv-climate-davis-weather-station",
+        "observed_property": "uv_index",
+    },
+    "*/Wet Bulb Temperature (indication)": {
+        "thing_name": "Climate Davis",
+        "sensor_id": "tgv-climate-davis-weather-station",
+        "observed_property": "wet_bulb_temperature",
+    },
+    "*/Current Evapotranspiration": {
+        "thing_name": "Climate Davis",
+        "sensor_id": "tgv-climate-davis-weather-station",
+        "observed_property": "evapotranspiration",
     },
 }
 

@@ -34,6 +34,15 @@ def _settings(tmp_path, **overrides):
         site_tasking_configs={},
         tasking_allowed_commands=set(),
         request_timeout_seconds=15.0,
+        frost_targets=(),
+        frost_batch_push_enabled=False,
+        frost_v2_batch_push_enabled=False,
+        frost_batch_max_observations=500,
+        frost_batch_timeout_seconds=60,
+        frost_batch_max_concurrency=4,
+        frost_cb_failure_threshold=3,
+        frost_cb_cooldown_seconds=600,
+        failed_dlq_max_bytes=50_000_000,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -340,7 +349,7 @@ def test_push_observations_uses_dynamic_datastream_lookup_when_mapping_missing(m
         status_code = 201
         text = "created"
 
-    monkeypatch.setattr(client, "_post_observation", lambda endpoint, payload, datastream_id: FakeResponse())
+    monkeypatch.setattr(client, "_post_observation", lambda endpoint, payload, datastream_id, base_url=None: FakeResponse())
 
     result = client.push_observations([reading])
 
@@ -359,7 +368,7 @@ def test_resolve_datastream_id_live_queries_by_device_eui_and_stream_key(monkeyp
 
     captured_filters: list[str] = []
 
-    def fake_fetch(endpoint, query_filter):
+    def fake_fetch(endpoint, query_filter, base_url=None):
         captured_filters.append(query_filter)
         return "777"
 

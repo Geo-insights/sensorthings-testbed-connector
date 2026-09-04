@@ -90,7 +90,11 @@ CLIMATE_ADAPTATION_ENTITY_SETS: list[dict[str, Any]] = [
                 "description": "Davis Vantage Pro2 outdoor weather station measuring air temperature, wind, and precipitation.",
                 "encodingType": "application/json",
                 "metadata": "https://thegreenvillage.org",
-                "observed_properties": ["air_temperature", "wind_speed", "wind_direction", "precipitation"],
+                "observed_properties": [
+                    "air_temperature", "wind_speed", "wind_direction", "precipitation",
+                    "dew_point", "heat_index", "wind_chill", "wind_gust",
+                    "rain_rate", "uv_index", "wet_bulb_temperature", "evapotranspiration",
+                ],
                 "properties": {},
             }
         ],
@@ -99,6 +103,14 @@ CLIMATE_ADAPTATION_ENTITY_SETS: list[dict[str, Any]] = [
             "wind_speed": "Wind speed.",
             "wind_direction": "Wind direction in degrees from north.",
             "precipitation": "Daily rainfall.",
+            "dew_point": "Dew point temperature.",
+            "heat_index": "Apparent temperature accounting for humidity.",
+            "wind_chill": "Apparent temperature accounting for wind.",
+            "wind_gust": "10-minute average wind gust speed.",
+            "rain_rate": "Current rainfall rate.",
+            "uv_index": "Ultraviolet radiation index.",
+            "wet_bulb_temperature": "Wet bulb temperature (indication).",
+            "evapotranspiration": "Current daily evapotranspiration.",
         },
     },
     {
