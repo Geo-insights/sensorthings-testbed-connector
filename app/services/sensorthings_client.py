@@ -146,7 +146,12 @@ class SensorThingsClient:
         self._observed_property_names: dict[str, str] = self._build_observed_property_name_map()
         self._tasking_capability_ids: dict[str, str] = dict(self._cache.collection("tasking_capabilities"))
         # Targets that answered CreateObservations with 4xx/501 (no dataArray support).
-        self._no_batch_targets: set[str] = set()
+        # Seed from capabilities discovery so we skip the first-cycle 404.
+        self._no_batch_targets: set[str] = {
+            stack.base_url.rstrip("/")
+            for stack in self._target_stacks
+            if not stack.capabilities.data_array
+        }
 
     @staticmethod
     def _load_base_urls() -> list[str]:

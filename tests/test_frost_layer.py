@@ -131,16 +131,15 @@ class TestFrostHTTPClient:
     def test_extract_first_iot_id_empty(self):
         assert FrostHTTPClient.extract_first_iot_id({"value": []}) is None
 
-    @patch("app.frost.http_client.requests.post")
-    def test_post_with_retry_success(self, mock_post):
+    def test_post_with_retry_success(self):
         response = MagicMock()
         response.ok = True
-        mock_post.return_value = response
 
         client = FrostHTTPClient(base_urls=["http://frost"])
-        result = client.post_with_retry("http://frost/Observations", {}, "ds1")
-        assert result.ok
-        assert mock_post.call_count == 1
+        with patch.object(client._session, "post", return_value=response) as mock_post:
+            result = client.post_with_retry("http://frost/Observations", {}, "ds1")
+            assert result.ok
+            assert mock_post.call_count == 1
 
     @patch("app.frost.http_client.requests.post")
     @patch("app.frost.http_client.time.sleep")

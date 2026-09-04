@@ -42,6 +42,14 @@ class CanonicalDatastream(str, Enum):
     WATER_LEVEL = "water_level"
     PM2_5 = "pm2_5"
     PM10 = "pm10"
+    DEW_POINT = "dew_point"
+    HEAT_INDEX = "heat_index"
+    WIND_CHILL = "wind_chill"
+    WIND_GUST = "wind_gust"
+    RAIN_RATE = "rain_rate"
+    UV_INDEX = "uv_index"
+    WET_BULB_TEMPERATURE = "wet_bulb_temperature"
+    EVAPOTRANSPIRATION = "evapotranspiration"
 
     @property
     def meta(self) -> DatastreamMeta:
@@ -99,6 +107,30 @@ _META: dict[CanonicalDatastream, DatastreamMeta] = {
         "PM10 concentration", "ug/m3",
         f"{_CF}#mass_concentration_of_pm10_ambient_aerosol_particles_in_air",
     ),
+    CanonicalDatastream.DEW_POINT: DatastreamMeta(
+        "Dew point temperature", "°C", f"{_CF}#dew_point_temperature",
+    ),
+    CanonicalDatastream.HEAT_INDEX: DatastreamMeta(
+        "Heat index", "°C", f"{_CF}#heat_index_of_air_temperature",
+    ),
+    CanonicalDatastream.WIND_CHILL: DatastreamMeta(
+        "Wind chill", "°C", f"{_CF}#wind_chill_of_air_temperature",
+    ),
+    CanonicalDatastream.WIND_GUST: DatastreamMeta(
+        "Wind gust speed", "km/h", f"{_CF}#wind_speed_of_gust",
+    ),
+    CanonicalDatastream.RAIN_RATE: DatastreamMeta(
+        "Rainfall rate", "mm/h", f"{_CF}#rainfall_rate",
+    ),
+    CanonicalDatastream.UV_INDEX: DatastreamMeta(
+        "UV index", "1", f"{_CF}#ultraviolet_index",
+    ),
+    CanonicalDatastream.WET_BULB_TEMPERATURE: DatastreamMeta(
+        "Wet bulb temperature", "°C", f"{_CF}#wet_bulb_temperature",
+    ),
+    CanonicalDatastream.EVAPOTRANSPIRATION: DatastreamMeta(
+        "Evapotranspiration", "mm", f"{_CF}#water_evapotranspiration_amount",
+    ),
 }
 
 
@@ -117,6 +149,16 @@ _ALIASES: dict[str, CanonicalDatastream] = {
     "pm25": CanonicalDatastream.PM2_5,
     "pm2.5": CanonicalDatastream.PM2_5,
     "p2": CanonicalDatastream.PM2_5,
+    "dewpoint": CanonicalDatastream.DEW_POINT,
+    "heatindex": CanonicalDatastream.HEAT_INDEX,
+    "windchill": CanonicalDatastream.WIND_CHILL,
+    "windgust": CanonicalDatastream.WIND_GUST,
+    "rainrate": CanonicalDatastream.RAIN_RATE,
+    "rainfallrate": CanonicalDatastream.RAIN_RATE,
+    "uvindex": CanonicalDatastream.UV_INDEX,
+    "ultravioletindex": CanonicalDatastream.UV_INDEX,
+    "wetbulbtemperature": CanonicalDatastream.WET_BULB_TEMPERATURE,
+    "et": CanonicalDatastream.EVAPOTRANSPIRATION,
 }
 
 
