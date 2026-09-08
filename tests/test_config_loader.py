@@ -9,7 +9,6 @@ import yaml
 
 from app.sta.config_loader import load_all_site_configs, load_site_config
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -342,7 +341,7 @@ class TestEdgeCases:
 
     def test_yaml_list_of_empty_dicts(self, tmp_path):
         cfg = _write_yaml(tmp_path / "site.yaml", [{}])
-        entity_sets, errors = load_site_config(cfg)
+        _entity_sets, errors = load_site_config(cfg)
         assert len(errors) > 0
         assert any("missing required keys" in e for e in errors)
 

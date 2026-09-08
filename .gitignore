@@ -9,3 +9,4 @@ data/*.json
 data/*.jsonl
 deserializing-consumer-example/projectsecrets.py
 .claude/
+TASK_LEDGER.md

@@ -10,11 +10,11 @@ Usage:
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
-import os
 import sys
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 
 import requests
@@ -186,10 +186,8 @@ def _query_server(target: dict, prefix: str) -> dict:
             latest = obs_list[0]
             raw_ts = latest.get("phenomenonTime", "")
             latest_value = latest.get("result")
-            try:
+            with contextlib.suppress(ValueError, TypeError):
                 latest_time = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
-            except (ValueError, TypeError):
-                pass
 
         # Calculate average interval from last 10 observations
         avg_interval_seconds = None
@@ -197,10 +195,8 @@ def _query_server(target: dict, prefix: str) -> dict:
             timestamps = []
             for obs in obs_list:
                 raw = obs.get("phenomenonTime", "")
-                try:
+                with contextlib.suppress(ValueError, TypeError):
                     timestamps.append(datetime.fromisoformat(str(raw).replace("Z", "+00:00")))
-                except (ValueError, TypeError):
-                    pass
             if len(timestamps) >= 2:
                 intervals = []
                 for i in range(len(timestamps) - 1):
@@ -371,9 +367,7 @@ def _print_cross_server_comparison(servers: list[dict]) -> None:
                 counts[s["label"]] = None  # Missing entirely
 
         values = [c for c in counts.values() if c is not None]
-        if len(values) >= 2 and (max(values) - min(values)) > max(values) * 0.05:
-            discrepancies.append((name, counts))
-        elif len(values) < len(reachable):
+        if (len(values) >= 2 and (max(values) - min(values)) > max(values) * 0.05) or len(values) < len(reachable):
             discrepancies.append((name, counts))
 
     if not discrepancies:
@@ -422,7 +416,7 @@ def main() -> None:
         if result["reachable"]:
             print(f" OK ({result['response_time_ms']}ms)")
         else:
-            print(f" FAILED")
+            print(" FAILED")
 
     for server in servers:
         _print_server_report(server)

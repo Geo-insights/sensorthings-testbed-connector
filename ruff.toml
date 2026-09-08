@@ -1,0 +1,22 @@
+# Minimal ruff config — catches real bugs, doesn't fight the existing style.
+target-version = "py312"
+line-length = 120
+
+[lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "E501",    # line too long — enforced by formatter, not linter
+    "SIM108",  # ternary instead of if/else — readability preference
+]
+
+[lint.per-file-ignores]
+"tests/*" = ["B011"]  # assert False is fine in tests

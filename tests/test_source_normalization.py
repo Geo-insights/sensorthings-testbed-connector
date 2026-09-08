@@ -7,13 +7,12 @@ backend-side enforcement position taken in Geonovum discussion #24.
 """
 from __future__ import annotations
 
-from app.sources import ohnics, levellog
+from app.sources import levellog, ohnics
 from app.sources.climate_adaptation import (
     CLIMATE_ADAPTATION_ENTITY_SETS,
     generate_demo_readings,
 )
 from app.sta.canonical import CanonicalDatastream, resolve
-
 
 _CANONICAL_UNITS = {member.value: member.meta.unit for member in CanonicalDatastream}
 _CANONICAL_NAMES = {member.value for member in CanonicalDatastream}

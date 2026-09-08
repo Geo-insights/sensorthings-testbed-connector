@@ -96,7 +96,7 @@ class KafkaTGVConsumer:
             finally:
                 self._consumer = None
 
-    def __enter__(self) -> "KafkaTGVConsumer":
+    def __enter__(self) -> KafkaTGVConsumer:
         self.connect()
         return self
 

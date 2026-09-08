@@ -47,10 +47,57 @@ uvicorn app.main:app --host 0.0.0.0 --port 8010 --reload
 
 # Production (Dockerfile CMD)
 uvicorn app.main:app --host 0.0.0.0 --port 8010
-
-# Tests
-pytest tests/ -q
 ```
+
+## Verified commands
+```bash
+# Unit tests (315 tests, ~13s, excludes integration by default)
+python -m pytest tests/ -q
+
+# Integration tests (needs Docker: docker compose -f docker-compose.test.yaml up -d)
+python -m pytest tests/ -q -m integration
+
+# Lint
+python -m ruff check app/ tests/ scripts/
+
+# Lint auto-fix
+python -m ruff check app/ tests/ scripts/ --fix
+
+# Type-check (not configured yet — no mypy/pyright in the project)
+# Syntax-check all app code
+python -c "import ast; [ast.parse(open(f).read()) for f in __import__('glob').glob('app/**/*.py', recursive=True)]"
+```
+
+### Done-gate (verification gate for any task)
+A task is done when **both** pass with zero errors:
+```bash
+python -m pytest tests/ -q && python -m ruff check app/ tests/ scripts/
+```
+
+## Parallel work
+Multiple Claude Code sessions and `isolation: "worktree"` subagents can work on this repo simultaneously. Coordination rules:
+
+1. **Claim before touching.** Before editing any file, add an entry to `TASK_LEDGER.md` with your task name, branch, and the files you will touch.
+2. **No overlapping files.** Never edit a file already claimed by another open task. If you need to, coordinate with that task's owner first.
+3. **Use worktree isolation for subagents.** Code-writing subagents must use `isolation: "worktree"` so they get their own branch and working copy.
+4. **Main session stays on main.** Only the main interactive session works on `main`; all parallel work happens on feature branches.
+5. **Run the done-gate before merging.** Every branch must pass `pytest + ruff check` before merging back to main.
+
+## Working autonomously
+For unattended runs, use a concrete exit condition so the session doesn't run forever.
+
+**Recommended invocation:**
+```bash
+claude --dangerously-skip-permissions \
+  -p "TASK DESCRIPTION. Exit when done-gate passes (pytest + ruff clean)." \
+  --max-turns 30
+```
+
+**Rules for autonomous sessions:**
+- Always set `--max-turns` (30 is a good default; raise to 50 for larger tasks).
+- The task prompt must include the done-gate command and an explicit exit instruction.
+- Claim your task in `TASK_LEDGER.md` at the start; mark it done at the end.
+- Do not push to remote unless the task prompt explicitly says to.
 
 ## Skills
 See ../gi-skills/skills/connector-review/SKILL.md

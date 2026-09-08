@@ -85,8 +85,8 @@ def parse_sensor_readings(sensor_data: dict[str, Any]) -> list[SensorReading]:
         return []
 
     # Extract coordinates (optional — used for entity registration, not readings)
-    lat = sensor_data.get("Lat", sensor_data.get("lat", 0.0))
-    lon = sensor_data.get("Long", sensor_data.get("Lon", sensor_data.get("lon", 0.0)))
+    _lat = sensor_data.get("Lat", sensor_data.get("lat", 0.0))
+    _lon = sensor_data.get("Long", sensor_data.get("Lon", sensor_data.get("lon", 0.0)))
 
     # Extract timestamp
     ts_raw = sensor_data.get("Timestamp", sensor_data.get("timestamp", sensor_data.get("Time", "")))

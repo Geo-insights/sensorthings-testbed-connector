@@ -12,7 +12,6 @@ Key differences handled:
 
 from __future__ import annotations
 
-from copy import deepcopy
 from typing import Any
 
 # Navigation property keys that may contain inline entity references.

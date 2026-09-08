@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 
 from app.models import SensorReading
-from app.pipeline.base import Decoder, Decapsulator, Deserializer, Normalizer, Parser
+from app.pipeline.base import Decapsulator, Decoder, Deserializer, Normalizer, Parser
 from app.pipeline.registry import ComponentRegistry, PipelineComponents, registry
-
 
 # ---------------------------------------------------------------------------
 # Concrete stubs for each ABC
@@ -39,7 +38,7 @@ class StubParser(Parser):
             observed_property="temperature",
             unit="°C",
             value=raw.get("value", 0.0),
-            timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
         )
 
 
@@ -102,7 +101,7 @@ class TestConcreteNormalizer:
             observed_property="temperature",
             unit="°C",
             value=0.0,
-            timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
         )
         result = normalizer.normalize(reading)
         assert result.unit == "K"

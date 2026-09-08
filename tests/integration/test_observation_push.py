@@ -11,7 +11,6 @@ from app.frost.cache import EntityCache
 from app.frost.entity_manager import EntityManager
 from app.frost.http_client import FrostHTTPClient
 
-
 pytestmark = pytest.mark.integration
 
 
@@ -67,7 +66,7 @@ def test_push_single_observation(frost_url, frost_stack):
         "result": 21.5,
         "Datastream": {"@iot.id": ds_id},
     }
-    http.post(f"v1.1/Observations", payload)
+    http.post("v1.1/Observations", payload)
 
     # Verify via direct query
     resp = requests.get(
@@ -86,7 +85,7 @@ def test_push_batch_observations(frost_url, frost_stack):
 
     for i in range(batch_size):
         now = datetime.now(UTC).isoformat()
-        http.post(f"v1.1/Observations", {
+        http.post("v1.1/Observations", {
             "phenomenonTime": now,
             "resultTime": now,
             "result": 20.0 + i * 0.1,
@@ -108,7 +107,7 @@ def test_post_with_retry_succeeds(frost_stack):
     now = datetime.now(UTC).isoformat()
 
     result = http.post_with_retry(
-        path=f"v1.1/Observations",
+        path="v1.1/Observations",
         payload={
             "phenomenonTime": now,
             "resultTime": now,

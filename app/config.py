@@ -9,7 +9,6 @@ from dotenv import load_dotenv
 
 from app.frost.target import FrostTarget
 
-
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 

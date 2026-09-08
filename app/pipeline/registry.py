@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
-from app.pipeline.base import Decoder, Decapsulator, Deserializer, Normalizer, Parser
+from app.pipeline.base import Decapsulator, Decoder, Deserializer, Normalizer, Parser
 
 
 @dataclass(frozen=True)

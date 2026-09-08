@@ -5,10 +5,7 @@ from __future__ import annotations
 import threading
 from unittest.mock import patch
 
-import pytest
-
 from app.frost.circuit_breaker import CircuitBreaker
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -243,7 +240,7 @@ class TestThreadSafety:
     def test_concurrent_mixed_operations(self):
         cb = CircuitBreaker(failure_threshold=5, cooldown_seconds=0.01)
         barrier = threading.Barrier(4)
-        errors: list[Exception] = []
+        _errors: list[Exception] = []
 
         def do_failures():
             barrier.wait()

@@ -17,7 +17,6 @@ from typing import Annotated, Any, Self
 
 from pydantic import BaseModel, Field, StringConstraints, computed_field, model_validator
 
-
 # ---------------------------------------------------------------------------
 # Shared types
 # ---------------------------------------------------------------------------

@@ -10,10 +10,8 @@ from pydantic import ValidationError
 from app.sta.models import (
     STAActuator,
     STADatastream,
-    STAEntityBase,
     STALocation,
     STAObservation,
-    STAObservedProperty,
     STAProject,
     STASensor,
     STATaskingCapability,

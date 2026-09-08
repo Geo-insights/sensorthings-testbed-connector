@@ -65,9 +65,7 @@ class TGVMeasurementParser(Parser):
             raw_value = next(iter(raw_value.values()))
         if raw_value is None or isinstance(raw_value, bool):
             value = float(raw_value) if raw_value is not None else 0.0
-        elif isinstance(raw_value, (int, float)):
-            value = float(raw_value)
-        elif isinstance(raw_value, str):
+        elif isinstance(raw_value, (int, float, str)):
             value = float(raw_value)
         else:
             raise ValueError(f"Cannot convert {raw_value!r} to float")
