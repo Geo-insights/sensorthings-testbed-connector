@@ -6,6 +6,7 @@ Steps:
 3. Explore the OData endpoints to find measurement/time-series entities
 """
 
+import contextlib
 import json
 import urllib.parse
 import urllib.request
@@ -71,10 +72,8 @@ def odata_get(path: str, token: str, top: int = 5) -> dict | list | None:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body = ""
-        try:
+        with contextlib.suppress(Exception):
             body = e.read().decode()[:200]
-        except Exception:
-            pass
         print(f"  [{e.code}] {url}  {body}")
         return None
     except Exception as e:

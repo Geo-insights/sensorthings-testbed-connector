@@ -10,10 +10,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import sys
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import psycopg2
 import requests
@@ -93,7 +91,7 @@ def run(max_batches: int = 200, workers: int = 20):
             batches += 1
             readings = avro_batch_to_sensor_readings(records)
             last_ts = datetime.fromtimestamp(
-                records[-1]["timestamp"] / 1000, tz=timezone.utc
+                records[-1]["timestamp"] / 1000, tz=UTC
             )
 
             # ── FROST push (concurrent) ─────────────────────────────
@@ -133,7 +131,7 @@ def run(max_batches: int = 200, workers: int = 20):
             total_frost_ok += ok
             total_frost_fail += fail
             total_monitoring += mon_inserted
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             delay = (now - last_ts).total_seconds()
             print(
                 f"Batch {batches}: {len(records)} rec | "

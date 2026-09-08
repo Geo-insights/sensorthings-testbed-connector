@@ -7,11 +7,11 @@ The API uses OData conventions with /api/{Type}/{installationId} for time-series
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 
 from app.models import SensorReading
-from app.sta.canonical import CanonicalDatastream, resolve
+from app.sta.canonical import resolve
 
 logger = logging.getLogger(__name__)
 

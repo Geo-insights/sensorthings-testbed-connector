@@ -12,7 +12,7 @@ target FROST server sees identical strings across sources.
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 from typing import NamedTuple
 
 
@@ -25,7 +25,7 @@ class DatastreamMeta(NamedTuple):
 _CF = "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html"
 
 
-class CanonicalDatastream(str, Enum):
+class CanonicalDatastream(StrEnum):
     """Allowed observation field names across the entire system."""
 
     TEMPERATURE = "temperature"

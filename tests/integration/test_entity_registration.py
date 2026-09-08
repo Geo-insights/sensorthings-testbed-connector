@@ -8,7 +8,6 @@ from app.frost.cache import EntityCache
 from app.frost.entity_manager import EntityManager
 from app.frost.http_client import FrostHTTPClient
 
-
 pytestmark = pytest.mark.integration
 
 

@@ -40,7 +40,7 @@ class FrostPushWorker:
     """Single-threaded, bounded-queue background pusher to the FROST targets."""
 
     def __init__(self) -> None:
-        self._queue: "queue.Queue[Any]" = queue.Queue()
+        self._queue: queue.Queue[Any] = queue.Queue()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._started = False

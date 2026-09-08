@@ -1,24 +1,21 @@
+import logging
+from contextlib import suppress
+from datetime import UTC
 from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter
-from fastapi import HTTPException
-from fastapi import Query
-from fastapi import Response
-from fastapi import UploadFile
+from fastapi import APIRouter, HTTPException, Query, Response, UploadFile
 
 from app.config import settings
 from app.models import IngestRequest, TaskingTaskCreateRequest, TaskingTaskQuery
 from app.services.kafka_tgv_consumer import KafkaTGVConsumer
-from app.sources.bridge_source import load_bridge_readings
-from app.sources.tgv_kafka_mapping import avro_batch_to_sensor_readings
 from app.services.monitoring_mqtt_bridge import (
     build_monitoring_mqtt_preview,
     publish_monitoring_mqtt,
 )
 from app.services.sensorthings_client import client
-
-import logging
+from app.sources.bridge_source import load_bridge_readings
+from app.sources.tgv_kafka_mapping import avro_batch_to_sensor_readings
 
 logger = logging.getLogger("connector.events")
 
@@ -274,10 +271,10 @@ def kafka_diagnostics() -> dict:
         partitions: list[dict] = []
         total_high = 0
         total_lag = 0
-        tps = [TopicPartition(topic, p) for p in topic_md.partitions.keys()]
+        tps = [TopicPartition(topic, p) for p in topic_md.partitions]
         committed = {tp.partition: tp for tp in consumer.committed(tps, timeout=10.0)}
 
-        for p in sorted(topic_md.partitions.keys()):
+        for p in sorted(topic_md.partitions):
             tp = TopicPartition(topic, p)
             low, high = consumer.get_watermark_offsets(tp, timeout=10.0, cached=False)
             comm = committed.get(p)
@@ -320,10 +317,8 @@ def kafka_diagnostics() -> dict:
             "guidance": guidance,
         }
     finally:
-        try:
+        with suppress(Exception):
             consumer.close()
-        except Exception:
-            pass
 
 
 @router.get("/freshness")
@@ -355,7 +350,7 @@ def freshness(response: Response) -> dict:
 
 
 @router.get("/frost-status")
-def frost_status() -> dict:
+def frost_worker_status() -> dict:
     """Background FROST push worker + dead-letter queue status.
 
     Surfaces the async push worker's queue depth, throughput, last push
@@ -428,8 +423,9 @@ def collaborall_write_test(
 
     This is the signal for the keep-or-drop decision on CollaborAll.
     """
+    from datetime import datetime
+
     import requests as req
-    from datetime import datetime, timezone
 
     from app.services.sensorthings_client import _as_quality_list, _coerce_iot_id
 
@@ -500,7 +496,7 @@ def collaborall_write_test(
     count_before = _count(ds_id_int)
 
     # 3. Build the observation with the same coercions the push path applies.
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     phenom = now.isoformat().replace("+00:00", "Z")
     payload = {
         "phenomenonTime": phenom,
@@ -522,9 +518,7 @@ def collaborall_write_test(
 
     if not post_resp.ok:
         verdict = "rejected"
-    elif count_before is not None and count_after is not None and count_after > count_before:
-        verdict = "landed"
-    elif location:
+    elif (count_before is not None and count_after is not None and count_after > count_before) or location:
         verdict = "landed"
     else:
         verdict = "accepted_no_persist"
@@ -565,6 +559,7 @@ def collaborall_fix_locations(
     Things that already have a Location are skipped.
     """
     import re
+
     import requests as req
 
     from app.services.sensorthings_client import _coerce_iot_id
@@ -794,6 +789,7 @@ def dlq_clear(
 def ohnics_diagnostics() -> dict:
     """Diagnostic: count Ohnics datastreams, check DELETE capability, inspect seed."""
     import requests as req
+
     from app.main import _seed_timestamps_from_frost
 
     base = client._http.primary_base_url

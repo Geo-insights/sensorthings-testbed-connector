@@ -33,7 +33,6 @@ from app.services.health_monitor import health_monitor
 from app.sources.climate_adaptation import CLIMATE_ADAPTATION_ENTITY_SETS
 from app.sta.canonical import resolve
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -688,7 +687,7 @@ class SensorThingsClient:
                             "definition": property_payload["definition"],
                             "description": property_payload["description"],
                         }
-                        observed_property_id, observed_property_status = self._get_or_create_entity(
+                        observed_property_id, _observed_property_status = self._get_or_create_entity(
                             settings.observed_properties_path,
                             property_payload["name"],
                             observed_property_record,
@@ -1676,7 +1675,7 @@ class SensorThingsClient:
         kept = 0
         expired = 0
 
-        with open(self._failed_observations_path, "r", encoding="utf-8") as infile, \
+        with open(self._failed_observations_path, encoding="utf-8") as infile, \
              open(tmp_path, "w", encoding="utf-8") as outfile:
             for line in infile:
                 stripped = line.strip()
@@ -2330,7 +2329,7 @@ class SensorThingsClient:
                     )
                 else:
                     now_iso = datetime.now(UTC).isoformat()
-                    for ep, pl, ds_id, sid in tasks:
+                    for ep, pl, ds_id, _sid in tasks:
                         self._write_failed_observation(
                             {"timestamp": now_iso, "datastream_id": ds_id, "endpoint": ep, "payload": pl, "status_code": None, "error": "circuit_open"},
                         )

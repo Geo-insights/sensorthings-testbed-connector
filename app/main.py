@@ -2,7 +2,7 @@ import asyncio
 import logging
 import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -111,10 +111,8 @@ async def _kafka_ingest_loop():
     )
 
     def _drop_consumer(c) -> None:
-        try:
+        with suppress(Exception):
             c.close()
-        except Exception:
-            pass
 
     consumer = None
     consecutive_failures = 0
@@ -439,7 +437,6 @@ def _seed_timestamps_from_frost(source_name: str) -> dict[str, datetime]:
 
 async def _polling_ingest_loop(source):
     """Background loop for a REST API polling source."""
-    from app.services.polling_source import PollingSource
 
     poll_seconds = source.poll_interval()
     logger.info("Polling loop started for %s (every %ds)", source.source_name, poll_seconds)

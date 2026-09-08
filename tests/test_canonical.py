@@ -1,7 +1,7 @@
 """Tests for canonical datastream names."""
 
-from app.sta.canonical import CanonicalDatastream
 from app.sources.climate_adaptation import CLIMATE_ADAPTATION_ENTITY_SETS
+from app.sta.canonical import CanonicalDatastream
 
 
 def test_all_members_have_meta():

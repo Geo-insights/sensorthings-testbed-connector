@@ -4,7 +4,9 @@ from app.pipeline.bridge import BridgeReadingParser, JsonDecoder
 from app.pipeline.kafka_tgv import (
     AvroUnionDeserializer,
     TGVDecapsulator,
-    TGVMeasurementParser,
+)
+from app.pipeline.kafka_tgv import (
+    TGVMeasurementParser as TGVMeasurementParser,
 )
 from app.pipeline.registry import PipelineComponents, registry
 

@@ -16,7 +16,6 @@ from app.sources.tgv_kafka_mapping import (
     avro_record_to_sensor_readings,
 )
 
-
 # ---------------------------------------------------------------------------
 # _extract_numeric_value
 # ---------------------------------------------------------------------------

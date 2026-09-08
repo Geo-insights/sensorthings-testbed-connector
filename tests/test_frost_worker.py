@@ -8,10 +8,8 @@ import time
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from app.models import SensorReading
-from app.services.frost_worker import FrostPushWorker, _SHUTDOWN
+from app.services.frost_worker import _SHUTDOWN, FrostPushWorker
 
 
 def _make_reading(**overrides) -> SensorReading:

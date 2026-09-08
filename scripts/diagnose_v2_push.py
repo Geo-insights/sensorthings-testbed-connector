@@ -9,7 +9,6 @@ Usage:
 from __future__ import annotations
 
 import json
-import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -77,7 +76,7 @@ def main() -> None:
 
     # 3. Verify datastreams exist on server
     print("\n  Verifying datastreams on server...")
-    for key, ds_id in ds_cache.items():
+    for _key, ds_id in ds_cache.items():
         try:
             resp = requests.get(
                 f"{V2_BASE}/Datastreams({ds_id})",

@@ -12,7 +12,6 @@ from __future__ import annotations
 import base64
 import json
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
@@ -286,7 +285,7 @@ def main():
     print(f"\n{'='*70}")
     print(f"  Registering on V2: {v2_url}")
     print(f"{'='*70}")
-    v2_ds = register_on_server(v2_url, v2_headers, prefix, v2_cache, is_v2=True)
+    _v2_ds = register_on_server(v2_url, v2_headers, prefix, v2_cache, is_v2=True)
 
     # Save caches
     PRIMARY_CACHE.write_text(json.dumps(primary_cache, indent=2))
@@ -306,7 +305,7 @@ def main():
                 break
 
     print(f"\n{'='*70}")
-    print(f"  NEW SENSORTHINGS_DATASTREAM_IDS_JSON for Render")
+    print("  NEW SENSORTHINGS_DATASTREAM_IDS_JSON for Render")
     print(f"{'='*70}")
     print(json.dumps(new_ds_json))
 

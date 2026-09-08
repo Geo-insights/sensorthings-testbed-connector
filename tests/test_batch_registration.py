@@ -1,13 +1,10 @@
 """Tests for FROST JSON Batch entity registration and capabilities discovery."""
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
-
-import pytest
+from unittest.mock import MagicMock
 
 from app.frost.entity_manager import EntityManager
-from app.frost.target_stack import TargetCapabilities, _parse_capabilities
-
+from app.frost.target_stack import _parse_capabilities
 
 # ---------------------------------------------------------------------------
 # TargetCapabilities discovery

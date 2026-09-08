@@ -13,7 +13,6 @@ from app.frost.cache import EntityCache
 from app.frost.entity_manager import EntityManager
 from app.frost.http_client import FrostHTTPClient
 
-
 # ---------------------------------------------------------------------------
 # EntityCache
 # ---------------------------------------------------------------------------
@@ -156,9 +155,8 @@ class TestFrostHTTPClient:
     def test_get_raises_frost_connection_error(self):
         import requests as req
         client = FrostHTTPClient(base_urls=["http://unreachable"])
-        with patch("app.frost.http_client.requests.get", side_effect=req.ConnectionError("refused")):
-            with pytest.raises(FrostConnectionError):
-                client.get("http://unreachable/Things")
+        with patch("app.frost.http_client.requests.get", side_effect=req.ConnectionError("refused")), pytest.raises(FrostConnectionError):
+            client.get("http://unreachable/Things")
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +172,7 @@ class TestEntityManager:
         return manager, http, cache
 
     def test_get_or_create_returns_cached(self, tmp_path: Path):
-        manager, http, cache = self._make_manager(tmp_path)
+        manager, _http, cache = self._make_manager(tmp_path)
         cache.put("things", "T1", "5")
 
         # Mock server confirming name matches
@@ -184,13 +182,12 @@ class TestEntityManager:
         assert status == "cached"
 
     def test_get_or_create_drops_stale_cache(self, tmp_path: Path):
-        manager, http, cache = self._make_manager(tmp_path)
+        manager, _http, cache = self._make_manager(tmp_path)
         cache.put("things", "T1", "5")
 
         # Server says name is different → stale
-        with patch.object(manager, "fetch_by_id", return_value={"name": "Wrong"}):
-            with patch.object(manager, "find_by_name", return_value="42"):
-                iot_id, status = manager.get_or_create("/Things", "T1", {"name": "T1"}, "things")
+        with patch.object(manager, "fetch_by_id", return_value={"name": "Wrong"}), patch.object(manager, "find_by_name", return_value="42"):
+            iot_id, status = manager.get_or_create("/Things", "T1", {"name": "T1"}, "things")
         assert iot_id == "42"
         assert status == "existing"
         assert cache.get("things", "T1") == "42"
@@ -203,15 +200,14 @@ class TestEntityManager:
         mock_response.headers = {}
         mock_response.status_code = 201
 
-        with patch.object(manager, "find_by_name", return_value=None):
-            with patch.object(http, "post", return_value=mock_response):
-                iot_id, status = manager.get_or_create("/Things", "T1", {"name": "T1"}, "things")
+        with patch.object(manager, "find_by_name", return_value=None), patch.object(http, "post", return_value=mock_response):
+            iot_id, status = manager.get_or_create("/Things", "T1", {"name": "T1"}, "things")
         assert iot_id == "99"
         assert "created" in status
         assert cache.get("things", "T1") == "99"
 
     def test_find_by_filter(self, tmp_path: Path):
-        manager, http, cache = self._make_manager(tmp_path)
+        manager, http, _cache = self._make_manager(tmp_path)
 
         mock_response = MagicMock()
         mock_response.ok = True

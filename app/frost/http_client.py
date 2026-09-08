@@ -14,7 +14,7 @@ from typing import Any
 
 import requests
 
-from app.exceptions import FrostConnectionError, FrostRequestError, ObservationUploadError
+from app.exceptions import FrostConnectionError, ObservationUploadError
 
 logger = logging.getLogger(__name__)
 
