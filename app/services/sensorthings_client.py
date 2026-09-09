@@ -30,10 +30,70 @@ from app.models import (
     TaskingTaskQuery,
 )
 from app.services.health_monitor import health_monitor
+from app.services.validation import classify_error
+from app.services.validation import recorder as validation_recorder
+from app.services.validation.error_classifier import (
+    UNRESOLVED_DATASTREAM as _EC_UNRESOLVED_DATASTREAM,
+)
+from app.services.validation.error_classifier import (
+    classify_status_string,
+)
 from app.sources.climate_adaptation import CLIMATE_ADAPTATION_ENTITY_SETS
 from app.sta.canonical import resolve
 
 logger = logging.getLogger(__name__)
+
+
+def _validation_target_label(base_url: str) -> str:
+    """Look up the operator-configured label for a FROST target base URL."""
+    normalized = (base_url or "").rstrip("/")
+    for t in settings.frost_targets:
+        if t.url.rstrip("/") == normalized:
+            return t.label or ""
+    return ""
+
+
+def _validation_summarize_results(
+    results: list[dict[str, Any]],
+) -> tuple[int, int, str | None]:
+    """Count (failed, dropped_permanent, dominant_error_class) from a target's
+    per-observation results list."""
+    from collections import Counter
+
+    failed = 0
+    dropped = 0
+    counts: Counter[str] = Counter()
+    for r in results:
+        if r.get("ok"):
+            continue
+        if r.get("dropped"):
+            dropped += 1
+        else:
+            failed += 1
+        cls = classify_error(status_code=r.get("status_code"))
+        if cls == "unknown":
+            msg = r.get("error") or r.get("message") or ""
+            if msg:
+                cls = classify_status_string(str(msg))
+            if cls == "unknown" and r.get("message") and "datastream" in str(r.get("message")).lower():
+                cls = _EC_UNRESOLVED_DATASTREAM
+        counts[cls] += 1
+    dominant = counts.most_common(1)[0][0] if counts else None
+    return failed, dropped, dominant
+
+
+def _validation_age_samples(readings: list[SensorReading], now_wall: float) -> list[float]:
+    """Per-observation age-at-push seconds (source_time → now)."""
+    samples: list[float] = []
+    for r in readings:
+        ts = getattr(r, "timestamp", None)
+        if ts is None:
+            continue
+        try:
+            samples.append(max(0.0, now_wall - ts.timestamp()))
+        except (AttributeError, TypeError):
+            continue
+    return samples
 
 
 def _canonical_property_payload(
@@ -2251,7 +2311,12 @@ class SensorThingsClient:
             logger.info("Datastream cache warmed: %d id(s) from %s", warmed, base_url)
         return warmed
 
-    def push_observations(self, readings: list[SensorReading]) -> dict[str, Any]:
+    def push_observations(
+        self,
+        readings: list[SensorReading],
+        *,
+        source: str = "unknown",
+    ) -> dict[str, Any]:
         preview = self.build_preview(readings)
         base_urls = self._base_urls()
         if not base_urls:
@@ -2267,6 +2332,12 @@ class SensorThingsClient:
         total_sent = 0
 
         def _push_target(base_url: str) -> tuple[dict[str, Any], int]:
+            # Validation instrumentation — captured once per target per push cycle
+            # so the harness can compute per-(source,target) latency, error rate,
+            # and DLQ/circuit activity. All calls are cheap no-ops when the harness
+            # kill switch is off.
+            _val_started = time.perf_counter()
+            _val_target_label = _validation_target_label(base_url)
             endpoint = self._endpoint_for_base_url(base_url, settings.observations_path)
             is_v2 = self._is_v2_url(base_url)
             stack = self._target_stack_for_url(base_url)
@@ -2336,6 +2407,20 @@ class SensorThingsClient:
                     logger.warning(
                         "Circuit open for %s — %d observations dead-lettered for replay", base_url, len(tasks)
                     )
+                _val_dur_ms = (time.perf_counter() - _val_started) * 1000.0
+                validation_recorder.record_push_attempt(
+                    source=source,
+                    target=base_url,
+                    target_label=_val_target_label,
+                    duration_ms=_val_dur_ms,
+                    readings_count=len(readings),
+                    sent_count=0,
+                    failed_count=len(unresolved),
+                    dropped_permanent_count=0,
+                    dropped_circuit_count=len(tasks),
+                    error_class="circuit_open",
+                    error_msg="circuit_open",
+                )
                 return (
                     {"base_url": base_url, "endpoint": endpoint, "sent": 0, "circuit_open": True, "dead_lettered": len(tasks), "results": list(unresolved)},
                     0,
@@ -2375,9 +2460,52 @@ class SensorThingsClient:
                             settings.frost_cb_failure_threshold,
                             settings.frost_cb_cooldown_seconds,
                         )
+                        validation_recorder.record_incident(
+                            kind="circuit_open",
+                            target=base_url,
+                            source=source,
+                            level="warning",
+                            context={
+                                "failure_threshold": settings.frost_cb_failure_threshold,
+                                "cooldown_seconds": settings.frost_cb_cooldown_seconds,
+                                "first_error": (first_error or "")[:200] or None,
+                            },
+                        )
                 else:
+                    # If the breaker was previously observed open and we now got
+                    # some sent, that's a half-open → closed transition worth
+                    # recording. Reading snapshot before record_success gives us
+                    # the pre-close state.
+                    _pre = observation_breaker.snapshot().get(base_url.rstrip("/"), {})
+                    _was_open = bool(_pre.get("open"))
                     observation_breaker.record_success(base_url)
+                    if _was_open:
+                        validation_recorder.record_incident(
+                            kind="circuit_close",
+                            target=base_url,
+                            source=source,
+                            level="info",
+                            context={"sent": sent},
+                        )
 
+            _val_dur_ms = (time.perf_counter() - _val_started) * 1000.0
+            _val_failed, _val_dropped_permanent, _val_error_class = _validation_summarize_results(results)
+            # If everything succeeded we still record for latency samples, but
+            # without an error_class so events.jsonl stays quiet on a clean run.
+            validation_recorder.record_push_attempt(
+                source=source,
+                target=base_url,
+                target_label=_val_target_label,
+                duration_ms=_val_dur_ms,
+                readings_count=len(readings),
+                sent_count=sent,
+                failed_count=_val_failed,
+                dropped_permanent_count=_val_dropped_permanent,
+                dropped_circuit_count=0,
+                error_class=_val_error_class,
+                error_msg=None,
+                age_at_push_samples=_validation_age_samples(readings, time.time()),
+            )
             return (
                 {"base_url": base_url, "endpoint": endpoint, "sent": sent, "results": results},
                 sent,

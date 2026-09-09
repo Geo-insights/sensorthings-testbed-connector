@@ -153,7 +153,7 @@ class TestPush:
 
         w._push(readings, mock_client)
 
-        mock_client.push_observations.assert_called_once_with(readings)
+        mock_client.push_observations.assert_called_once_with(readings, source="kafka")
         assert w._pushed_total == 3
         assert w._last_push_seconds is not None
         assert w._last_push_at is not None

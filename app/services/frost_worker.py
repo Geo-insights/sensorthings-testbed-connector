@@ -163,7 +163,8 @@ class FrostPushWorker:
         sent = 0
         error: str | None = None
         try:
-            result = client.push_observations(batch)
+            # Worker currently only serves the Kafka path (see main.py).
+            result = client.push_observations(batch, source="kafka")
             sent = int(result.get("total_sent", 0) or 0)
         except Exception as exc:  # push_observations DLQs internally; guard anyway
             logger.exception("FROST worker push failed for %d readings", len(batch))
