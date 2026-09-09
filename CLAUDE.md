@@ -83,6 +83,15 @@ Multiple Claude Code sessions and `isolation: "worktree"` subagents can work on 
 4. **Main session stays on main.** Only the main interactive session works on `main`; all parallel work happens on feature branches.
 5. **Run the done-gate before merging.** Every branch must pass `pytest + ruff check` before merging back to main.
 
+## Validation harness (14-day Geonovum SLO test)
+
+`app/services/validation/` instruments the ingest → push path so uptime, per-path latency (batch push ms + age-at-push s), error-rate broken out by taxonomy class, circuit-breaker activity, and DLQ activity can be reported at the end of a multi-day run. Off by default — flip `VALIDATION_HARNESS_ENABLED=true` in Render env vars to enable. When disabled, all hooks are cheap no-ops (zero cost on the ingest hot path).
+
+- **Storage layout** — `data/validation/{events,incidents,snapshots}.jsonl` on the persistent disk. Events + incidents rotate at size caps (defaults 20 MB / 5 MB) with `.1..5` backups. Snapshots is one line per interval (default 5 min); at 5-min for 14 days that's ~4032 lines / ~20 MB.
+- **HTTP surface** — `/validation/status` (enabled flag + file sizes), `/validation/summary` (in-memory rollup), `/validation/incidents?limit=N` (recent incidents).
+- **Report** — `python scripts/generate_validation_report.py` (optional `--start`/`--end` ISO for windowing) reads the JSONL files and emits `reports/geonovum_14d_validation.md` + `data/validation/metrics.json`.
+- **Smoke test** — add a synthetic bad target to `SENSORTHINGS_BASE_URLS` (URL that will never resolve, e.g. `https://smoke-fail.invalid`), let the harness run ~2 h, verify the report shows an uptime dip + circuit_open incident + DLQ growth for that host, then remove the synthetic entry before starting the real 14-day clock. Design memo: `reports/geonovum_14d_validation_deploy_memo.md`.
+
 ## Working autonomously
 For unattended runs, use a concrete exit condition so the session doesn't run forever.
 

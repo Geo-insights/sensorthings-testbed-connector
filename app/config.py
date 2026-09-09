@@ -436,6 +436,19 @@ class Settings:
     # (drops the backlog to go live). When False (default) it only alerts — a
     # human decides, since skipping discards the un-pushed backlog.
     kafka_auto_skip_on_lag: bool = os.getenv("KAFKA_AUTO_SKIP_ON_LAG", "false").lower() in {"1", "true", "yes", "on"}
+    # --- Validation harness (Geonovum 14-day SLO test) ---
+    # Kill switch: when False, all validation hooks are cheap no-ops.
+    # Toggling via env var alone is enough to disable — no re-deploy needed.
+    validation_harness_enabled: bool = os.getenv("VALIDATION_HARNESS_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    validation_data_dir: str = os.getenv("VALIDATION_DATA_DIR", "data/validation").strip()
+    validation_snapshot_interval_seconds: int = int(os.getenv("VALIDATION_SNAPSHOT_INTERVAL_SECONDS", "300"))
+    # events.jsonl only records non-clean push attempts, so it stays small; cap
+    # protects against a runaway failure loop filling the disk.
+    validation_events_max_bytes: int = int(os.getenv("VALIDATION_EVENTS_MAX_BYTES", str(20 * 1024 * 1024)))
+    validation_incidents_max_bytes: int = int(os.getenv("VALIDATION_INCIDENTS_MAX_BYTES", str(5 * 1024 * 1024)))
+    # Rolling reservoir per (source, target) — latency and age-at-push samples;
+    # snapshots reset the reservoirs each window so 1000 is plenty per 5-min slot.
+    validation_sample_reservoir_size: int = int(os.getenv("VALIDATION_SAMPLE_RESERVOIR_SIZE", "1000"))
 
 
 settings = Settings()

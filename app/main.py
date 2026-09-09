@@ -38,7 +38,7 @@ def _consume_and_push_once(consumer, max_messages: int = 500, timeout: float = 5
     # multi-target) FROST push below, so downstream freshness is not gated by
     # FROST push latency. Fire-and-forget + idempotent: monitoring dedups via
     # ON CONFLICT DO NOTHING.
-    _push_to_monitoring(readings)
+    _push_to_monitoring(readings, source="kafka")
     if settings.frost_async_push_enabled:
         # Decoupled path: hand the readings to the background FROST worker and
         # return immediately so the consume loop can pull the next batch. Kafka
@@ -51,11 +51,11 @@ def _consume_and_push_once(consumer, max_messages: int = 500, timeout: float = 5
         queued = frost_worker.enqueue(readings, settings.frost_worker_enqueue_timeout_seconds)
         if not queued:
             frost_worker.record_inline_fallback()
-            client.push_observations(readings)
+            client.push_observations(readings, source="kafka")
         pushed: int | str = "queued" if queued else "inline"
     else:
         # Legacy coupled path: push inline before commit.
-        result = client.push_observations(readings)
+        result = client.push_observations(readings, source="kafka")
         pushed = result.get("total_sent", 0)
     # Commit only after the push has been handed off (async) or completed
     # (inline) — failed observations are safely in the DLQ, so re-consuming them
@@ -287,7 +287,7 @@ def _resolve_monitoring_datastream_id(reading) -> str | None:
     return None
 
 
-def _push_to_monitoring(readings: list) -> None:
+def _push_to_monitoring(readings: list, source: str = "unknown") -> None:
     """Fire-and-forget push of readings to the monitoring module.
 
     Runs before the (slow, multi-target) FROST push so monitoring freshness is
@@ -297,6 +297,9 @@ def _push_to_monitoring(readings: list) -> None:
     if not settings.monitoring_push_url or not settings.monitoring_push_key:
         return
     import requests as req
+
+    from app.services.validation import MONITORING_TARGET, classify_error
+    from app.services.validation import recorder as validation_recorder
 
     base_url = client._http.primary_base_url or ""
     forwarded = []
@@ -324,6 +327,9 @@ def _push_to_monitoring(readings: list) -> None:
     forwarded_count = 0
     for start in range(0, len(forwarded), chunk_size):
         chunk = forwarded[start : start + chunk_size]
+        t0 = time.perf_counter()
+        status_code: int | None = None
+        exc: BaseException | None = None
         try:
             resp = req.post(
                 f"{settings.monitoring_push_url}/readings/push",
@@ -331,12 +337,31 @@ def _push_to_monitoring(readings: list) -> None:
                 headers={"X-Connector-Key": settings.monitoring_push_key},
                 timeout=10,
             )
+            status_code = resp.status_code
             if resp.ok:
                 forwarded_count += len(chunk)
             else:
                 logger.warning("Monitoring push failed: %s %s", resp.status_code, resp.text[:200])
-        except Exception:
+        except Exception as e:
+            exc = e
             logger.warning("Monitoring push failed (connection error)", exc_info=True)
+        dur_ms = (time.perf_counter() - t0) * 1000.0
+        chunk_ok = status_code is not None and 200 <= status_code < 300
+        error_class = None if chunk_ok else classify_error(exc=exc, status_code=status_code)
+        error_msg = None if chunk_ok else (
+            f"http {status_code}" if status_code else f"{type(exc).__name__}: {exc}" if exc else "unknown"
+        )
+        validation_recorder.record_push_attempt(
+            source=source,
+            target=MONITORING_TARGET,
+            target_label="monitoring_http",
+            duration_ms=dur_ms,
+            readings_count=len(chunk),
+            sent_count=len(chunk) if chunk_ok else 0,
+            failed_count=0 if chunk_ok else len(chunk),
+            error_class=error_class,
+            error_msg=error_msg,
+        )
     if forwarded_count:
         logger.debug("Monitoring push: %d readings forwarded", forwarded_count)
 
@@ -491,7 +516,13 @@ async def _polling_ingest_loop(source):
                 # registration completes.
                 new_readings = _dedup_readings(readings, last_timestamps)
                 if new_readings:
-                    result = await run_in_threadpool(client.push_observations, new_readings)
+                    _push_source = source.source_name.lower()
+                    # Bind loop-local vars as lambda defaults so run_in_threadpool
+                    # sees this iteration's values, not whichever the loop has
+                    # advanced to by the time the thread pool picks it up.
+                    result = await run_in_threadpool(
+                        lambda nr=new_readings, ps=_push_source: client.push_observations(nr, source=ps)
+                    )
                     _update_timestamps(new_readings, last_timestamps)
                     from app.services.health_monitor import health_monitor
                     health_monitor.record_source_success(source.source_name.lower())
@@ -503,7 +534,7 @@ async def _polling_ingest_loop(source):
                         result.get("total_sent", 0),
                     )
                     # Forward to monitoring module (fire-and-forget)
-                    await run_in_threadpool(_push_to_monitoring, new_readings)
+                    await run_in_threadpool(_push_to_monitoring, new_readings, _push_source)
                 else:
                     logger.debug("%s: all %d readings already pushed, skipping", source.source_name, len(readings))
         except Exception as exc:
@@ -587,6 +618,20 @@ async def lifespan(app: FastAPI):
     tasks = []
     has_frost_target = bool(settings.sensorthings_base_url or settings.sensorthings_base_urls)
 
+    # --- Validation harness (14-day Geonovum SLO test) ---
+    # Configure the recorder before ingest starts so the very first push cycle
+    # is captured. When VALIDATION_HARNESS_ENABLED=false this is a no-op.
+    from app.services.validation import recorder as validation_recorder
+    from app.services.validation.collector import snapshot_loop as _validation_snapshot_loop
+
+    validation_recorder.configure(
+        enabled=settings.validation_harness_enabled,
+        data_dir=settings.validation_data_dir,
+        events_max_bytes=settings.validation_events_max_bytes,
+        incidents_max_bytes=settings.validation_incidents_max_bytes,
+        sample_reservoir_size=settings.validation_sample_reservoir_size,
+    )
+
     # Start the background FROST push worker before the ingest loops so they can
     # hand off immediately (Phase 2 decoupling).
     if settings.frost_async_push_enabled and has_frost_target:
@@ -616,6 +661,15 @@ async def lifespan(app: FastAPI):
     if settings.failed_replay_enabled and has_frost_target:
         tasks.append(asyncio.create_task(_failed_replay_loop()))
 
+    # Start the validation snapshot loop last so all sources are up.
+    if settings.validation_harness_enabled:
+        tasks.append(asyncio.create_task(_validation_snapshot_loop()))
+        validation_recorder.record_incident(
+            kind="app_start",
+            level="info",
+            context={"has_frost_target": has_frost_target, "kafka_enabled": settings.kafka_tgv_enabled},
+        )
+
     yield
     for t in tasks:
         t.cancel()
@@ -640,6 +694,10 @@ app.mount("/static/sensor-images", StaticFiles(directory=str(SENSOR_IMAGES_DIR))
 
 app.include_router(health_router)
 app.include_router(connector_router)
+
+from app.routes.validation import router as _validation_router  # noqa: E402
+
+app.include_router(_validation_router)
 
 
 @app.get("/frost/status")

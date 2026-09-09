@@ -7,6 +7,7 @@ coverage.xml
 htmlcov/
 data/*.json
 data/*.jsonl
+data/validation/
 deserializing-consumer-example/projectsecrets.py
 .claude/
 TASK_LEDGER.md
