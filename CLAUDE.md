@@ -123,3 +123,17 @@ See ../gi-skills/skills/preflight/SKILL.md
 See ../gi-skills/skills/ship/SKILL.md
 See ../gi-skills/skills/retro/SKILL.md
 See ../gi-skills/skills/learn/SKILL.md
+
+## Global workflow skills (gstack)
+The following slash commands are available globally via gstack (`~/.claude/skills/gstack/`):
+- `/spec` — turn vague intent into a precise, executable spec
+- `/plan` — plan implementation strategy before coding
+- `/review` — pre-landing PR review
+- `/ship` — detect base branch, run tests, review diff, create PR
+- `/retro` — weekly engineering retrospective
+- `/office-hours` — YC-style office hours
+- `/qa` — systematically QA test a web app and fix bugs found
+- `/investigate` — systematic debugging with root cause investigation
+- `/health` — code quality dashboard
+- `/diagram` — generate diagrams from English or Mermaid source
+- `/learn` — manage project learnings
