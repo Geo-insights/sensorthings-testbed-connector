@@ -72,6 +72,14 @@ class _TargetStats:
         "last_success_epoch",
         "latency_samples",
         "sent",
+        # Per-window counters — reset at each snapshot so the report generator
+        # can sum deltas correctly instead of re-summing cumulatives.
+        "w_attempts",
+        "w_dropped_circuit",
+        "w_dropped_permanent",
+        "w_errors_by_class",
+        "w_failed",
+        "w_sent",
     )
 
     def __init__(self, sample_cap: int) -> None:
@@ -85,6 +93,13 @@ class _TargetStats:
         self.age_at_push_samples: deque[float] = deque(maxlen=sample_cap)
         self.last_success_epoch: float | None = None
         self.last_failure_epoch: float | None = None
+        # Per-window (reset at snapshot)
+        self.w_attempts: int = 0
+        self.w_sent: int = 0
+        self.w_failed: int = 0
+        self.w_dropped_permanent: int = 0
+        self.w_dropped_circuit: int = 0
+        self.w_errors_by_class: dict[str, int] = {}
 
 
 class ValidationRecorder:
@@ -180,17 +195,29 @@ class ValidationRecorder:
             if stats is None:
                 stats = _TargetStats(self._sample_reservoir_size)
                 self._stats[key] = stats
+            _sent = max(0, int(sent_count))
+            _failed = max(0, int(failed_count))
+            _dperm = max(0, int(dropped_permanent_count))
+            _dcirc = max(0, int(dropped_circuit_count))
+            # Cumulative (for /validation/summary)
             stats.attempts += 1
-            stats.sent += max(0, int(sent_count))
-            stats.failed += max(0, int(failed_count))
-            stats.dropped_permanent += max(0, int(dropped_permanent_count))
-            stats.dropped_circuit += max(0, int(dropped_circuit_count))
+            stats.sent += _sent
+            stats.failed += _failed
+            stats.dropped_permanent += _dperm
+            stats.dropped_circuit += _dcirc
+            # Per-window (for snapshots → report generator)
+            stats.w_attempts += 1
+            stats.w_sent += _sent
+            stats.w_failed += _failed
+            stats.w_dropped_permanent += _dperm
+            stats.w_dropped_circuit += _dcirc
             if sent_count > 0:
                 stats.last_success_epoch = now
             if failed_count > 0 or dropped_permanent_count > 0 or dropped_circuit_count > 0:
                 stats.last_failure_epoch = now
             if error_class:
                 stats.errors_by_class[error_class] = stats.errors_by_class.get(error_class, 0) + 1
+                stats.w_errors_by_class[error_class] = stats.w_errors_by_class.get(error_class, 0) + 1
             if duration_ms is not None:
                 stats.latency_samples.append(float(duration_ms))
             if age_at_push_samples:
@@ -239,31 +266,60 @@ class ValidationRecorder:
     # Snapshot (called by collector; resets the rolling reservoirs)
     # ------------------------------------------------------------------
     def snapshot_targets(self, *, reset_samples: bool = True) -> dict[str, dict[str, Any]]:
-        """Per-(source,target) rollup. Optionally reset latency/age reservoirs."""
+        """Per-(source,target) rollup.
+
+        When ``reset_samples`` is True (the collector path), the returned
+        counters are **per-window deltas** and the latency/age reservoirs are
+        flushed.  The report generator can safely sum these across snapshots.
+
+        When False (the ``/validation/summary`` path), cumulative totals and
+        the current reservoir contents are returned non-destructively.
+        """
         if not self._enabled:
             return {}
         out: dict[str, dict[str, Any]] = {}
         with self._lock:
             for key, stats in self._stats.items():
-                out[key] = {
-                    "attempts": stats.attempts,
-                    "sent": stats.sent,
-                    "failed": stats.failed,
-                    "dropped_permanent": stats.dropped_permanent,
-                    "dropped_circuit": stats.dropped_circuit,
-                    "errors_by_class": dict(stats.errors_by_class),
-                    "latency_ms": _percentiles(stats.latency_samples),
-                    "age_at_push_s": _percentiles(stats.age_at_push_samples),
-                    "last_success_epoch": stats.last_success_epoch,
-                    "last_failure_epoch": stats.last_failure_epoch,
-                }
                 if reset_samples:
+                    # Per-window deltas — safe to sum across snapshots.
+                    out[key] = {
+                        "attempts": stats.w_attempts,
+                        "sent": stats.w_sent,
+                        "failed": stats.w_failed,
+                        "dropped_permanent": stats.w_dropped_permanent,
+                        "dropped_circuit": stats.w_dropped_circuit,
+                        "errors_by_class": dict(stats.w_errors_by_class),
+                        "latency_ms": _percentiles(stats.latency_samples),
+                        "age_at_push_s": _percentiles(stats.age_at_push_samples),
+                        "last_success_epoch": stats.last_success_epoch,
+                        "last_failure_epoch": stats.last_failure_epoch,
+                    }
+                    stats.w_attempts = 0
+                    stats.w_sent = 0
+                    stats.w_failed = 0
+                    stats.w_dropped_permanent = 0
+                    stats.w_dropped_circuit = 0
+                    stats.w_errors_by_class = {}
                     stats.latency_samples.clear()
                     stats.age_at_push_samples.clear()
+                else:
+                    # Cumulative totals — non-destructive read.
+                    out[key] = {
+                        "attempts": stats.attempts,
+                        "sent": stats.sent,
+                        "failed": stats.failed,
+                        "dropped_permanent": stats.dropped_permanent,
+                        "dropped_circuit": stats.dropped_circuit,
+                        "errors_by_class": dict(stats.errors_by_class),
+                        "latency_ms": _percentiles(stats.latency_samples),
+                        "age_at_push_s": _percentiles(stats.age_at_push_samples),
+                        "last_success_epoch": stats.last_success_epoch,
+                        "last_failure_epoch": stats.last_failure_epoch,
+                    }
         return out
 
     def summary(self) -> dict[str, Any]:
-        """Non-destructive summary for /validation/summary."""
+        """Non-destructive summary for /validation/summary (cumulative totals)."""
         return {
             "enabled": self._enabled,
             "uptime_seconds": round(time.monotonic() - self._started_monotonic, 1),
