@@ -18,6 +18,7 @@ import json
 from pathlib import Path
 
 from fastapi import APIRouter, Query
+from fastapi.responses import PlainTextResponse
 
 from app.config import settings
 from app.services.validation import recorder
@@ -66,3 +67,57 @@ def validation_incidents(limit: int = Query(default=100, ge=1, le=2000)) -> dict
     except FileNotFoundError:
         return {"count": 0, "incidents": []}
     return {"count": len(lines), "incidents": lines[-limit:]}
+
+
+@router.get("/report", response_class=PlainTextResponse)
+def validation_report(
+    start: str | None = Query(default=None, description="Window start ISO, e.g. 2026-09-10T14:43:56Z"),
+    end: str | None = Query(default=None, description="Window end ISO (omit for now)"),
+) -> str:
+    """Generate the Geonovum validation report on-the-fly from the JSONL files."""
+    from scripts.generate_validation_report import (
+        _load_jsonl,
+        _parse_ts,
+        compute_aggregates,
+        render_markdown,
+    )
+
+    data_dir = Path(settings.validation_data_dir)
+    snapshots = _load_jsonl(data_dir / "snapshots.jsonl")
+    events = _load_jsonl(data_dir / "events.jsonl")
+    incidents = _load_jsonl(data_dir / "incidents.jsonl")
+    dlq_path = Path(settings.failed_observations_path)
+    dlq_lines = _load_jsonl(dlq_path) if dlq_path.exists() else None
+
+    metrics = compute_aggregates(
+        snapshots, events, incidents, dlq_lines,
+        _parse_ts(start) if start else None,
+        _parse_ts(end) if end else None,
+    )
+    return render_markdown(metrics)
+
+
+@router.get("/metrics")
+def validation_metrics(
+    start: str | None = Query(default=None),
+    end: str | None = Query(default=None),
+) -> dict:
+    """Return the raw metrics JSON that backs the report."""
+    from scripts.generate_validation_report import (
+        _load_jsonl,
+        _parse_ts,
+        compute_aggregates,
+    )
+
+    data_dir = Path(settings.validation_data_dir)
+    snapshots = _load_jsonl(data_dir / "snapshots.jsonl")
+    events = _load_jsonl(data_dir / "events.jsonl")
+    incidents = _load_jsonl(data_dir / "incidents.jsonl")
+    dlq_path = Path(settings.failed_observations_path)
+    dlq_lines = _load_jsonl(dlq_path) if dlq_path.exists() else None
+
+    return compute_aggregates(
+        snapshots, events, incidents, dlq_lines,
+        _parse_ts(start) if start else None,
+        _parse_ts(end) if end else None,
+    )
