@@ -460,11 +460,20 @@ def _seed_timestamps_from_frost(source_name: str) -> dict[str, datetime]:
     return timestamps
 
 
+def _polling_stale_threshold(poll_seconds: int) -> int:
+    """Seconds of no data after which a polling source is considered stalled."""
+    return poll_seconds + max(0, settings.freshness_grace_seconds)
+
+
 async def _polling_ingest_loop(source):
     """Background loop for a REST API polling source."""
 
     poll_seconds = source.poll_interval()
-    logger.info("Polling loop started for %s (every %ds)", source.source_name, poll_seconds)
+    stale_threshold = _polling_stale_threshold(poll_seconds)
+    logger.info(
+        "Polling loop started for %s (every %ds, stall threshold %ds)",
+        source.source_name, poll_seconds, stale_threshold,
+    )
 
     # Eager registration: register entities before the first data fetch so we
     # don't lose readings if the first fetch succeeds but registration would
@@ -541,6 +550,29 @@ async def _polling_ingest_loop(source):
             logger.exception("%s polling cycle failed", source.source_name)
             from app.services.health_monitor import health_monitor
             health_monitor.record_source_error(source.source_name.lower(), f"{type(exc).__name__}: {exc}")
+
+        # Stall watchdog — mirrors the Kafka watchdog pattern. Fires when the
+        # source hasn't delivered fresh data for longer than (poll_interval +
+        # freshness_grace). Unlike Kafka there's no consumer to reconnect, so
+        # the action is alert-only; the poller will keep retrying on the next
+        # cycle regardless.
+        from app.services.health_monitor import health_monitor
+        age = health_monitor.source_age_seconds(source.source_name.lower())
+        if age is not None and age > stale_threshold:
+            from app.services.alerting import send_alert
+            send_alert(
+                f"{source.source_name.lower()}.stall",
+                f"No {source.source_name} observations for {int(age)}s "
+                f"(threshold {stale_threshold}s). Check upstream API availability.",
+                level="warning",
+                context={
+                    "age_seconds": round(age, 1),
+                    "threshold_seconds": stale_threshold,
+                    "api_url": (getattr(source, '_client', None) and "configured") or "unknown",
+                },
+                dedup_key=f"{source.source_name.lower()}.stall",
+            )
+
         await asyncio.sleep(poll_seconds)
 
 

@@ -46,11 +46,14 @@ class OhnicsPollingSource(PollingSource):
 
     async def fetch_readings(self) -> list[SensorReading]:
         """Fetch latest 5-min readings from Ohnics and return SensorReadings for Delft sensors."""
+        from app.services.health_monitor import health_monitor
+
         url = settings.ohnics_api_url
         try:
             data = await self._client.get(url)
-        except Exception:
+        except Exception as exc:
             logger.exception("Failed to fetch Ohnics data from %s", url)
+            health_monitor.record_source_error("ohnics", f"{type(exc).__name__}: {exc}")
             return []
 
         if not isinstance(data, list):
