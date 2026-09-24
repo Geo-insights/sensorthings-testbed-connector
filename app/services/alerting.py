@@ -74,6 +74,21 @@ def send_alert(
         True if a request was sent (regardless of HTTP status), False if the
         webhook is unconfigured or the alert was suppressed by cooldown.
     """
+    # Mirror the alert into the validation incidents log BEFORE the webhook
+    # gate, so incidents are captured regardless of whether ALERT_WEBHOOK_URL
+    # is configured. The 14-day run missed all alert.* incidents because the
+    # mirror was after the early return.
+    try:
+        from app.services.validation import recorder as _validation_recorder
+
+        _validation_recorder.record_incident(
+            kind=f"alert.{event}",
+            level=level,
+            context={"message": message, **(context or {})},
+        )
+    except Exception:
+        logger.debug("Validation incident mirror failed", exc_info=True)
+
     url = settings.alert_webhook_url
     if not url:
         return False
@@ -106,17 +121,4 @@ def send_alert(
         logger.info("Alert '%s' delivered (status=%s)", event, resp.status_code)
     except requests.RequestException as exc:
         logger.warning("Alert '%s' delivery failed: %s", event, exc)
-
-    # Mirror the alert into the validation incidents log so the 14-day report
-    # can render a chronological incident log without scraping the webhook side.
-    try:
-        from app.services.validation import recorder as _validation_recorder
-
-        _validation_recorder.record_incident(
-            kind=f"alert.{event}",
-            level=level,
-            context={"message": message, **(context or {})},
-        )
-    except Exception:
-        logger.debug("Validation incident mirror failed", exc_info=True)
     return True
