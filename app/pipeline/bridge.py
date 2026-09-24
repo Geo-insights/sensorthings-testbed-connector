@@ -13,7 +13,8 @@ class JsonDecoder(Decoder):
     """Decode raw JSON bytes into a Python dict."""
 
     def decode(self, raw: bytes) -> dict[str, Any]:
-        return json.loads(raw)
+        result: dict[str, Any] = json.loads(raw)
+        return result
 
 
 class BridgeReadingParser(Parser):

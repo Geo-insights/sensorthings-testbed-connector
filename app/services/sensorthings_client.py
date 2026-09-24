@@ -358,9 +358,11 @@ class SensorThingsClient:
         site_config = settings.site_tasking_configs.get(site_key.strip().lower(), {})
         if not site_config:
             return {"actuators": [], "capabilities": []}
+        actuators_raw = site_config.get("actuators", [])
+        capabilities_raw = site_config.get("capabilities", [])
         return {
-            "actuators": [item for item in site_config.get("actuators", []) if isinstance(item, dict)],
-            "capabilities": [item for item in site_config.get("capabilities", []) if isinstance(item, dict)],
+            "actuators": [item for item in (actuators_raw if isinstance(actuators_raw, list) else []) if isinstance(item, dict)],
+            "capabilities": [item for item in (capabilities_raw if isinstance(capabilities_raw, list) else []) if isinstance(item, dict)],
         }
 
     def _tasking_capability_cache_key(self, site_key: str, capability_key: str) -> str:
@@ -1572,6 +1574,8 @@ class SensorThingsClient:
             payload["executionTime"] = request.execution_time.isoformat().replace("+00:00", "Z")
 
         base_url = self._primary_base_url()
+        if not base_url:
+            return {"ok": False, "error": "No FROST base URL configured"}
         capability_tasks_endpoint = self._endpoint_for_base_url(base_url, f"{settings.tasking_capabilities_path}({capability_id})/Tasks")
         response = requests.post(capability_tasks_endpoint, json=payload, headers=self._headers(), timeout=self._request_timeout())
         if not response.ok:

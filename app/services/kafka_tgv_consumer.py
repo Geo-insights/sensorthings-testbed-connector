@@ -237,7 +237,7 @@ class KafkaTGVConsumer:
             timeout=15.0,
         )
         response.raise_for_status()
-        return response.json()["schema"]
+        return str(response.json()["schema"])
 
     @staticmethod
     def _on_assign(consumer: Consumer, partitions: list) -> None:

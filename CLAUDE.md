@@ -51,7 +51,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8010
 
 ## Verified commands
 ```bash
-# Unit tests (315 tests, ~13s, excludes integration by default)
+# Unit tests (383 tests, ~14s, excludes integration by default)
 python -m pytest tests/ -q
 
 # Integration tests (needs Docker: docker compose -f docker-compose.test.yaml up -d)
@@ -63,15 +63,14 @@ python -m ruff check app/ tests/ scripts/
 # Lint auto-fix
 python -m ruff check app/ tests/ scripts/ --fix
 
-# Type-check (not configured yet — no mypy/pyright in the project)
-# Syntax-check all app code
-python -c "import ast; [ast.parse(open(f).read()) for f in __import__('glob').glob('app/**/*.py', recursive=True)]"
+# Type-check (mypy, strict on app/)
+python -m mypy app/
 ```
 
 ### Done-gate (verification gate for any task)
-A task is done when **both** pass with zero errors:
+A task is done when **all three** pass with zero errors:
 ```bash
-python -m pytest tests/ -q && python -m ruff check app/ tests/ scripts/
+python -m pytest tests/ -q && python -m ruff check app/ tests/ scripts/ && python -m mypy app/
 ```
 
 ## Parallel work

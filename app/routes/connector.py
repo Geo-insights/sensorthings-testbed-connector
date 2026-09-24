@@ -570,7 +570,7 @@ def collaborall_fix_locations(
     base_c = collab.url.rstrip("/")
     headers_c = {**client._headers_for_url(base_c), "Content-Type": "application/json"}
 
-    base_p = client._http.primary_base_url.rstrip("/")
+    base_p = (client._http.primary_base_url or "").rstrip("/")
     headers_p = client._headers()
     prefix = settings.entity_name_prefix
 
@@ -633,7 +633,8 @@ def collaborall_fix_locations(
         try:
             body = r.json()
             if isinstance(body, dict) and body.get("@iot.id") is not None:
-                return _coerce_iot_id(body["@iot.id"])
+                result = _coerce_iot_id(body["@iot.id"])
+                return int(result) if result is not None else None
         except Exception:
             pass
         m = re.search(r"\((\d+)\)\s*$", r.headers.get("Location", ""))
@@ -659,7 +660,7 @@ def collaborall_fix_locations(
         if dry_run:
             results.append({"thing": tname, "thing_id": tid, "status": "would_link", "location_name": loc_name})
             continue
-        loc_id = _find_collab_location(loc_name)
+        loc_id = _find_collab_location(str(loc_name or ""))
         loc_created = False
         if loc_id is None:
             try:
