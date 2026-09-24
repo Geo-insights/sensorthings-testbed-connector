@@ -150,16 +150,16 @@ def parse_logdata_readings(
         ts = _parse_ts(point.get("Timestamp", point.get("timestamp", point.get("DateTime", ""))))
         if ts is None:
             continue
-        value = None
+        val: float | None = None
         for key in ("Value", "value", "Level", "level", "WaterLevel", "NormalizedValue"):
             if key in point:
                 try:
-                    value = float(point[key])
+                    val = float(point[key])
                     break
                 except (ValueError, TypeError):
                     continue
-        if value is None:
+        if val is None:
             continue
-        readings.append(_emit(ts, value))
+        readings.append(_emit(ts, val))
 
     return readings

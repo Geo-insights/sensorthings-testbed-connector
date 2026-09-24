@@ -48,7 +48,7 @@ class LevellogPollingSource(PollingSource):
             lat = inst.get("lat")
             lon = inst.get("lon")
             if lat is not None and lon is not None:
-                sets.append(build_entity_set(name, inst_id, lat=float(lat), lon=float(lon)))
+                sets.append(build_entity_set(name, inst_id, lat=float(str(lat)), lon=float(str(lon))))
             else:
                 sets.append(build_entity_set(name, inst_id))
         return sets

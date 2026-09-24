@@ -526,12 +526,10 @@ async def _polling_ingest_loop(source):
                 new_readings = _dedup_readings(readings, last_timestamps)
                 if new_readings:
                     _push_source = source.source_name.lower()
-                    # Bind loop-local vars as lambda defaults so run_in_threadpool
-                    # sees this iteration's values, not whichever the loop has
-                    # advanced to by the time the thread pool picks it up.
-                    result = await run_in_threadpool(
-                        lambda nr=new_readings, ps=_push_source: client.push_observations(nr, source=ps)
-                    )
+                    def _do_push(nr: list = new_readings, ps: str = _push_source) -> dict:
+                        return client.push_observations(nr, source=ps)
+
+                    result = await run_in_threadpool(_do_push)
                     _update_timestamps(new_readings, last_timestamps)
                     from app.services.health_monitor import health_monitor
                     health_monitor.record_source_success(source.source_name.lower())
@@ -576,9 +574,9 @@ async def _polling_ingest_loop(source):
         await asyncio.sleep(poll_seconds)
 
 
-def _get_enabled_polling_sources():
+def _get_enabled_polling_sources() -> list:
     """Instantiate and return all enabled polling sources."""
-    sources = []
+    sources: list = []
 
     from app.services.ohnics_source import OhnicsPollingSource
     ohnics = OhnicsPollingSource()

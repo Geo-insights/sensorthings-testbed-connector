@@ -46,7 +46,7 @@ def _parse_capabilities(body: dict[str, Any]) -> TargetCapabilities:
     conformance: list[str] = []
     if isinstance(body.get("value"), list):
         collections = [
-            item.get("name") for item in body["value"]
+            str(item.get("name")) for item in body["value"]
             if isinstance(item, dict) and item.get("name")
         ]
     server_settings = body.get("serverSettings")
