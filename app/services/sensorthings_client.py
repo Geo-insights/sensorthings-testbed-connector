@@ -2070,6 +2070,24 @@ class SensorThingsClient:
             health_monitor.record_success(datastream_id)
             return {"sensor_id": sensor_id, "datastream_id": datastream_id, "status_code": 409, "ok": True, "duplicate": True}
         elif not is_retryable_status(response.status_code):
+            # A 4xx with an HTML body (instead of JSON) means the STA server
+            # isn't actually responding — a reverse proxy or load balancer is
+            # returning an error page. Treat it as retryable (dead-letter for
+            # replay) rather than permanently dropping. The Fraunhofer v2.0
+            # outage on Sep 24 returned HTML 404s that were incorrectly dropped.
+            content_type = response.headers.get("content-type", "")
+            if "text/html" in content_type or response.text.lstrip().startswith("<html"):
+                logger.warning(
+                    "Observation got HTML error page (datastream=%s status=%s endpoint=%s) — treating as retryable, dead-lettering: %s",
+                    datastream_id,
+                    response.status_code,
+                    endpoint,
+                    response.text[:200],
+                )
+                self._write_failed_observation(
+                    {"timestamp": datetime.now(UTC).isoformat(), "datastream_id": datastream_id, "endpoint": endpoint, "payload": payload, "status_code": response.status_code, "error": f"html_error_page status={response.status_code}", "body": response.text[:500]},
+                )
+                return {"sensor_id": sensor_id, "datastream_id": datastream_id, "status_code": response.status_code, "ok": False, "error": "html_error_page"}
             # Permanent client error (bad payload / unknown datastream). Drop it
             # instead of dead-lettering so the replay loop can't retry it forever.
             health_monitor.record_failure(datastream_id, f"dropped status {response.status_code}")
