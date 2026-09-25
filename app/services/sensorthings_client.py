@@ -19,6 +19,7 @@ from app.frost.cache import EntityCache
 from app.frost.circuit_breaker import CircuitBreaker
 from app.frost.entity_manager import EntityManager
 from app.frost.http_client import FrostHTTPClient, is_retryable_status
+from app.frost.odata_fields import odata_fields_for
 from app.frost.target_stack import TargetStack
 from app.models import (
     ConnectorPreview,
@@ -1607,16 +1608,20 @@ class SensorThingsClient:
                 "message": "No SensorThings server configured.",
             }
 
+        # Use v1.1 OData fields for the primary target (tasking queries go there)
+        _fields = odata_fields_for(
+            self._target_stacks[0].version if self._target_stacks else "1.1"
+        )
         params: dict[str, str] = {
             "$top": str(query.top),
-            "$orderby": "@iot.id desc",
+            "$orderby": f"{_fields.id} desc",
         }
         filters: list[str] = []
         if query.capability_key:
             cache_key = self._tasking_capability_cache_key(query.site_key, query.capability_key)
             capability_id = self._tasking_capability_ids.get(cache_key) or self._registered_entities.get("tasking_capabilities", {}).get(cache_key)
             if capability_id:
-                filters.append(f"TaskingCapability/@iot.id eq {capability_id}")
+                filters.append(f"TaskingCapability/{_fields.id} eq {capability_id}")
             else:
                 return {
                     "mode": "live",
@@ -1684,7 +1689,8 @@ class SensorThingsClient:
         return None
 
     def _observation_exists_at(
-        self, obs_endpoint: str, headers: dict[str, str], datastream_id: Any, phenomenon_time: str
+        self, obs_endpoint: str, headers: dict[str, str], datastream_id: Any, phenomenon_time: str,
+        *, version: str = "1.1",
     ) -> bool | None:
         """Return True if an Observation already exists for (datastream, phenomenonTime).
 
@@ -1698,10 +1704,11 @@ class SensorThingsClient:
         ds_ref = _coerce_iot_id(datastream_id)
         if ds_ref in (None, "", "unknown"):
             return None
+        _fields = odata_fields_for(version)
         params = {
-            "$filter": f"Datastream/@iot.id eq {ds_ref} and phenomenonTime eq {phenomenon_time}",
+            "$filter": f"Datastream/{_fields.id} eq {ds_ref} and phenomenonTime eq {phenomenon_time}",
             "$top": "1",
-            "$select": "@iot.id",
+            "$select": _fields.id,
         }
         try:
             response = requests.get(obs_endpoint, params=params, headers=headers, timeout=self._request_timeout())
@@ -1801,7 +1808,9 @@ class SensorThingsClient:
                         ds_ref = payload["Datastream"].get("@iot.id")
                     if ds_ref is None:
                         ds_ref = datastream_id
-                    if phenomenon_time and self._observation_exists_at(endpoint, headers, ds_ref, str(phenomenon_time)) is True:
+                    replay_stack = self._target_stack_for_url(base_url) if base_url else None
+                    replay_version = replay_stack.version if replay_stack else "1.1"
+                    if phenomenon_time and self._observation_exists_at(endpoint, headers, ds_ref, str(phenomenon_time), version=replay_version) is True:
                         results.append({"datastream_id": datastream_id, "ok": True, "status_code": 200, "duplicate": True})
                         continue
 
@@ -1900,7 +1909,8 @@ class SensorThingsClient:
                 except ValueError:
                     things_body = {}
                 if isinstance(things_body, dict):
-                    things_count = things_body.get("@iot.count") or things_body.get("@count") or things_body.get("count")
+                    fields = odata_fields_for(target_version)
+                    things_count = things_body.get(fields.count) or things_body.get("@iot.count") or things_body.get("@count") or things_body.get("count")
 
             return {
                 "mode": "live",
@@ -2191,7 +2201,8 @@ class SensorThingsClient:
             ]
 
         def _ds_ref(ds_id: str) -> dict[str, Any]:
-            return {"id": _coerce_iot_id(ds_id)} if is_v2 else {"@iot.id": _coerce_iot_id(ds_id)}
+            f = odata_fields_for("2.0" if is_v2 else "1.1")
+            return {f.id: _coerce_iot_id(ds_id)}
 
         # Group per datastream, preserving order so the response array maps back.
         grouped: dict[str, list[tuple[dict[str, Any], str]]] = {}
@@ -2297,11 +2308,13 @@ class SensorThingsClient:
         base_url = self._primary_base_url()
         if not base_url:
             return 0
+        stack = self._target_stack_for_url(base_url)
+        fields = stack.fields if stack else odata_fields_for("1.1")
         endpoint = self._endpoint_for_base_url(base_url, settings.datastreams_path)
         try:
             resp = requests.get(
                 endpoint,
-                params={"$select": "@iot.id,name,properties", "$top": str(max_datastreams)},
+                params={"$select": f"{fields.id},name,properties", "$top": str(max_datastreams)},
                 headers=self._headers_for_url(base_url),
                 timeout=self._request_timeout(),
             )
@@ -2313,7 +2326,7 @@ class SensorThingsClient:
 
         warmed = 0
         for ds in values:
-            ds_id = ds.get("@iot.id") or ds.get("id")
+            ds_id = ds.get(fields.id) or ds.get("@iot.id") or ds.get("id")
             if not ds_id:
                 continue
             props = ds.get("properties") or {}

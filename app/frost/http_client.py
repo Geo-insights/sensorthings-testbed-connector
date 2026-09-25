@@ -15,6 +15,7 @@ from typing import Any
 import requests
 
 from app.exceptions import FrostConnectionError, ObservationUploadError
+from app.frost.odata_fields import FrostODataFields
 
 logger = logging.getLogger(__name__)
 
@@ -154,11 +155,22 @@ class FrostHTTPClient:
     # -- Response helpers --------------------------------------------------
 
     @staticmethod
-    def extract_iot_id(response: requests.Response) -> str | None:
-        """Extract @iot.id from a FROST response (body or Location header)."""
+    def extract_iot_id(
+        response: requests.Response,
+        fields: FrostODataFields | None = None,
+    ) -> str | None:
+        """Extract entity id from a FROST response (body or Location header).
+
+        When *fields* is supplied the version-specific id key is tried first,
+        falling back to the opposite convention for tolerance.  Without
+        *fields* both ``@iot.id`` (v1.x) and ``id`` (v2.0) are probed.
+        """
         try:
             body = response.json()
             if isinstance(body, dict):
+                if fields is not None and body.get(fields.id) is not None:
+                    return str(body[fields.id])
+                # Fall back: always try both for tolerance
                 if body.get("@iot.id") is not None:
                     return str(body["@iot.id"])
                 if body.get("id") is not None:
@@ -172,8 +184,13 @@ class FrostHTTPClient:
         return None
 
     @staticmethod
-    def extract_iot_id_from_body(body: dict[str, Any]) -> str | None:
-        """Extract @iot.id directly from a parsed entity dict."""
+    def extract_iot_id_from_body(
+        body: dict[str, Any],
+        fields: FrostODataFields | None = None,
+    ) -> str | None:
+        """Extract entity id directly from a parsed entity dict."""
+        if fields is not None and body.get(fields.id) is not None:
+            return str(body[fields.id])
         if body.get("@iot.id") is not None:
             return str(body["@iot.id"])
         if body.get("id") is not None:
@@ -181,15 +198,22 @@ class FrostHTTPClient:
         return None
 
     @staticmethod
-    def extract_first_iot_id(body: Any) -> str | None:
-        """Extract the first @iot.id from a collection response."""
+    def extract_first_iot_id(
+        body: Any,
+        fields: FrostODataFields | None = None,
+    ) -> str | None:
+        """Extract the first entity id from a collection response."""
         if isinstance(body, dict):
+            if fields is not None and body.get(fields.id) is not None:
+                return str(body[fields.id])
             if body.get("@iot.id") is not None:
                 return str(body["@iot.id"])
             value = body.get("value")
             if isinstance(value, list) and value:
                 first = value[0]
                 if isinstance(first, dict):
+                    if fields is not None and first.get(fields.id) is not None:
+                        return str(first[fields.id])
                     if first.get("@iot.id") is not None:
                         return str(first["@iot.id"])
                     if first.get("id") is not None:

@@ -15,6 +15,7 @@ from typing import Any
 from app.frost.cache import EntityCache
 from app.frost.entity_manager import EntityManager
 from app.frost.http_client import FrostHTTPClient
+from app.frost.odata_fields import odata_fields_for
 from app.frost.target import FrostTarget
 
 logger = logging.getLogger(__name__)
@@ -82,7 +83,8 @@ class TargetStack:
         label = target.label or _slug(target.url)
         cache_file = cache_dir / f"entities_{label}.json"
         self.cache = EntityCache(cache_file)
-        self.entity_manager = EntityManager(self.http, self.cache)
+        self.fields = odata_fields_for(target.version)
+        self.entity_manager = EntityManager(self.http, self.cache, fields=self.fields)
         self.capabilities = self._discover()
 
     @property
