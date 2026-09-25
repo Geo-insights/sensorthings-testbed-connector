@@ -11,6 +11,7 @@ from typing import Any
 
 from app.frost.cache import EntityCache
 from app.frost.http_client import FrostHTTPClient
+from app.frost.odata_fields import FrostODataFields
 
 logger = logging.getLogger(__name__)
 
@@ -22,9 +23,15 @@ _VALIDATION_TTL_SECONDS = 600  # 10 minutes
 class EntityManager:
     """Idempotent entity CRUD using FrostHTTPClient + EntityCache."""
 
-    def __init__(self, http: FrostHTTPClient, cache: EntityCache) -> None:
+    def __init__(
+        self,
+        http: FrostHTTPClient,
+        cache: EntityCache,
+        fields: FrostODataFields | None = None,
+    ) -> None:
         self._http = http
         self._cache = cache
+        self._fields = fields
         # In-memory only: tracks when each (collection, name) was last validated
         self._validated_at: dict[str, float] = {}
 
@@ -48,7 +55,7 @@ class EntityManager:
         return body if isinstance(body, dict) else None
 
     def find_by_name(self, path: str, name: str) -> str | None:
-        """Search for an entity by name via OData $filter. Returns @iot.id or None."""
+        """Search for an entity by name via OData $filter. Returns entity id or None."""
         endpoint = self._http.endpoint(path)
         if not endpoint:
             return None
@@ -62,7 +69,7 @@ class EntityManager:
             body = response.json()
         except ValueError:
             return None
-        return self._http.extract_first_iot_id(body)
+        return self._http.extract_first_iot_id(body, fields=self._fields)
 
     def cached_id_matches(
         self, path: str, entity_id: str, expected_name: str | None, cache_key: str = ""
@@ -136,7 +143,7 @@ class EntityManager:
         except Exception as exc:
             logger.warning("Failed to create entity %s at %s: %s", name, path, exc)
             return None, f"error:{exc}"
-        entity_id = self._http.extract_iot_id(response)
+        entity_id = self._http.extract_iot_id(response, fields=self._fields)
         if entity_id:
             self._cache.put(collection, name, entity_id)
         return entity_id, f"created:{response.status_code}"
@@ -213,7 +220,7 @@ class EntityManager:
         entries: list[tuple[str, str, str]],
         body: dict[str, Any] | None,
     ) -> dict[str, str | None]:
-        """Parse a batch response body and extract @iot.id per ref_id."""
+        """Parse a batch response body and extract entity id per ref_id."""
         result: dict[str, str | None] = {ref_id: None for ref_id, _, _ in entries}
         if not body or "responses" not in body:
             return result
@@ -227,10 +234,14 @@ class EntityManager:
 
             iot_id: str | None = None
             if 200 <= status < 300:
-                # POST → direct @iot.id; GET collection → first item's @iot.id
-                iot_id = self._http.extract_iot_id_from_body(resp_body)
+                # POST → direct entity id; GET collection → first item's id
+                iot_id = self._http.extract_iot_id_from_body(
+                    resp_body, fields=self._fields
+                )
                 if iot_id is None:
-                    iot_id = self._http.extract_first_iot_id(resp_body)
+                    iot_id = self._http.extract_first_iot_id(
+                        resp_body, fields=self._fields
+                    )
 
             if iot_id and ref_id in result:
                 result[ref_id] = iot_id
@@ -240,7 +251,7 @@ class EntityManager:
     # -- OData filter queries ----------------------------------------------
 
     def find_by_filter(self, endpoint: str, odata_filter: str) -> str | None:
-        """Query a collection endpoint with an OData $filter, return first @iot.id."""
+        """Query a collection endpoint with an OData $filter, return first entity id."""
         try:
             response = self._http.get(endpoint, params={"$filter": odata_filter, "$top": "1"})
         except Exception:
@@ -251,4 +262,4 @@ class EntityManager:
             body = response.json()
         except ValueError:
             return None
-        return self._http.extract_first_iot_id(body)
+        return self._http.extract_first_iot_id(body, fields=self._fields)

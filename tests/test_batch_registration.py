@@ -99,7 +99,7 @@ def test_batch_find_by_name_parses_collection_response():
         ],
     }
     http.extract_iot_id_from_body.return_value = None
-    http.extract_first_iot_id.side_effect = lambda body: (
+    http.extract_first_iot_id.side_effect = lambda body, fields=None: (
         str(body["value"][0]["@iot.id"]) if body.get("value") else None
     )
 
@@ -136,7 +136,7 @@ def test_batch_create_updates_cache():
             },
         ],
     }
-    http.extract_iot_id_from_body.side_effect = lambda body: (
+    http.extract_iot_id_from_body.side_effect = lambda body, fields=None: (
         str(body["@iot.id"]) if "@iot.id" in body else None
     )
     http.extract_first_iot_id.return_value = None
