@@ -1,3 +1,5 @@
+# TODO: migrate to Normalizer pattern -- Bridge loads pre-formed SensorReading
+# objects from a JSON file, so there are no vendor fields to normalize.
 from __future__ import annotations
 
 import json
