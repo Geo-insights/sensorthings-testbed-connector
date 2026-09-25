@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Any
 
 from app.models import SensorReading
-from app.sta.canonical import resolve
+from app.sources.normalizers import LevellogNormalizer
 
 logger = logging.getLogger(__name__)
 
@@ -81,23 +81,15 @@ def parse_logdata_readings(
     A legacy list-of-dicts shape is still handled as a fallback so the parser
     keeps working if a given installation type returns objects instead.
     """
-    canonical = resolve("water_level")
-    if canonical is None:  # unreachable given canonical.py, but keeps mypy honest
-        return []
-    meta = canonical.meta
-
-    def _emit(ts: datetime, value: float) -> SensorReading:
-        return SensorReading(
+    def _emit(ts: datetime, value: float) -> list[SensorReading]:
+        normalizer = LevellogNormalizer(water_level=value)
+        return normalizer.to_readings(
             sensor_id=f"tgv-levellog-{installation_id[:8]}",
             sensor_name=f"Levellog {installation_name} sensor",
-            observed_property=canonical.value,
-            unit=meta.unit,
-            value=value,
-            timestamp=ts,
-            quality="good",
-            location="tgv",
             thing_name=f"Levellog {installation_name}",
-            observed_property_name=meta.display_name,
+            timestamp=ts,
+            location="tgv",
+            quality="good",
         )
 
     def _parse_ts(raw: Any) -> datetime | None:
@@ -134,7 +126,7 @@ def parse_logdata_readings(
                 value = float(str(row[value_col]).replace(",", "."))
             except (ValueError, TypeError):
                 continue
-            readings.append(_emit(ts, value))
+            readings.extend(_emit(ts, value))
         return readings
 
     # Fallback shape: list of dicts (or {"data"/"value": [...]}).
@@ -160,6 +152,6 @@ def parse_logdata_readings(
                     continue
         if val is None:
             continue
-        readings.append(_emit(ts, val))
+        readings.extend(_emit(ts, val))
 
     return readings
