@@ -1,0 +1,47 @@
+# Template for Levellog / CARS Online groundwater sensors (runtime-discovered).
+#
+# Levellog installations are discovered from the LEVELLOG_INSTALLATIONS_JSON
+# env var. The levellog.build_entity_set() function generates entity-set
+# dicts at runtime. This template documents the structure for reference;
+# it is NOT loaded automatically.
+#
+# To add a known Levellog installation as a static config, copy this
+# template, fill in the installation details, and save as
+# entity_configs/levellog_{installation_name}.yaml.
+
+version: "1.1"
+
+thing:
+  name: "Levellog {installation_name}"
+  description: "Groundwater level monitoring at The Green Village ({installation_name})."
+  properties:
+    site: tgv
+    campus: TU Delft
+    source: levellog
+    api: cars-online
+    installation_id: "{installation_id}"
+
+location:
+  name: "Levellog {installation_name} location"
+  description: "Groundwater sensor location at The Green Village ({installation_name})."
+  encodingType: "application/geo+json"
+  location:
+    type: Point
+    coordinates: [4.3776, 51.9966]  # Replace with actual [lon, lat]
+  properties: {}
+
+site_key: tgv
+site_name: "The Green Village"
+
+sensors:
+  - sensor_id: "tgv-levellog-{installation_id_prefix}"
+    name: "Levellog {installation_name} sensor"
+    description: "Groundwater level sensor connected via CARS Online API ({installation_name})."
+    encodingType: "application/json"
+    metadata: "https://cars-api.carsonline.eu"
+    observed_properties:
+      - water_level
+    properties: {}
+
+observed_properties:
+  water_level: "Groundwater level relative to reference datum."

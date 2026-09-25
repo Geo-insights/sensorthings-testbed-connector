@@ -3,10 +3,12 @@ from __future__ import annotations
 import logging
 import random
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from app.models import SensorReading
 from app.sta.canonical import resolve
+from app.sta.entity_config import load_entity_sets
 from app.sta.models import (
     STADatastream,
     STALocation,
@@ -18,182 +20,31 @@ from app.sta.models import (
 
 logger = logging.getLogger(__name__)
 
+# Entity configs directory at the repo root.
+_ENTITY_CONFIGS_DIR = Path(__file__).resolve().parents[2] / "entity_configs"
 
-CLIMATE_ADAPTATION_ENTITY_SETS: list[dict[str, Any]] = [
-    {
-        "site_key": "tgv",
-        "site_name": "The Green Village",
-        "thing": {
-            "name": "TGV Office Lab",
-            "description": "Indoor climate monitoring at The Green Village office laboratory, fed from Confluent Cloud Kafka.",
-            "properties": {
-                "site": "tgv",
-                "campus": "TU Delft",
-                "source": "kafka",
-                "topic": "tud_gv_officelab-climate",
-            },
-        },
-        "location": {
-            "name": "TGV Office Lab location",
-            "description": "Weather station at The Green Village office laboratory, TU Delft campus. Height: 5 m above ground.",
-            "encodingType": "application/geo+json",
-            "location": {"type": "Point", "coordinates": [4.377633926937161, 51.99658144237765]},
-            "properties": {"altitude_m": 5},
-        },
-        "sensors": [
-            {
-                "sensor_id": "tgv-officelab-climate",
-                "name": "TGV Office Lab climate sensor",
-                "description": "Multi-parameter indoor climate sensor in the TGV office lab.",
-                "encodingType": "application/json",
-                "metadata": "https://thegreenvillage.org",
-                # Keys must match measurement_id values in the Kafka topic.
-                "observed_properties": ["temperature", "humidity", "co2", "pressure"],
-                "properties": {
-                    "long_description": "Bosch BME680 multi-parameter sensor measuring temperature, humidity, CO2, and barometric pressure. Mounted at desk height (1.2 m) in the TGV office laboratory for indoor climate monitoring.",
-                    "image_url": None,
-                    "installation_notes": "Wall-mounted near the east window, powered via USB.",
-                },
-            }
-        ],
-        "observed_properties": {
-            "temperature": "Indoor air temperature.",
-            "humidity": "Indoor relative humidity.",
-            "co2": "Indoor CO2 concentration.",
-            "pressure": "Indoor air pressure.",
-        },
-    },
-    {
-        "site_key": "tgv",
-        "site_name": "The Green Village",
-        "thing": {
-            "name": "Climate Davis",
-            "description": "Davis Vantage Pro2 outdoor weather station at The Green Village, TU Delft campus.",
-            "properties": {
-                "site": "tgv",
-                "campus": "TU Delft",
-                "source": "kafka",
-                "topic": "tud_gv_officelab-climate",
-            },
-        },
-        "location": {
-            "name": "Climate Davis location",
-            "description": "Davis weather station at The Green Village, TU Delft campus. Height: 10 m above ground.",
-            "encodingType": "application/geo+json",
-            "location": {"type": "Point", "coordinates": [4.377633926937161, 51.99658144237765]},
-            "properties": {"altitude_m": 10},
-        },
-        "sensors": [
-            {
-                "sensor_id": "tgv-climate-davis-weather-station",
-                "name": "Davis weather station",
-                "description": "Davis Vantage Pro2 outdoor weather station measuring air temperature, wind, and precipitation.",
-                "encodingType": "application/json",
-                "metadata": "https://thegreenvillage.org",
-                "observed_properties": [
-                    "air_temperature", "wind_speed", "wind_direction", "precipitation",
-                    "dew_point", "heat_index", "wind_chill", "wind_gust",
-                    "rain_rate", "uv_index", "wet_bulb_temperature", "evapotranspiration",
-                ],
-                "properties": {},
-            }
-        ],
-        "observed_properties": {
-            "air_temperature": "Outdoor air temperature.",
-            "wind_speed": "Wind speed.",
-            "wind_direction": "Wind direction in degrees from north.",
-            "precipitation": "Daily rainfall.",
-            "dew_point": "Dew point temperature.",
-            "heat_index": "Apparent temperature accounting for humidity.",
-            "wind_chill": "Apparent temperature accounting for wind.",
-            "wind_gust": "10-minute average wind gust speed.",
-            "rain_rate": "Current rainfall rate.",
-            "uv_index": "Ultraviolet radiation index.",
-            "wet_bulb_temperature": "Wet bulb temperature (indication).",
-            "evapotranspiration": "Current daily evapotranspiration.",
-        },
-    },
-    {
-        "site_key": "tgv",
-        "site_name": "The Green Village",
-        "thing": {
-            "name": "Weather Climatics",
-            "description": "Climatics rooftop weather station at The Green Village, TU Delft campus.",
-            "properties": {
-                "site": "tgv",
-                "campus": "TU Delft",
-                "source": "kafka",
-                "topic": "tud_gv_officelab-climate",
-            },
-        },
-        "location": {
-            "name": "Weather Climatics location",
-            "description": "Climatics rooftop station at The Green Village, TU Delft campus.",
-            "encodingType": "application/geo+json",
-            "location": {"type": "Point", "coordinates": [4.377633926937161, 51.99658144237765]},
-            "properties": {},
-        },
-        "sensors": [
-            {
-                "sensor_id": "tgv-weather-climatics-rooftop-station",
-                "name": "Climatics rooftop station",
-                "description": "Climatics rooftop weather station measuring air pressure.",
-                "encodingType": "application/json",
-                "metadata": "https://thegreenvillage.org",
-                "observed_properties": ["air_pressure"],
-                "properties": {},
-            }
-        ],
-        "observed_properties": {
-            "air_pressure": "Atmospheric air pressure.",
-        },
-    },
-    {
-        "site_key": "tgv",
-        "site_name": "The Green Village",
-        "thing": {
-            "name": "Hitteplein",
-            "description": "Hitteplein climate station at The Green Village, TU Delft campus.",
-            "properties": {
-                "site": "tgv",
-                "campus": "TU Delft",
-                "source": "kafka",
-                "topic": "tud_gv_officelab-climate",
-            },
-        },
-        "location": {
-            "name": "Hitteplein location",
-            "description": "Hitteplein climate station at The Green Village, TU Delft campus.",
-            "encodingType": "application/geo+json",
-            "location": {"type": "Point", "coordinates": [4.377633926937161, 51.99658144237765]},
-            "properties": {},
-        },
-        "sensors": [
-            {
-                "sensor_id": "tgv-hitteplein-climate-station",
-                "name": "Hitteplein climate station",
-                "description": "Hitteplein climate station measuring solar radiation and relative humidity.",
-                "encodingType": "application/json",
-                "metadata": "https://thegreenvillage.org",
-                "observed_properties": ["solar_radiation", "relative_humidity"],
-                "properties": {},
-            }
-        ],
-        "observed_properties": {
-            "solar_radiation": "Solar radiation.",
-            "relative_humidity": "Outdoor relative humidity.",
-        },
-    },
-]
+# Load entity sets from YAML config files.  This replaces the old hardcoded
+# CLIMATE_ADAPTATION_ENTITY_SETS list.  The YAML files in entity_configs/ are
+# the source of truth for what entities should exist on FROST.
+CLIMATE_ADAPTATION_ENTITY_SETS: list[dict[str, Any]] = load_entity_sets(
+    _ENTITY_CONFIGS_DIR,
+)
 
 
 def entity_set_to_sta_models(
     entity_set: dict[str, Any],
-) -> tuple[STAThing, STALocation, list[STASensor], dict[str, STAObservedProperty], list[STADatastream]]:
+) -> tuple[
+    STAThing,
+    STALocation,
+    list[STASensor],
+    dict[str, STAObservedProperty],
+    list[STADatastream],
+]:
     """Convert a raw entity-set dict into typed STA domain models.
 
     Returns (thing, location, sensors, observed_properties, datastreams).
-    Datastreams don't have linked IDs set — those are resolved at registration time.
+    Datastreams don't have linked IDs set -- those are resolved at registration
+    time.
     """
     thing = STAThing(
         name=entity_set["thing"]["name"],
@@ -204,7 +55,9 @@ def entity_set_to_sta_models(
     location = STALocation(
         name=entity_set["location"]["name"],
         description=entity_set["location"]["description"],
-        encodingType=entity_set["location"].get("encodingType", "application/geo+json"),
+        encodingType=entity_set["location"].get(
+            "encodingType", "application/geo+json"
+        ),
         location=entity_set["location"]["location"],
         properties=entity_set["location"].get("properties", {}),
     )
@@ -227,12 +80,15 @@ def entity_set_to_sta_models(
             canonical = resolve(op_key)
             if canonical is None:
                 logger.warning(
-                    "Unknown observed property %r on %s — skipping datastream",
-                    op_key, sensor_def["name"],
+                    "Unknown observed property %r on %s -- skipping datastream",
+                    op_key,
+                    sensor_def["name"],
                 )
                 continue
             meta = canonical.meta
-            description = entity_set["observed_properties"].get(op_key, meta.display_name)
+            description = entity_set["observed_properties"].get(
+                op_key, meta.display_name
+            )
 
             if op_key not in observed_properties:
                 observed_properties[op_key] = STAObservedProperty(
@@ -244,7 +100,10 @@ def entity_set_to_sta_models(
             datastreams.append(
                 STADatastream(
                     name=f"{sensor_def['name']} - {meta.display_name}",
-                    description=f"{meta.display_name} observations for {entity_set['thing']['name']}",
+                    description=(
+                        f"{meta.display_name} observations for"
+                        f" {entity_set['thing']['name']}"
+                    ),
                     unitOfMeasurement=UnitOfMeasurement(
                         name=meta.display_name,
                         symbol=meta.unit,
@@ -281,8 +140,10 @@ def generate_demo_readings() -> list[SensorReading]:
                 canonical = resolve(observed_property)
                 if canonical is None:
                     logger.warning(
-                        "Unknown observed property %r on %s — skipping demo reading",
-                        observed_property, sensor["name"],
+                        "Unknown observed property %r on %s"
+                        " -- skipping demo reading",
+                        observed_property,
+                        sensor["name"],
                     )
                     continue
                 low, high = ranges.get(observed_property, (0.0, 1.0))

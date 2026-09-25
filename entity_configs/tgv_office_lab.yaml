@@ -1,0 +1,45 @@
+version: "1.1"
+
+thing:
+  name: "TGV Office Lab"
+  description: "Indoor climate monitoring at The Green Village office laboratory, fed from Confluent Cloud Kafka."
+  properties:
+    site: tgv
+    campus: TU Delft
+    source: kafka
+    topic: tud_gv_officelab-climate
+
+location:
+  name: "TGV Office Lab location"
+  description: "Weather station at The Green Village office laboratory, TU Delft campus. Height: 5 m above ground."
+  encodingType: "application/geo+json"
+  location:
+    type: Point
+    coordinates: [4.377633926937161, 51.99658144237765]
+  properties:
+    altitude_m: 5
+
+site_key: tgv
+site_name: "The Green Village"
+
+sensors:
+  - sensor_id: "tgv-officelab-climate"
+    name: "TGV Office Lab climate sensor"
+    description: "Multi-parameter indoor climate sensor in the TGV office lab."
+    encodingType: "application/json"
+    metadata: "https://thegreenvillage.org"
+    observed_properties:
+      - temperature
+      - humidity
+      - co2
+      - pressure
+    properties:
+      long_description: "Bosch BME680 multi-parameter sensor measuring temperature, humidity, CO2, and barometric pressure. Mounted at desk height (1.2 m) in the TGV office laboratory for indoor climate monitoring."
+      image_url: null
+      installation_notes: "Wall-mounted near the east window, powered via USB."
+
+observed_properties:
+  temperature: "Indoor air temperature."
+  humidity: "Indoor relative humidity."
+  co2: "Indoor CO2 concentration."
+  pressure: "Indoor air pressure."
