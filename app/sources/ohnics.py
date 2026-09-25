@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from app.models import SensorReading
-from app.sta.canonical import resolve
+from app.sources.normalizers import OhnicsNormalizer
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +23,7 @@ _DESCRIPTIONS: dict[str, str] = {
 }
 
 # Mapping from Ohnics JSON field names to canonical observed property keys.
-# Confirmed from live API: P2 = PM2.5, T = temperature.
+# Retained for backward compatibility (used by external callers).
 FIELD_TO_PROPERTY: dict[str, str] = {
     "P2": "pm2_5",
     "T": "air_temperature",
@@ -76,8 +76,9 @@ def build_entity_set(
 def parse_sensor_readings(sensor_data: dict[str, Any]) -> list[SensorReading]:
     """Parse a single Ohnics sensor JSON object into SensorReadings.
 
-    The exact field names depend on the API response shape; this function tries
-    several known variants for sensor name, coordinates, timestamp, and values.
+    Uses :class:`OhnicsNormalizer` to map vendor fields (P2, T) to canonical
+    observed properties. The exact field names depend on the API response shape;
+    this function handles several known variants for sensor name and timestamp.
     """
     # Extract sensor name
     name = str(sensor_data.get("Name", sensor_data.get("name", "")))
@@ -98,36 +99,13 @@ def parse_sensor_readings(sensor_data: dict[str, Any]) -> list[SensorReading]:
     else:
         ts = datetime.now(UTC)
 
-    readings: list[SensorReading] = []
-    for field_key, prop_key in FIELD_TO_PROPERTY.items():
-        value = sensor_data.get(field_key)
-        if value is None:
-            continue
-        try:
-            float_val = float(value)
-        except (ValueError, TypeError):
-            continue
-
-        canonical = resolve(prop_key)
-        if canonical is None:
-            logger.warning(
-                "Ohnics field %r maps to non-canonical property %r — skipping",
-                field_key, prop_key,
-            )
-            continue
-        meta = canonical.meta
-        readings.append(
-            SensorReading(
-                sensor_id=f"ohnics-{name}",
-                sensor_name=f"Ohnics {name} sensor",
-                observed_property=canonical.value,
-                unit=meta.unit,
-                value=float_val,
-                timestamp=ts,
-                quality="good",
-                location="delft",
-                thing_name=f"Ohnics {name}",
-                observed_property_name=meta.display_name,
-            )
-        )
-    return readings
+    # Build normalizer from vendor fields — unknown keys silently dropped
+    normalizer = OhnicsNormalizer.model_validate(sensor_data)
+    return normalizer.to_readings(
+        sensor_id=f"ohnics-{name}",
+        sensor_name=f"Ohnics {name} sensor",
+        thing_name=f"Ohnics {name}",
+        timestamp=ts,
+        location="delft",
+        quality="good",
+    )
