@@ -20,7 +20,6 @@ from app.frost.circuit_breaker import CircuitBreaker
 from app.frost.entity_manager import EntityManager
 from app.frost.http_client import FrostHTTPClient, is_retryable_status
 from app.frost.target_stack import TargetStack
-from app.frost.v2_adapter import adapt_datastream_payload, adapt_observation_payload, adapt_payload
 from app.models import (
     ConnectorPreview,
     ObservationPayload,
@@ -40,6 +39,7 @@ from app.services.validation.error_classifier import (
 )
 from app.sources.climate_adaptation import CLIMATE_ADAPTATION_ENTITY_SETS
 from app.sta.canonical import resolve
+from app.sta.models import adapt_datastream_payload, adapt_observation_payload, adapt_payload
 
 logger = logging.getLogger(__name__)
 
