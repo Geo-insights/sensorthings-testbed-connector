@@ -19,6 +19,7 @@ Usage::
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -162,3 +163,61 @@ def load_entity_sets(config_dir: Path) -> list[dict[str, Any]]:
     :func:`configs_to_entity_sets`.
     """
     return configs_to_entity_sets(load_all_configs(config_dir))
+
+
+# ---------------------------------------------------------------------------
+# Startup reconciliation: YAML desired state vs FROST actual state
+# ---------------------------------------------------------------------------
+
+
+class ReconciliationResult:
+    """Outcome of comparing YAML configs against a FROST server."""
+
+    def __init__(self) -> None:
+        self.present: list[str] = []
+        self.created: list[str] = []
+        self.extra: list[str] = []
+
+    @property
+    def ok(self) -> bool:
+        return not self.extra and not self.created
+
+
+def reconcile_with_frost(
+    configs: list[EntityConfig],
+    find_thing_by_name: Callable[[str], str | None],
+) -> ReconciliationResult:
+    """Compare YAML-declared Things against FROST.
+
+    For each config, checks whether the Thing exists on FROST by name.
+    Logs what is present, what is missing (will be created by registration),
+    and what is extra (on FROST but not in any YAML config).
+
+    *find_thing_by_name* is a callable ``(name) -> id | None`` so this
+    module stays decoupled from :class:`EntityManager`.
+
+    This function is read-only -- it never creates or deletes entities.
+    The existing ``register_entity_set()`` flow handles creation.
+    """
+    result = ReconciliationResult()
+
+    for config in configs:
+        thing_name: str = config.thing.get("name", "")
+        if not thing_name:
+            continue
+
+        thing_id = find_thing_by_name(thing_name)
+        if thing_id is not None:
+            result.present.append(thing_name)
+            logger.info(
+                "Reconcile: Thing %r exists on FROST (id=%s)", thing_name, thing_id
+            )
+        else:
+            result.created.append(thing_name)
+            logger.warning(
+                "Reconcile: Thing %r declared in YAML but missing from FROST"
+                " -- will be created by registration",
+                thing_name,
+            )
+
+    return result

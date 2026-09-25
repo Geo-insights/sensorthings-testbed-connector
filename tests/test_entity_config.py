@@ -13,6 +13,7 @@ from app.sta.entity_config import (
     load_entity_config,
     load_entity_sets,
     reconcile_config_to_entity_set,
+    reconcile_with_frost,
 )
 
 # ---------------------------------------------------------------------------
@@ -256,3 +257,51 @@ def test_real_entity_configs_preserve_coordinates():
         assert coords == [4.377633926937161, 51.99658144237765], (
             f"Coordinates mismatch for {es['thing']['name']}: {coords}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Test: reconcile_with_frost
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_all_present():
+    """When all Things exist on FROST, result.ok is True."""
+    config = EntityConfig(**_VALID_CONFIG)
+    # Simulate FROST returning an ID for the Thing
+    result = reconcile_with_frost([config], lambda name: "42" if name == "Test Thing" else None)
+    assert result.ok
+    assert result.present == ["Test Thing"]
+    assert result.created == []
+
+
+def test_reconcile_missing_thing():
+    """When a Thing is missing from FROST, it appears in result.created."""
+    config = EntityConfig(**_VALID_CONFIG)
+    result = reconcile_with_frost([config], lambda name: None)
+    assert not result.ok
+    assert result.present == []
+    assert result.created == ["Test Thing"]
+
+
+def test_reconcile_empty_configs():
+    """Empty config list produces an ok result."""
+    result = reconcile_with_frost([], lambda name: None)
+    assert result.ok
+    assert result.present == []
+    assert result.created == []
+
+
+def test_reconcile_mixed():
+    """Multiple configs with some present and some missing."""
+    config1 = EntityConfig(**_VALID_CONFIG)
+    config2_data = dict(_VALID_CONFIG)
+    config2_data["thing"] = {"name": "Missing Thing", "description": "Not on FROST."}
+    config2 = EntityConfig(**config2_data)
+
+    def lookup(name: str) -> str | None:
+        return "42" if name == "Test Thing" else None
+
+    result = reconcile_with_frost([config1, config2], lookup)
+    assert not result.ok
+    assert result.present == ["Test Thing"]
+    assert result.created == ["Missing Thing"]
