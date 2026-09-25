@@ -1,3 +1,6 @@
+# TODO: migrate to Normalizer pattern -- TGV uses a dynamic device/measurement
+# lookup table rather than fixed vendor fields, so the current function-based
+# approach is retained until a DynamicNormalizer variant is designed.
 from __future__ import annotations
 
 import logging
