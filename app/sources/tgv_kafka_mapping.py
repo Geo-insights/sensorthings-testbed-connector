@@ -1,6 +1,3 @@
-# TODO: migrate to Normalizer pattern -- TGV uses a dynamic device/measurement
-# lookup table rather than fixed vendor fields, so the current function-based
-# approach is retained until a DynamicNormalizer variant is designed.
 from __future__ import annotations
 
 import logging
@@ -9,7 +6,6 @@ from typing import Any
 
 from app.config import settings
 from app.models import SensorReading
-from app.sta.canonical import resolve
 
 logger = logging.getLogger(__name__)
 
@@ -173,13 +169,12 @@ def avro_record_to_sensor_readings(
     """
     Convert a single deserialized GreenVillageRecord dict to SensorReadings.
 
-    One SensorReading is produced per measurement entry that:
-    - Has a resolvable numeric value
-    - Has a matching entry in the device mapping
-
-    The measurement_id is used as stream_key so the FROST client can resolve
-    the correct Datastream via OData filter on properties/streamKey.
+    Uses :class:`~app.sources.normalizers.TGVMeasurementNormalizer` to resolve
+    each measurement entry through the device mapping table and enforce
+    canonical names/units.
     """
+    from app.sources.normalizers import TGVMeasurementNormalizer
+
     device_id: str = record.get("device_id", "")
     timestamp_ms: int = record.get("timestamp", 0)
     measurements: list[dict[str, Any]] = record.get("measurements", [])
@@ -189,6 +184,9 @@ def avro_record_to_sensor_readings(
     except (OSError, ValueError, OverflowError):
         ts = datetime.now(UTC)
 
+    active_mapping = override_mapping if override_mapping is not None else _DEFAULT_DEVICE_MAPPING
+    normalizer = TGVMeasurementNormalizer(active_mapping)
+
     readings: list[SensorReading] = []
 
     for m in measurements:
@@ -196,49 +194,15 @@ def avro_record_to_sensor_readings(
         raw_value = m.get("value")
         unit_from_avro: str | None = m.get("unit") or None
 
-        numeric_value = _extract_numeric_value(raw_value)
-        if numeric_value is None:
-            logger.debug(
-                "Skipping non-numeric measurement: %s/%s = %r",
-                device_id, measurement_id, raw_value,
-            )
-            continue
-
-        mapping = _get_mapping(device_id, measurement_id, override_mapping)
-        if mapping is None:
-            logger.debug("No mapping for %s/%s — skipping", device_id, measurement_id)
-            continue
-
-        canonical = resolve(mapping["observed_property"])
-        if canonical is None:
-            logger.warning(
-                "Mapping for %s/%s uses non-canonical observed_property %r — skipping",
-                device_id, measurement_id, mapping["observed_property"],
-            )
-            continue
-        meta = canonical.meta
-        if unit_from_avro and unit_from_avro != meta.unit:
-            logger.info(
-                "Avro unit %r for %s/%s disagrees with canonical %r — using canonical",
-                unit_from_avro, device_id, measurement_id, meta.unit,
-            )
-
-        readings.append(
-            SensorReading(
-                sensor_id=mapping["sensor_id"],
-                sensor_name=mapping.get("sensor_name", mapping["sensor_id"]),
-                observed_property=canonical.value,
-                unit=meta.unit,
-                value=numeric_value,
-                timestamp=ts,
-                quality="good",
-                location="tgv",
-                thing_name=mapping["thing_name"],
-                device_eui=device_id,
-                stream_key=measurement_id,
-                observed_property_name=meta.display_name,
-            )
+        reading = normalizer.normalize_measurement(
+            device_id=device_id,
+            measurement_id=measurement_id,
+            raw_value=raw_value,
+            timestamp=ts,
+            unit_from_avro=unit_from_avro,
         )
+        if reading is not None:
+            readings.append(reading)
 
     return readings
 
