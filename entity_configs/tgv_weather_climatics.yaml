@@ -1,0 +1,35 @@
+version: "1.1"
+
+thing:
+  name: "Weather Climatics"
+  description: "Climatics rooftop weather station at The Green Village, TU Delft campus."
+  properties:
+    site: tgv
+    campus: TU Delft
+    source: kafka
+    topic: tud_gv_officelab-climate
+
+location:
+  name: "Weather Climatics location"
+  description: "Climatics rooftop station at The Green Village, TU Delft campus."
+  encodingType: "application/geo+json"
+  location:
+    type: Point
+    coordinates: [4.377633926937161, 51.99658144237765]
+  properties: {}
+
+site_key: tgv
+site_name: "The Green Village"
+
+sensors:
+  - sensor_id: "tgv-weather-climatics-rooftop-station"
+    name: "Climatics rooftop station"
+    description: "Climatics rooftop weather station measuring air pressure."
+    encodingType: "application/json"
+    metadata: "https://thegreenvillage.org"
+    observed_properties:
+      - air_pressure
+    properties: {}
+
+observed_properties:
+  air_pressure: "Atmospheric air pressure."

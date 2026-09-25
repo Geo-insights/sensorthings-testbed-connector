@@ -1,0 +1,49 @@
+# Template for Ohnics air quality sensors (runtime-discovered).
+#
+# Ohnics sensors are discovered dynamically from the 5min.json API.
+# The ohnics.build_entity_set() function generates entity-set dicts
+# at runtime using the sensor name, coordinates, and measured properties
+# from the API response. This template documents the structure for
+# reference; it is NOT loaded automatically.
+#
+# To add a known Ohnics sensor as a static config, copy this template,
+# fill in the sensor_name, coordinates, and observed_properties, and
+# save as entity_configs/ohnics_{sensor_name}.yaml.
+
+version: "1.1"
+
+thing:
+  name: "Ohnics {sensor_name}"
+  description: "Ohnics outdoor air quality sensor in Delft ({sensor_name})."
+  properties:
+    site: delft
+    source: ohnics
+    ohnics_name: "{sensor_name}"
+    network: SamenMeten
+
+location:
+  name: "Ohnics {sensor_name} location"
+  description: "Outdoor air quality measurement point {sensor_name} in Delft."
+  encodingType: "application/geo+json"
+  location:
+    type: Point
+    coordinates: [0.0, 0.0]  # Replace with actual [lon, lat]
+  properties: {}
+
+site_key: delft
+site_name: Delft
+
+sensors:
+  - sensor_id: "ohnics-{sensor_name}"
+    name: "Ohnics {sensor_name} sensor"
+    description: "Ohnics particulate matter sensor ({sensor_name})."
+    encodingType: "application/json"
+    metadata: "https://ohnics.online"
+    observed_properties:
+      - pm2_5
+      - air_temperature
+    properties: {}
+
+observed_properties:
+  pm2_5: "Particulate matter concentration (PM2.5) in ambient air."
+  air_temperature: "Outdoor air temperature at sensor location."
