@@ -167,6 +167,7 @@ def _coerce_iot_id(value: Any) -> Any:
 observation_breaker = CircuitBreaker(
     failure_threshold=settings.frost_cb_failure_threshold,
     cooldown_seconds=settings.frost_cb_cooldown_seconds,
+    overrides=settings.frost_cb_overrides,
 )
 
 

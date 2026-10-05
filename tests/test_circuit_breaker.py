@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import threading
 from unittest.mock import patch
 
@@ -277,3 +279,229 @@ class TestThreadSafety:
 
         # No assertion on final state since it's nondeterministic;
         # the test passes if no exceptions or deadlocks occur.
+
+
+# ---------------------------------------------------------------------------
+# Per-target override tests
+# ---------------------------------------------------------------------------
+
+TARGET_WBD = "https://sta.wbd-rd.nl/FROST-Server/v1.1"
+TARGET_FRAUNHOFER = "https://fraunhofer.example.com/staplus/v2.0"
+
+
+class TestOverridesDefault:
+    """When no overrides are set, global defaults apply."""
+
+    def test_no_overrides_uses_global_threshold(self):
+        cb = CircuitBreaker(failure_threshold=3, cooldown_seconds=600.0)
+        # Should need exactly 3 failures to open
+        cb.record_failure(TARGET)
+        cb.record_failure(TARGET)
+        assert cb.allow(TARGET) is True
+        cb.record_failure(TARGET)
+        assert cb.allow(TARGET) is False
+
+    def test_empty_overrides_dict(self):
+        cb = CircuitBreaker(failure_threshold=2, overrides={})
+        cb.record_failure(TARGET)
+        assert cb.record_failure(TARGET) is True
+
+
+class TestOverridesParsing:
+    """Override values are applied per-target via host pattern matching."""
+
+    def test_override_raises_threshold(self):
+        cb = CircuitBreaker(
+            failure_threshold=2,
+            cooldown_seconds=600.0,
+            overrides={"sta.wbd-rd.nl": {"failure_threshold": 5}},
+        )
+        # WBD target needs 5 failures, not 2
+        for _ in range(4):
+            cb.record_failure(TARGET_WBD)
+        assert cb.allow(TARGET_WBD) is True
+        cb.record_failure(TARGET_WBD)
+        assert cb.allow(TARGET_WBD) is False
+
+    def test_override_lowers_cooldown(self):
+        cb = CircuitBreaker(
+            failure_threshold=1,
+            cooldown_seconds=600.0,
+            overrides={"fraunhofer": {"cooldown_seconds": 30}},
+        )
+        cb.record_failure(TARGET_FRAUNHOFER)
+        assert cb.allow(TARGET_FRAUNHOFER) is False
+
+        with patch("app.frost.circuit_breaker.time") as mock_time:
+            # 31 seconds later — should be past the 30s override cooldown
+            mock_time.monotonic.return_value = 1e9
+            assert cb.allow(TARGET_FRAUNHOFER) is True
+
+    def test_override_partial_keys_fall_back_to_global(self):
+        """An override with only cooldown_seconds still uses global failure_threshold."""
+        cb = CircuitBreaker(
+            failure_threshold=3,
+            cooldown_seconds=600.0,
+            overrides={"sta.wbd-rd.nl": {"cooldown_seconds": 120}},
+        )
+        # Threshold should still be the global 3
+        for _ in range(2):
+            cb.record_failure(TARGET_WBD)
+        assert cb.allow(TARGET_WBD) is True
+        cb.record_failure(TARGET_WBD)
+        assert cb.allow(TARGET_WBD) is False
+
+    def test_non_matching_target_uses_global(self):
+        cb = CircuitBreaker(
+            failure_threshold=2,
+            overrides={"sta.wbd-rd.nl": {"failure_threshold": 10}},
+        )
+        # TARGET doesn't match "sta.wbd-rd.nl", so global threshold=2 applies
+        cb.record_failure(TARGET)
+        assert cb.record_failure(TARGET) is True
+
+
+class TestOverridesIsolation:
+    """Different targets get different thresholds simultaneously."""
+
+    def test_two_targets_different_thresholds(self):
+        cb = CircuitBreaker(
+            failure_threshold=2,
+            cooldown_seconds=600.0,
+            overrides={
+                "sta.wbd-rd.nl": {"failure_threshold": 5},
+                "fraunhofer": {"failure_threshold": 1},
+            },
+        )
+        # Fraunhofer opens after 1 failure
+        assert cb.record_failure(TARGET_FRAUNHOFER) is True
+        assert cb.allow(TARGET_FRAUNHOFER) is False
+
+        # WBD still open after 4 failures (threshold=5)
+        for _ in range(4):
+            cb.record_failure(TARGET_WBD)
+        assert cb.allow(TARGET_WBD) is True
+
+        # WBD opens on 5th
+        cb.record_failure(TARGET_WBD)
+        assert cb.allow(TARGET_WBD) is False
+
+        # Unmatched target uses global threshold=2
+        cb.record_failure(TARGET)
+        assert cb.allow(TARGET) is True
+        cb.record_failure(TARGET)
+        assert cb.allow(TARGET) is False
+
+    def test_snapshot_uses_per_target_cooldown(self):
+        cb = CircuitBreaker(
+            failure_threshold=1,
+            cooldown_seconds=600.0,
+            overrides={"fraunhofer": {"cooldown_seconds": 30}},
+        )
+        cb.record_failure(TARGET_FRAUNHOFER)
+        cb.record_failure(TARGET)
+
+        snap = cb.snapshot()
+        # Fraunhofer has 30s cooldown, so remaining should be <= 30
+        fraunhofer_state = snap[TARGET_FRAUNHOFER.rstrip("/")]
+        assert fraunhofer_state["open"] is True
+        assert fraunhofer_state["cooldown_remaining_s"] <= 30.0
+
+        # Default target has 600s cooldown
+        default_state = snap[TARGET.rstrip("/")]
+        assert default_state["open"] is True
+        assert default_state["cooldown_remaining_s"] <= 600.0
+        assert default_state["cooldown_remaining_s"] > 30.0
+
+
+class TestOverridesURLPatternMatching:
+    """Host pattern is substring-matched against the full target URL."""
+
+    def test_hostname_substring_match(self):
+        cb = CircuitBreaker(
+            failure_threshold=2,
+            overrides={"sta.wbd-rd.nl": {"failure_threshold": 10}},
+        )
+        # Full URL containing the host pattern
+        url = "https://sta.wbd-rd.nl/FROST-Server/v1.1"
+        for _ in range(9):
+            cb.record_failure(url)
+        assert cb.allow(url) is True
+        cb.record_failure(url)
+        assert cb.allow(url) is False
+
+    def test_partial_host_match(self):
+        cb = CircuitBreaker(
+            failure_threshold=2,
+            overrides={"wbd-rd": {"failure_threshold": 5}},
+        )
+        for _ in range(4):
+            cb.record_failure(TARGET_WBD)
+        assert cb.allow(TARGET_WBD) is True
+
+    def test_no_false_positive_match(self):
+        cb = CircuitBreaker(
+            failure_threshold=2,
+            overrides={"totally-different.example.com": {"failure_threshold": 99}},
+        )
+        # TARGET doesn't match the override pattern
+        cb.record_failure(TARGET)
+        assert cb.record_failure(TARGET) is True  # global threshold=2
+
+
+class TestConfigCBOverrides:
+    """Test FROST_CB_OVERRIDES env var parsing in config."""
+
+    def test_valid_json_parsed(self):
+        override_json = json.dumps({"sta.wbd-rd.nl": {"failure_threshold": 5, "cooldown_seconds": 300}})
+        with patch.dict(os.environ, {"FROST_CB_OVERRIDES": override_json}):
+            from app.config import _load_cb_overrides
+
+            result = _load_cb_overrides()
+            assert "sta.wbd-rd.nl" in result
+            assert result["sta.wbd-rd.nl"]["failure_threshold"] == 5
+            assert result["sta.wbd-rd.nl"]["cooldown_seconds"] == 300.0
+
+    def test_empty_env_returns_empty_dict(self):
+        with patch.dict(os.environ, {"FROST_CB_OVERRIDES": ""}):
+            from app.config import _load_cb_overrides
+
+            assert _load_cb_overrides() == {}
+
+    def test_missing_env_returns_empty_dict(self):
+        with patch.dict(os.environ, {}, clear=False):
+            env = os.environ.copy()
+            env.pop("FROST_CB_OVERRIDES", None)
+            with patch.dict(os.environ, env, clear=True):
+                from app.config import _load_cb_overrides
+
+                assert _load_cb_overrides() == {}
+
+    def test_invalid_json_returns_empty_dict(self):
+        with patch.dict(os.environ, {"FROST_CB_OVERRIDES": "not-json{{{"}):
+            from app.config import _load_cb_overrides
+
+            assert _load_cb_overrides() == {}
+
+    def test_non_dict_json_returns_empty_dict(self):
+        with patch.dict(os.environ, {"FROST_CB_OVERRIDES": '["a", "b"]'}):
+            from app.config import _load_cb_overrides
+
+            assert _load_cb_overrides() == {}
+
+    def test_partial_override_keys(self):
+        override_json = json.dumps({"host.example.com": {"failure_threshold": 7}})
+        with patch.dict(os.environ, {"FROST_CB_OVERRIDES": override_json}):
+            from app.config import _load_cb_overrides
+
+            result = _load_cb_overrides()
+            assert result["host.example.com"] == {"failure_threshold": 7}
+
+    def test_non_dict_values_skipped(self):
+        override_json = json.dumps({"good": {"failure_threshold": 5}, "bad": "string"})
+        with patch.dict(os.environ, {"FROST_CB_OVERRIDES": override_json}):
+            from app.config import _load_cb_overrides
+
+            result = _load_cb_overrides()
+            assert "good" in result
+            assert "bad" not in result

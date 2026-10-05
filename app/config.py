@@ -134,6 +134,42 @@ def _load_levellog_installations() -> tuple[dict[str, object], ...]:
     return tuple(installs)
 
 
+def _load_cb_overrides() -> dict[str, dict[str, int | float]]:
+    """Parse ``FROST_CB_OVERRIDES`` JSON env var.
+
+    Expected format::
+
+        {"sta.wbd-rd.nl": {"failure_threshold": 5, "cooldown_seconds": 300}}
+
+    Invalid JSON or non-dict payloads are silently ignored (empty dict).
+    """
+    import logging
+
+    raw = os.getenv("FROST_CB_OVERRIDES", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logging.getLogger(__name__).warning("FROST_CB_OVERRIDES: invalid JSON, using empty overrides")
+        return {}
+    if not isinstance(data, dict):
+        logging.getLogger(__name__).warning("FROST_CB_OVERRIDES: expected a JSON object, using empty overrides")
+        return {}
+    parsed: dict[str, dict[str, int | float]] = {}
+    for key, value in data.items():
+        if not isinstance(value, dict):
+            continue
+        entry: dict[str, int | float] = {}
+        if "failure_threshold" in value:
+            entry["failure_threshold"] = int(value["failure_threshold"])
+        if "cooldown_seconds" in value:
+            entry["cooldown_seconds"] = float(value["cooldown_seconds"])
+        if entry:
+            parsed[str(key)] = entry
+    return parsed
+
+
 def _coerce_float(value: object) -> float | None:
     if value is None:
         return None
@@ -373,6 +409,7 @@ class Settings:
     # Circuit breaker: skip a target after N consecutive failed push cycles.
     frost_cb_failure_threshold: int = int(os.getenv("FROST_CB_FAILURE_THRESHOLD", "3"))
     frost_cb_cooldown_seconds: float = field(default_factory=lambda: _load_float("FROST_CB_COOLDOWN_SECONDS", "600"))
+    frost_cb_overrides: dict[str, dict[str, int | float]] = field(default_factory=_load_cb_overrides)
     # --- FROST push concurrency & async worker (throughput / decoupling) ---
     # Push the FROST_BATCH_MAX_OBSERVATIONS-sized chunks of one large
     # CreateObservations batch concurrently per target instead of sequentially,
