@@ -31,7 +31,7 @@ class AsyncAPIClient:
     async def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         """GET request with retries. Returns parsed JSON."""
         url = f"{self._base_url}{path}" if self._base_url else path
-        async with httpx.AsyncClient(verify=self._verify_ssl, timeout=self._timeout) as client:
+        async with httpx.AsyncClient(verify=self._verify_ssl, timeout=self._timeout, follow_redirects=True) as client:
             for attempt in range(1, self._max_retries + 1):
                 try:
                     resp = await client.get(url, params=params, headers=self._headers)
@@ -49,7 +49,7 @@ class AsyncAPIClient:
     async def post(self, path: str, data: dict[str, Any] | str | None = None, json_body: Any = None, params: dict[str, Any] | None = None) -> Any:
         """POST request with retries. Returns parsed JSON."""
         url = f"{self._base_url}{path}" if self._base_url else path
-        async with httpx.AsyncClient(verify=self._verify_ssl, timeout=self._timeout) as client:
+        async with httpx.AsyncClient(verify=self._verify_ssl, timeout=self._timeout, follow_redirects=True) as client:
             for attempt in range(1, self._max_retries + 1):
                 try:
                     if json_body is not None:
