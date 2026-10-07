@@ -63,6 +63,41 @@ class MeetJeStadNormalizer(Normalizer):
     }
 
 
+class KNMIWeatherNormalizer(Normalizer):
+    """KNMI weather stations: temperature, wind, pressure, visibility, etc.
+
+    Wind speed and gust fields are named ``windspeedkmh`` / ``windgustskmh``
+    because the parser converts the Buienradar m/s values to km/h before
+    constructing this normalizer (canonical WIND_SPEED / WIND_GUST use km/h).
+    """
+
+    temperature: float | None = None
+    groundtemperature: float | None = None
+    feeltemperature: float | None = None
+    humidity: float | None = None
+    windspeedkmh: float | None = None
+    winddirectiondegrees: float | None = None
+    windgustskmh: float | None = None
+    airpressure: float | None = None
+    visibility: float | None = None
+    sunpower: float | None = None
+    rainfalllasthour: float | None = None
+
+    NAME_TRANSFORM: ClassVar[dict[str, CanonicalDatastream]] = {
+        "temperature": CanonicalDatastream.TEMPERATURE,
+        "groundtemperature": CanonicalDatastream.GROUND_TEMPERATURE,
+        "feeltemperature": CanonicalDatastream.FEEL_TEMPERATURE,
+        "humidity": CanonicalDatastream.HUMIDITY,
+        "windspeedkmh": CanonicalDatastream.WIND_SPEED,
+        "winddirectiondegrees": CanonicalDatastream.WIND_DIRECTION,
+        "windgustskmh": CanonicalDatastream.WIND_GUST,
+        "airpressure": CanonicalDatastream.AIR_PRESSURE,
+        "visibility": CanonicalDatastream.VISIBILITY,
+        "sunpower": CanonicalDatastream.SOLAR_RADIATION,
+        "rainfalllasthour": CanonicalDatastream.PRECIPITATION,
+    }
+
+
 class TGVMeasurementNormalizer:
     """Normalize a single TGV Avro measurement via the device mapping table.
 

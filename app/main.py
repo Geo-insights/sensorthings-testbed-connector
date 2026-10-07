@@ -613,6 +613,11 @@ def _get_enabled_polling_sources() -> list:
     if samen_meten.is_enabled():
         sources.append(samen_meten)
 
+    from app.services.knmi_weather_source import KNMIWeatherPollingSource
+    knmi_weather = KNMIWeatherPollingSource()
+    if knmi_weather.is_enabled():
+        sources.append(knmi_weather)
+
     return sources
 
 
