@@ -415,7 +415,7 @@ class Settings:
     knmi_api_key: str = os.getenv("KNMI_API_KEY", "").strip()
     # --- Meet je Stad urban climate (#15) ---
     meet_je_stad_enabled: bool = os.getenv("MEET_JE_STAD_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
-    meet_je_stad_api_url: str = os.getenv("MEET_JE_STAD_API_URL", "https://meetjestad.net/data/").strip().rstrip("/")
+    meet_je_stad_api_url: str = os.getenv("MEET_JE_STAD_API_URL", "https://meetjestad.net/data/").strip()
     meet_je_stad_poll_seconds: int = int(os.getenv("MEET_JE_STAD_POLL_SECONDS", "900"))
     # --- BRO groundwater (#16) ---
     bro_enabled: bool = os.getenv("BRO_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
