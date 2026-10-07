@@ -1,0 +1,7 @@
+connector.geo-insights.nl {
+	reverse_proxy connector:8010
+}
+
+monitor.geo-insights.nl {
+	reverse_proxy monitoring:8020
+}
