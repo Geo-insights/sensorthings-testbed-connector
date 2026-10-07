@@ -1,0 +1,47 @@
+services:
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - connector
+      - monitoring
+    restart: unless-stopped
+
+  connector:
+    build:
+      context: ./sensorthings-testbed-connector
+      dockerfile: Dockerfile
+    env_file: ./connector.env
+    volumes:
+      - connector_data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8010/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  monitoring:
+    build:
+      context: ./monitoring_module
+      dockerfile: Dockerfile
+    env_file: ./monitoring.env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8020/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  caddy_data:
+  caddy_config:
+  connector_data:
