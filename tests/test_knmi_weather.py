@@ -19,7 +19,7 @@ import pytest
 
 from app.services.knmi_weather_source import KNMIWeatherPollingSource
 from app.services.rest_polling_source import RestPollingSource
-from app.sources.knmi_weather import build_entity_set, parse_station_measurements
+from app.sources.knmi_weather import build_entity_set, parse_edr_locations, parse_station_measurements
 from app.sources.normalizers import KNMIWeatherNormalizer
 from app.sta.canonical import CanonicalDatastream
 
@@ -426,6 +426,120 @@ class TestBuildEntitySet:
         entity_set = build_entity_set(6260, "De Bilt", 52.10, 5.18)
         for key in entity_set["observed_properties"]:
             assert resolve(key) is not None, f"observed_property {key!r} is not canonical"
+
+
+# ---------------------------------------------------------------------------
+# KNMIWeatherPollingSource
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# parse_edr_locations — KNMI EDR API GeoJSON parser
+# ---------------------------------------------------------------------------
+
+
+class TestParseEdrLocations:
+    def test_extracts_stations_from_geojson(self):
+        data = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "id": "06260",
+                    "geometry": {"type": "Point", "coordinates": [5.18, 52.10]},
+                    "properties": {
+                        "name": "De Bilt",
+                        "ta": 185,  # 0.1 °C
+                        "ff": 32,   # 0.1 m/s
+                        "dd": 225,
+                        "datetime": "2026-10-07T14:00:00Z",
+                    },
+                }
+            ],
+        }
+        stations, readings = parse_edr_locations(data)
+        assert len(stations) == 1
+        assert stations[0]["id"] == "06260"
+        assert stations[0]["lat"] == pytest.approx(52.10)
+        assert stations[0]["lon"] == pytest.approx(5.18)
+        assert len(readings) >= 2
+
+    def test_temperature_scaled_from_deci_celsius(self):
+        data = {
+            "features": [{
+                "id": "06260",
+                "geometry": {"type": "Point", "coordinates": [5.18, 52.10]},
+                "properties": {"ta": 185, "datetime": "2026-10-07T14:00:00Z"},
+            }],
+        }
+        _, readings = parse_edr_locations(data)
+        temp = [r for r in readings if r.observed_property == "temperature"]
+        assert len(temp) == 1
+        assert temp[0].value == pytest.approx(18.5)
+
+    def test_wind_speed_converted_deci_ms_to_kmh(self):
+        data = {
+            "features": [{
+                "id": "06260",
+                "geometry": {"type": "Point", "coordinates": [5.18, 52.10]},
+                "properties": {"ff": 32, "datetime": "2026-10-07T14:00:00Z"},
+            }],
+        }
+        _, readings = parse_edr_locations(data)
+        wind = [r for r in readings if r.observed_property == "wind_speed"]
+        assert len(wind) == 1
+        # 32 * 0.36 = 11.52 km/h
+        assert wind[0].value == pytest.approx(11.52)
+        assert wind[0].unit == "km/h"
+
+    def test_empty_features_returns_empty(self):
+        stations, readings = parse_edr_locations({"features": []})
+        assert stations == []
+        assert readings == []
+
+    def test_feature_without_geometry_skipped(self):
+        data = {
+            "features": [{
+                "id": "06260",
+                "geometry": {},
+                "properties": {"ta": 185},
+            }],
+        }
+        stations, _ = parse_edr_locations(data)
+        assert stations == []
+
+    def test_multiple_stations_all_parsed(self):
+        data = {
+            "features": [
+                {
+                    "id": "06260",
+                    "geometry": {"type": "Point", "coordinates": [5.18, 52.10]},
+                    "properties": {"ta": 185},
+                },
+                {
+                    "id": "06380",
+                    "geometry": {"type": "Point", "coordinates": [5.76, 50.91]},
+                    "properties": {"ta": 172},
+                },
+            ],
+        }
+        stations, _readings = parse_edr_locations(data)
+        assert len(stations) == 2
+        ids = {s["id"] for s in stations}
+        assert "06260" in ids
+        assert "06380" in ids
+
+    def test_unknown_params_ignored(self):
+        data = {
+            "features": [{
+                "id": "06260",
+                "geometry": {"type": "Point", "coordinates": [5.18, 52.10]},
+                "properties": {"unknown_param": 999, "ta": 200},
+            }],
+        }
+        _, readings = parse_edr_locations(data)
+        props = {r.observed_property for r in readings}
+        assert "temperature" in props
+        assert len(props) == 1
 
 
 # ---------------------------------------------------------------------------
