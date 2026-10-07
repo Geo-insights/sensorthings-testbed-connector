@@ -407,10 +407,10 @@ class Settings:
     buienradar_api_url: str = os.getenv("BUIENRADAR_API_URL", "https://data.buienradar.nl/2.0/feed/json").strip()
     buienradar_poll_seconds: int = int(os.getenv("BUIENRADAR_POLL_SECONDS", "600"))
     # --- KNMI weather stations source ---
-    # KNMI Data Platform EDR API (CC-BY-4.0). Free API key from
-    # https://developer.dataplatform.knmi.nl — set KNMI_API_KEY.
+    # Default: Buienradar JSON feed (KNMI station data, no key needed).
+    # Alternative: set KNMI_WEATHER_API_URL to KNMI EDR API + KNMI_API_KEY.
     knmi_weather_enabled: bool = os.getenv("KNMI_WEATHER_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
-    knmi_weather_api_url: str = os.getenv("KNMI_WEATHER_API_URL", "https://api.dataplatform.knmi.nl/edr/v1/collections/observations/locations").strip()
+    knmi_weather_api_url: str = os.getenv("KNMI_WEATHER_API_URL", "https://data.buienradar.nl/2.0/feed/json").strip()
     knmi_weather_poll_seconds: int = int(os.getenv("KNMI_WEATHER_POLL_SECONDS", "600"))
     knmi_api_key: str = os.getenv("KNMI_API_KEY", "").strip()
     # --- Meet je Stad urban climate (#15) ---
