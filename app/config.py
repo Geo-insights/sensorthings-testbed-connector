@@ -389,6 +389,33 @@ class Settings:
     levellog_installation_ids: str = os.getenv("LEVELLOG_INSTALLATION_IDS", "").strip()
     levellog_installations: tuple[dict[str, object], ...] = field(default_factory=_load_levellog_installations)
     levellog_poll_seconds: int = int(os.getenv("LEVELLOG_POLL_SECONDS", "900"))
+    # --- Luchtmeetnet RIVM air quality source (#11) ---
+    luchtmeetnet_enabled: bool = os.getenv("LUCHTMEETNET_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    luchtmeetnet_api_url: str = os.getenv("LUCHTMEETNET_API_URL", "https://api.luchtmeetnet.nl/open_api").strip().rstrip("/")
+    luchtmeetnet_poll_seconds: int = int(os.getenv("LUCHTMEETNET_POLL_SECONDS", "3600"))
+    # --- Sensor.Community citizen air quality (#12) ---
+    sensor_community_enabled: bool = os.getenv("SENSOR_COMMUNITY_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    sensor_community_api_url: str = os.getenv("SENSOR_COMMUNITY_API_URL", "https://data.sensor.community/airrohr/v1/filter/country=NL").strip()
+    sensor_community_poll_seconds: int = int(os.getenv("SENSOR_COMMUNITY_POLL_SECONDS", "300"))
+    # --- Samen Meten RIVM STA federation (#13) ---
+    samen_meten_enabled: bool = os.getenv("SAMEN_METEN_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    samen_meten_api_url: str = os.getenv("SAMEN_METEN_API_URL", "https://api-samenmeten.rivm.nl/v1.0").strip().rstrip("/")
+    samen_meten_poll_seconds: int = int(os.getenv("SAMEN_METEN_POLL_SECONDS", "600"))
+    samen_meten_max_things: int = int(os.getenv("SAMEN_METEN_MAX_THINGS", "500"))
+    # --- Buienradar weather (#14) ---
+    buienradar_enabled: bool = os.getenv("BUIENRADAR_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    buienradar_api_url: str = os.getenv("BUIENRADAR_API_URL", "https://data.buienradar.nl/2.0/feed/json").strip()
+    buienradar_poll_seconds: int = int(os.getenv("BUIENRADAR_POLL_SECONDS", "600"))
+    # --- Meet je Stad urban climate (#15) ---
+    meet_je_stad_enabled: bool = os.getenv("MEET_JE_STAD_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    meet_je_stad_api_url: str = os.getenv("MEET_JE_STAD_API_URL", "https://meetjestad.net/data/").strip().rstrip("/")
+    meet_je_stad_poll_seconds: int = int(os.getenv("MEET_JE_STAD_POLL_SECONDS", "900"))
+    # --- BRO groundwater (#16) ---
+    bro_enabled: bool = os.getenv("BRO_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    bro_api_url: str = os.getenv("BRO_API_URL", "https://publiek.broservices.nl/gm/").strip().rstrip("/")
+    bro_poll_seconds: int = int(os.getenv("BRO_POLL_SECONDS", "3600"))
+    bro_bbox: str = os.getenv("BRO_BBOX", "").strip()
+    bro_max_wells: int = int(os.getenv("BRO_MAX_WELLS", "500"))
     # --- Monitoring module direct push ---
     monitoring_push_url: str = os.getenv("MONITORING_PUSH_URL", "").strip().rstrip("/")
     monitoring_push_key: str = os.getenv("MONITORING_PUSH_KEY", "").strip()

@@ -588,6 +588,31 @@ def _get_enabled_polling_sources() -> list:
     if levellog.is_enabled():
         sources.append(levellog)
 
+    from app.services.luchtmeetnet_source import LuchtmeetnetPollingSource
+    luchtmeetnet = LuchtmeetnetPollingSource()
+    if luchtmeetnet.is_enabled():
+        sources.append(luchtmeetnet)
+
+    from app.services.sensor_community_source import SensorCommunityPollingSource
+    sensor_community = SensorCommunityPollingSource()
+    if sensor_community.is_enabled():
+        sources.append(sensor_community)
+
+    from app.services.meet_je_stad_source import MeetJeStadPollingSource
+    meet_je_stad = MeetJeStadPollingSource()
+    if meet_je_stad.is_enabled():
+        sources.append(meet_je_stad)
+
+    from app.services.bro_groundwater_source import BROGroundwaterPollingSource
+    bro = BROGroundwaterPollingSource()
+    if bro.is_enabled():
+        sources.append(bro)
+
+    from app.services.samen_meten_source import SamenMetenPollingSource
+    samen_meten = SamenMetenPollingSource()
+    if samen_meten.is_enabled():
+        sources.append(samen_meten)
+
     return sources
 
 

@@ -54,6 +54,24 @@ class CanonicalDatastream(StrEnum):
     UV_INDEX = "uv_index"
     WET_BULB_TEMPERATURE = "wet_bulb_temperature"
     EVAPOTRANSPIRATION = "evapotranspiration"
+    # Luchtmeetnet air quality (#11)
+    NO2 = "no2"
+    O3 = "o3"
+    SO2 = "so2"
+    CO = "co"
+    NH3 = "nh3"
+    BENZENE = "benzene"
+    # Sensor.Community noise (#12)
+    NOISE_LAEQ = "noise_laeq"
+    NOISE_LAMIN = "noise_lamin"
+    NOISE_LAMAX = "noise_lamax"
+    # Buienradar weather (#14)
+    VISIBILITY = "visibility"
+    GROUND_TEMPERATURE = "ground_temperature"
+    FEEL_TEMPERATURE = "feel_temperature"
+    # Meet je Stad soil (#15)
+    SOIL_MOISTURE = "soil_moisture"
+    SOIL_TEMPERATURE = "soil_temperature"
 
     @property
     def meta(self) -> DatastreamMeta:
@@ -135,6 +153,63 @@ _META: dict[CanonicalDatastream, DatastreamMeta] = {
     CanonicalDatastream.EVAPOTRANSPIRATION: DatastreamMeta(
         "Evapotranspiration", "mm", f"{_CF}#water_evapotranspiration_amount",
     ),
+    # Luchtmeetnet air quality (#11)
+    CanonicalDatastream.NO2: DatastreamMeta(
+        "Nitrogen dioxide", "ug/m3",
+        f"{_CF}#mass_concentration_of_nitrogen_dioxide_in_air",
+    ),
+    CanonicalDatastream.O3: DatastreamMeta(
+        "Ozone", "ug/m3",
+        f"{_CF}#mass_concentration_of_ozone_in_air",
+    ),
+    CanonicalDatastream.SO2: DatastreamMeta(
+        "Sulfur dioxide", "ug/m3",
+        f"{_CF}#mass_concentration_of_sulfur_dioxide_in_air",
+    ),
+    CanonicalDatastream.CO: DatastreamMeta(
+        "Carbon monoxide", "mg/m3",
+        f"{_CF}#mass_concentration_of_carbon_monoxide_in_air",
+    ),
+    CanonicalDatastream.NH3: DatastreamMeta(
+        "Ammonia", "ug/m3",
+        f"{_CF}#mass_concentration_of_ammonia_in_air",
+    ),
+    CanonicalDatastream.BENZENE: DatastreamMeta(
+        "Benzene", "ug/m3",
+        f"{_CF}#mass_concentration_of_benzene_in_air",
+    ),
+    # Sensor.Community noise (#12)
+    CanonicalDatastream.NOISE_LAEQ: DatastreamMeta(
+        "Noise level (LAeq)", "dB(A)",
+        f"{_CF}#equivalent_continuous_a_weighted_sound_pressure_level_in_air",
+    ),
+    CanonicalDatastream.NOISE_LAMIN: DatastreamMeta(
+        "Noise level minimum (LAmin)", "dB(A)",
+        f"{_CF}#equivalent_continuous_a_weighted_sound_pressure_level_in_air",
+    ),
+    CanonicalDatastream.NOISE_LAMAX: DatastreamMeta(
+        "Noise level maximum (LAmax)", "dB(A)",
+        f"{_CF}#equivalent_continuous_a_weighted_sound_pressure_level_in_air",
+    ),
+    # Buienradar weather (#14)
+    CanonicalDatastream.VISIBILITY: DatastreamMeta(
+        "Visibility", "m", f"{_CF}#visibility_in_air",
+    ),
+    CanonicalDatastream.GROUND_TEMPERATURE: DatastreamMeta(
+        "Ground temperature", "°C", f"{_CF}#soil_temperature",
+    ),
+    CanonicalDatastream.FEEL_TEMPERATURE: DatastreamMeta(
+        "Feels-like temperature", "°C", f"{_CF}#air_temperature",
+    ),
+    # Meet je Stad soil (#15)
+    CanonicalDatastream.SOIL_MOISTURE: DatastreamMeta(
+        "Soil moisture content", "m3/m3",
+        f"{_CF}#volume_fraction_of_water_in_soil",
+    ),
+    CanonicalDatastream.SOIL_TEMPERATURE: DatastreamMeta(
+        "Soil temperature", "°C",
+        f"{_CF}#soil_temperature",
+    ),
 }
 
 
@@ -163,6 +238,26 @@ _ALIASES: dict[str, CanonicalDatastream] = {
     "ultravioletindex": CanonicalDatastream.UV_INDEX,
     "wetbulbtemperature": CanonicalDatastream.WET_BULB_TEMPERATURE,
     "et": CanonicalDatastream.EVAPOTRANSPIRATION,
+    # Luchtmeetnet formulas
+    "nitrogendioxide": CanonicalDatastream.NO2,
+    "ozone": CanonicalDatastream.O3,
+    "sulfurdioxide": CanonicalDatastream.SO2,
+    "carbonmonoxide": CanonicalDatastream.CO,
+    "ammonia": CanonicalDatastream.NH3,
+    "c6h6": CanonicalDatastream.BENZENE,
+    # Sensor.Community value_types
+    "p1": CanonicalDatastream.PM10,
+    "noise_laeq": CanonicalDatastream.NOISE_LAEQ,
+    "noise_lamin": CanonicalDatastream.NOISE_LAMIN,
+    "noise_lamax": CanonicalDatastream.NOISE_LAMAX,
+    # Buienradar
+    "groundtemperature": CanonicalDatastream.GROUND_TEMPERATURE,
+    "feeltemperature": CanonicalDatastream.FEEL_TEMPERATURE,
+    "sunpower": CanonicalDatastream.SOLAR_RADIATION,
+    "rainfalllasthour": CanonicalDatastream.PRECIPITATION,
+    # Meet je Stad
+    "soilmoisture": CanonicalDatastream.SOIL_MOISTURE,
+    "soiltemperature": CanonicalDatastream.SOIL_TEMPERATURE,
 }
 
 

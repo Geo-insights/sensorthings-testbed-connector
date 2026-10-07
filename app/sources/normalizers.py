@@ -43,6 +43,26 @@ class LevellogNormalizer(Normalizer):
     }
 
 
+class MeetJeStadNormalizer(Normalizer):
+    """Meet je Stad LoRaWAN sensors: temperature, humidity, PM, soil."""
+
+    temperature: float | None = None
+    humidity: float | None = None
+    pm2_5: float | None = None
+    pm10: float | None = None
+    soil_moisture: float | None = None
+    soil_temperature: float | None = None
+
+    NAME_TRANSFORM: ClassVar[dict[str, CanonicalDatastream]] = {
+        "temperature": CanonicalDatastream.TEMPERATURE,
+        "humidity": CanonicalDatastream.HUMIDITY,
+        "pm2_5": CanonicalDatastream.PM2_5,
+        "pm10": CanonicalDatastream.PM10,
+        "soil_moisture": CanonicalDatastream.SOIL_MOISTURE,
+        "soil_temperature": CanonicalDatastream.SOIL_TEMPERATURE,
+    }
+
+
 class TGVMeasurementNormalizer:
     """Normalize a single TGV Avro measurement via the device mapping table.
 
