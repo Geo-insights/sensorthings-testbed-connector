@@ -168,7 +168,13 @@ class BROGroundwaterPollingSource(RestPollingSource):
                 resp.raise_for_status()
                 xml_text = resp.text
         except httpx.HTTPStatusError as exc:
-            logger.exception("BRO: GMW search failed (HTTP %d)", exc.response.status_code)
+            if exc.response.status_code == 400:
+                logger.error(
+                    "BRO: GMW search rejected (HTTP 400) — bbox may be too "
+                    "large. Try a smaller BRO_BBOX (max ~0.1 x 0.1 degrees)."
+                )
+            else:
+                logger.exception("BRO: GMW search failed (HTTP %d)", exc.response.status_code)
             return
         except Exception:
             logger.exception("BRO: GMW search request failed")
