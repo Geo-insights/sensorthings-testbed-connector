@@ -1,7 +1,7 @@
 # SensorThings Testbed Connector
 
 ## What this project is
-FastAPI service that consumes sensor data from multiple sources (TGV Kafka, Ohnics, Levellog, bridge sensors) and pushes it to one or more OGC SensorThings FROST servers. Handles entity registration, observation posting, and multi-target fan-out.
+FastAPI service that consumes sensor data from 10 sources and pushes to one or more OGC SensorThings FROST servers. Handles entity registration, observation posting, and multi-target fan-out.
 
 ## Relationship to main project
 Standalone service that feeds real-time sensor data into FROST servers consumed by the monitoring_module and Geo-Insights-MVP. Shares no database with the other services — all state is in local JSON entity caches and Kafka offsets.
@@ -12,15 +12,34 @@ Same as main Geo Insights project:
 - Iust Kuipers (CTO): technical lead, architecture owner
 
 ## Architecture
-- `app/main.py` — FastAPI app with persistent Kafka consumer in background thread
+- `app/main.py` — FastAPI app with Kafka consumer + polling source loops in background tasks
 - `app/config.py` — Settings from env vars, FROST target parsing, datastream map loading
 - `app/routes/` — health and connector control endpoints
 - `app/services/sensorthings_client.py` — SensorThings entity registration and observation posting
+- `app/services/rest_polling_source.py` — Intermediate base class for REST polling sources (error handling, zero-discovery alerting)
+- `app/services/polling_source.py` — Abstract base class (PollingSource ABC)
 - `app/sta/models.py` — Pydantic models for OGC SensorThings entities (Sensor, Thing, Datastream, Observation, etc.)
+- `app/sta/canonical.py` — Canonical datastream enum (35 members) + unit/CF metadata + resolve()
 - `app/frost/` — Per-target FROST stack: HTTP client, entity cache, entity manager, v2 adapter, circuit breaker
-- `app/sources/` — Source-specific Kafka message mapping (TGV, bridge, Ohnics, Levellog)
+- `app/sources/` — Source-specific parsers, normalizers, and entity builders
 - `data/` — Persistent entity caches (`registered_entities.json`, `entities_{target}.json`)
 - `scripts/` — Utility scripts (catchup, discovery, demo reset)
+
+### Data sources (10)
+| Source | Type | Module | Poll interval |
+|--------|------|--------|---------------|
+| TGV Kafka | Avro stream | `app/pipeline/kafka_tgv.py` | Continuous |
+| Bridge | MQTT | `app/sources/bridge_source.py` | Continuous |
+| Ohnics | REST poll | `app/services/ohnics_source.py` | 300s |
+| Levellog | REST poll (OAuth2) | `app/services/levellog_source.py` | 900s |
+| Luchtmeetnet | REST poll | `app/services/luchtmeetnet_source.py` | 3600s |
+| Sensor.Community | REST poll | `app/services/sensor_community_source.py` | 300s |
+| Samen Meten | STA federation | `app/services/samen_meten_source.py` | 600s |
+| KNMI weather | REST poll | `app/services/knmi_weather_source.py` | 600s |
+| Meet je Stad | REST poll | `app/services/meet_je_stad_source.py` | 900s |
+| BRO groundwater | REST poll (multi-step) | `app/services/bro_groundwater_source.py` | 3600s |
+
+All REST polling sources extend `RestPollingSource` and are disabled by default (`*_ENABLED=false`). Each source has a parser in `app/sources/` and a service in `app/services/`.
 
 ## Stack
 - Python 3.12 (Dockerfile: `python:3.12-slim`)
@@ -51,7 +70,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8010
 
 ## Verified commands
 ```bash
-# Unit tests (383 tests, ~14s, excludes integration by default)
+# Unit tests (747 tests, ~14s, excludes integration by default)
 python -m pytest tests/ -q
 
 # Integration tests (needs Docker: docker compose -f docker-compose.test.yaml up -d)
