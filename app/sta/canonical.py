@@ -8,6 +8,10 @@ from ``.meta`` — never pass a source-provided unit string through to FROST.
 Unit symbols follow pragmatic UCUM (``°C`` not ``Cel``, ``ppm`` not
 ``[ppm]``, ``deg`` not ``degrees``) so dashboards stay readable while every
 target FROST server sees identical strings across sources.
+
+Governance: this enum covers *environmental observations* only.  Device
+telemetry fields (battery voltage, RSSI, etc.) do not belong here — they
+should travel via a separate telemetry channel if needed.
 """
 
 from __future__ import annotations

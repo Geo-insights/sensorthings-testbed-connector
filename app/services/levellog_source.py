@@ -9,18 +9,19 @@ from typing import Any
 from app.config import settings
 from app.models import SensorReading
 from app.services.api_client import AsyncAPIClient, OAuth2ClientCredentials
-from app.services.polling_source import PollingSource
+from app.services.rest_polling_source import RestPollingSource
 from app.sources.levellog import build_entity_set, parse_logdata_readings
 
 logger = logging.getLogger("connector.levellog")
 
 
-class LevellogPollingSource(PollingSource):
+class LevellogPollingSource(RestPollingSource):
     """Polls the CARS Online API for groundwater level readings."""
 
     source_name = "levellog"
 
     def __init__(self) -> None:
+        super().__init__()
         self._oauth = OAuth2ClientCredentials(
             token_url=settings.levellog_token_url,
             client_id=settings.levellog_client_id,
@@ -53,7 +54,7 @@ class LevellogPollingSource(PollingSource):
                 sets.append(build_entity_set(name, inst_id))
         return sets
 
-    async def fetch_readings(self) -> list[SensorReading]:
+    async def _do_fetch_readings(self) -> list[SensorReading]:
         """Fetch latest groundwater readings from CARS API."""
         if not self._installations:
             logger.warning("Levellog: no installations configured")
@@ -74,12 +75,6 @@ class LevellogPollingSource(PollingSource):
             readings = await self._fetch_installation(client, inst)
             all_readings.extend(readings)
 
-        if all_readings:
-            logger.info(
-                "Levellog: fetched %d readings from %d installation(s)",
-                len(all_readings),
-                len(self._installations),
-            )
         return all_readings
 
     async def _fetch_installation(
