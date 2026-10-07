@@ -8,18 +8,20 @@ from typing import Any
 from app.config import settings
 from app.models import SensorReading
 from app.services.api_client import AsyncAPIClient
-from app.services.polling_source import PollingSource
+from app.services.rest_polling_source import RestPollingSource
 from app.sources.ohnics import build_entity_set, parse_sensor_readings
 
 logger = logging.getLogger("connector.ohnics")
 
 
-class OhnicsPollingSource(PollingSource):
+class OhnicsPollingSource(RestPollingSource):
     """Polls the Ohnics 5min.json endpoint for air quality readings in Delft."""
 
     source_name = "ohnics"
+    uses_dynamic_discovery = True
 
     def __init__(self) -> None:
+        super().__init__()
         self._client = AsyncAPIClient(
             headers={"User-Agent": "GeoInsights-Connector/1.0"},
             verify_ssl=False,  # ohnics.online has a TLS cert issue
@@ -44,17 +46,10 @@ class OhnicsPollingSource(PollingSource):
             sets.append(build_entity_set(name, lat, lon, props))
         return sets
 
-    async def fetch_readings(self) -> list[SensorReading]:
-        """Fetch latest 5-min readings from Ohnics and return SensorReadings for Delft sensors."""
-        from app.services.health_monitor import health_monitor
-
+    async def _do_fetch_readings(self) -> list[SensorReading]:
+        """Fetch latest 5-min readings from Ohnics for Delft sensors."""
         url = settings.ohnics_api_url
-        try:
-            data = await self._client.get(url)
-        except Exception as exc:
-            logger.exception("Failed to fetch Ohnics data from %s", url)
-            health_monitor.record_source_error("ohnics", f"{type(exc).__name__}: {exc}")
-            return []
+        data = await self._client.get(url)
 
         if not isinstance(data, list):
             logger.warning("Ohnics response is not a list (got %s)", type(data).__name__)
@@ -78,6 +73,4 @@ class OhnicsPollingSource(PollingSource):
             readings = parse_sensor_readings(sensor_data)
             all_readings.extend(readings)
 
-        if all_readings:
-            logger.info("Ohnics: fetched %d readings from %d Delft sensors", len(all_readings), len(self._discovered_sensors))
         return all_readings
