@@ -156,15 +156,11 @@ class BROGroundwaterPollingSource(RestPollingSource):
 
         # BRO returns XML — use httpx directly instead of AsyncAPIClient.post()
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
                 resp = await client.post(
                     f"{settings.bro_api_url}/gmw/v1/characteristics/searches",
                     json=body,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Accept": "application/xml",
-                        "User-Agent": "GeoInsights-Connector/1.0",
-                    },
+                    headers={"User-Agent": "GeoInsights-Connector/1.0"},
                 )
                 if resp.status_code == 429:
                     logger.warning("BRO: GMW search received HTTP 429 (rate limited)")
