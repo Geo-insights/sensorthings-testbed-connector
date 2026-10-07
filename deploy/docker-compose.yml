@@ -35,6 +35,9 @@ services:
       args:
         - VITE_SUPABASE_URL=${VITE_SUPABASE_URL}
         - VITE_SUPABASE_ANON_KEY=${VITE_SUPABASE_ANON_KEY}
+        - VITE_QA_BYPASS=${VITE_QA_BYPASS}
+        - VITE_QA_USER=${VITE_QA_USER}
+        - VITE_QA_PASSWORD=${VITE_QA_PASSWORD}
     env_file: ./monitoring.env
     restart: unless-stopped
     healthcheck:
