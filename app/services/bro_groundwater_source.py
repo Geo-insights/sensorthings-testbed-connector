@@ -120,7 +120,14 @@ class BROGroundwaterPollingSource(RestPollingSource):
     # ------------------------------------------------------------------
 
     async def _discover_wells(self) -> None:
-        """POST /gmw/v1/objects/search to find wells within the configured bbox."""
+        """POST /gmw/v1/characteristics/searches to find wells in the bbox.
+
+        The BRO API returns XML (not JSON), so we parse the response with
+        xml.etree.ElementTree instead of relying on AsyncAPIClient.post()
+        which calls resp.json().
+        """
+        import xml.etree.ElementTree as ET
+
         bbox = settings.bro_bbox.strip()
         if not bbox:
             logger.warning(
@@ -147,31 +154,57 @@ class BROGroundwaterPollingSource(RestPollingSource):
             }
         }
 
+        # BRO returns XML — use httpx directly instead of AsyncAPIClient.post()
         try:
-            response = await self._client.post(
-                "/gmw/v1/objects/search",
-                json_body=body,
-            )
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 429:
-                logger.warning(
-                    "BRO: GMW search received HTTP 429 (rate limited) — "
-                    "well discovery skipped this cycle"
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    f"{settings.bro_api_url}/gmw/v1/characteristics/searches",
+                    json=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Accept": "application/xml",
+                        "User-Agent": "GeoInsights-Connector/1.0",
+                    },
                 )
-            else:
-                logger.exception("BRO: GMW search request failed (HTTP %d)", exc.response.status_code)
+                if resp.status_code == 429:
+                    logger.warning("BRO: GMW search received HTTP 429 (rate limited)")
+                    return
+                resp.raise_for_status()
+                xml_text = resp.text
+        except httpx.HTTPStatusError as exc:
+            logger.exception("BRO: GMW search failed (HTTP %d)", exc.response.status_code)
             return
         except Exception:
             logger.exception("BRO: GMW search request failed")
             return
 
-        if not isinstance(response, dict):
-            logger.warning(
-                "BRO: GMW search returned unexpected type %s", type(response).__name__
-            )
+        # Parse XML response to extract well BRO IDs and coordinates
+        try:
+            root = ET.fromstring(xml_text)
+        except ET.ParseError:
+            logger.exception("BRO: failed to parse GMW search XML response")
             return
 
-        wells = discover_wells(response, max_wells=settings.bro_max_wells)
+        # Build a JSON-like structure that discover_wells() can consume
+        ns = {"gml": "http://www.opengis.net/gml/3.2"}
+        bro_objects: list[dict[str, Any]] = []
+        for elem in root.iter():
+            bro_id_el = elem.find(".//broId") if elem.tag.endswith("GMW_C") else None
+            if bro_id_el is None:
+                # Try matching on any element with a broId child
+                bro_id_el = elem.find("broId")
+            if bro_id_el is not None and bro_id_el.text:
+                obj: dict[str, Any] = {"broId": bro_id_el.text.strip()}
+                # Try to find coordinates in gml:pos
+                pos_el = elem.find(".//gml:pos", ns)
+                if pos_el is not None and pos_el.text:
+                    obj["deliveredLocation"] = {
+                        "location": {"pos": pos_el.text.strip()}
+                    }
+                bro_objects.append(obj)
+
+        response_dict = {"broObjects": bro_objects}
+        wells = discover_wells(response_dict, max_wells=settings.bro_max_wells)
         for w in wells:
             well_id = w["well_id"]
             if well_id not in self._discovered_wells:
