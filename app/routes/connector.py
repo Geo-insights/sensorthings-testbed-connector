@@ -342,6 +342,18 @@ def freshness(response: Response) -> dict:
         thresholds["ohnics"] = settings.ohnics_poll_seconds + grace
     if settings.levellog_enabled:
         thresholds["levellog"] = settings.levellog_poll_seconds + grace
+    if settings.luchtmeetnet_enabled:
+        thresholds["luchtmeetnet"] = settings.luchtmeetnet_poll_seconds + grace
+    if settings.sensor_community_enabled:
+        thresholds["sensor_community"] = settings.sensor_community_poll_seconds + grace
+    if settings.samen_meten_enabled:
+        thresholds["samen_meten"] = settings.samen_meten_poll_seconds + grace
+    if settings.knmi_weather_enabled:
+        thresholds["knmi_weather"] = settings.knmi_weather_poll_seconds + grace
+    if settings.meet_je_stad_enabled:
+        thresholds["meet_je_stad"] = settings.meet_je_stad_poll_seconds + grace
+    if settings.bro_enabled:
+        thresholds["bro_groundwater"] = settings.bro_poll_seconds + grace
 
     result = health_monitor.source_freshness(thresholds)
     if result["any_stale"]:
