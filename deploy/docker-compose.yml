@@ -32,6 +32,9 @@ services:
     build:
       context: ./monitoring_module
       dockerfile: Dockerfile
+      args:
+        - VITE_SUPABASE_URL=${VITE_SUPABASE_URL}
+        - VITE_SUPABASE_ANON_KEY=${VITE_SUPABASE_ANON_KEY}
     env_file: ./monitoring.env
     restart: unless-stopped
     healthcheck:
