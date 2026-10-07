@@ -49,3 +49,4 @@ ssh geo@<IP> "cd /opt/geo-insights && docker compose logs -f connector --tail 50
 # Resource usage
 ssh geo@<IP> "docker stats --no-stream"
 ```
+# webhook test 2026-10-07T19:47:54Z
