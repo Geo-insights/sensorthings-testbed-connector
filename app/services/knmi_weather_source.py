@@ -120,20 +120,23 @@ class KNMIWeatherPollingSource(RestPollingSource):
         if base_url.endswith("/locations"):
             base_url = base_url[: -len("/locations")]
 
-        # Build params dict -- httpx encodes these correctly without
-        # double-encoding the POLYGON WKT spaces.
-        params = {
-            "coords": "POLYGON((3.3 50.7,7.2 50.7,7.2 53.5,3.3 53.5,3.3 50.7))",
-            "parameter-name": "ta,tg,ff,dd,fxx,pp,rh,vv,rg,r1h",
-            "datetime": f"{start}/{end}",
-        }
+        # The KNMI EDR API requires literal unencoded WKT in the coords
+        # parameter. httpx and requests both encode parentheses/commas/spaces
+        # when using params=. Build the raw URL and pass it directly.
+        url = (
+            f"{base_url}/area"
+            f"?coords=POLYGON((3.3 50.7,7.2 50.7,7.2 53.5,3.3 53.5,3.3 50.7))"
+            f"&parameter-name=ta,tg,ff,dd,fxx,pp,rh,vv,rg,r1h"
+            f"&datetime={start}/{end}"
+        )
 
         headers = {"User-Agent": "GeoInsights-Connector/1.0"}
         if settings.knmi_api_key:
             headers["Authorization"] = settings.knmi_api_key
 
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            resp = await client.get(f"{base_url}/area", params=params, headers=headers)
+            # Use httpx.URL to prevent re-encoding the pre-built query string
+            resp = await client.get(httpx.URL(url, encoded=True), headers=headers)
             resp.raise_for_status()
             data = resp.json()
 
