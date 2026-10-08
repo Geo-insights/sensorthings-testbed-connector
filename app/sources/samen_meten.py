@@ -37,13 +37,21 @@ _SM_NAME_MAP: dict[str, str] = {
     "particulate matter < 2.5 um": "pm2_5",
     "pm2.5": "pm2_5",
     "pm25": "pm2_5",
+    "pm25_kal": "pm2_5",
     "fijnstof pm2.5": "pm2_5",
     "fijnstof pm25": "pm2_5",
     "pm 2.5": "pm2_5",
     "particulate matter < 10 µm": "pm10",
     "particulate matter < 10 um": "pm10",
+    "pm10_kal": "pm10",
     "fijnstof pm10": "pm10",
     "pm 10": "pm10",
+    # Datastream name suffixes (Samen Meten DS names: "SENSOR-6-rh")
+    "rh": "relative_humidity",
+    "temp": "temperature",
+    "no2": "no2",
+    "o3": "o3",
+    "nh3": "nh3",
 }
 
 
@@ -146,14 +154,20 @@ def parse_things_response(data: dict[str, Any]) -> list[dict[str, Any]]:
             if not ds_id:
                 continue
 
+            # Try ObservedProperty expand first, fall back to Datastream name
             op = ds.get("ObservedProperty")
-            if not isinstance(op, dict):
-                continue
-            op_name = str(op.get("name", "")).strip()
+            if isinstance(op, dict) and op.get("name"):
+                op_name = str(op["name"]).strip()
+            else:
+                # Samen Meten DS names look like "SENSOR-6-rh" or "SENSOR-12-pm25_kal"
+                # Extract the suffix after the last dash as the property hint
+                ds_name = str(ds.get("name", ""))
+                op_name = ds_name.rsplit("-", 1)[-1] if "-" in ds_name else ds_name
+
             canonical = _map_observed_property_name(op_name)
             if canonical is None:
                 logger.debug(
-                    "samen_meten: Thing %s DS %s observed_property %r — not canonical, skipped",
+                    "samen_meten: Thing %s DS %s property %r — not canonical, skipped",
                     thing_id, ds_id, op_name,
                 )
                 continue
