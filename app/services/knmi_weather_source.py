@@ -131,7 +131,7 @@ class KNMIWeatherPollingSource(RestPollingSource):
         raw_url = (
             f"{base_url}/area"
             f"?coords=POLYGON((3.3 50.7,7.2 50.7,7.2 53.5,3.3 53.5,3.3 50.7))"
-            f"&parameter-name=ta,tg,ff,dd,fxx,pp,rh,vv,rg,r1h"
+            f"&parameter-name=ta,tg,ff,dd,pp,rh,vv,rg"
             f"&datetime={start}/{end}"
         )
 
