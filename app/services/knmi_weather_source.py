@@ -10,6 +10,7 @@ Also supports the legacy Buienradar JSON feed for backward compatibility
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from typing import Any
 
 from app.config import settings
@@ -38,6 +39,7 @@ class KNMIWeatherPollingSource(RestPollingSource):
             headers["Authorization"] = settings.knmi_api_key
         self._client = AsyncAPIClient(headers=headers)
         self._discovered_stations: dict[str, dict[str, Any]] = {}
+        self._station_names: dict[str, str] = {}
         self._is_buienradar = "buienradar" in settings.knmi_weather_api_url.lower()
 
     def is_enabled(self) -> bool:
@@ -67,22 +69,18 @@ class KNMIWeatherPollingSource(RestPollingSource):
         """Fetch latest KNMI station readings.
 
         Auto-detects the response format:
-        - KNMI EDR API → GeoJSON FeatureCollection (default)
+        - KNMI EDR API → CoverageJSON via ``/area`` query
         - Buienradar feed → ``actual.stationmeasurements`` array (legacy)
         """
-        url = settings.knmi_weather_api_url
-        data = await self._client.get(url)
-
-        if not isinstance(data, dict):
-            logger.warning("KNMI weather response is not a dict (got %s)", type(data).__name__)
-            return []
-
-        # Auto-detect: Buienradar feed has "actual.stationmeasurements"
-        if self._is_buienradar or "actual" in data:
+        if self._is_buienradar:
+            data = await self._client.get(settings.knmi_weather_api_url)
+            if not isinstance(data, dict):
+                logger.warning("KNMI weather response is not a dict (got %s)", type(data).__name__)
+                return []
             return self._parse_buienradar(data)
 
-        # KNMI EDR API returns GeoJSON FeatureCollection
-        return self._parse_edr(data)
+        # KNMI EDR API: use /area query to get all NL stations in one request
+        return await self._fetch_edr()
 
     def _parse_buienradar(self, data: dict[str, Any]) -> list[SensorReading]:
         """Parse Buienradar JSON feed (legacy path)."""
@@ -106,9 +104,38 @@ class KNMIWeatherPollingSource(RestPollingSource):
 
         return parse_station_measurements(measurements)
 
-    def _parse_edr(self, data: dict[str, Any]) -> list[SensorReading]:
-        """Parse KNMI EDR API GeoJSON response."""
-        stations, readings = parse_edr_locations(data)
+    async def _fetch_edr(self) -> list[SensorReading]:
+        """Fetch all NL stations via KNMI EDR /area query (CoverageJSON)."""
+        from datetime import timedelta
+
+        now = datetime.now(UTC)
+        start = (now - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # Netherlands bounding box polygon
+        base_url = settings.knmi_weather_api_url.rstrip("/")
+        # Strip /locations if present (config may still have the old path)
+        if base_url.endswith("/locations"):
+            base_url = base_url[: -len("/locations")]
+
+        url = (
+            f"{base_url}/area"
+            f"?coords=POLYGON((3.3 50.7,7.2 50.7,7.2 53.5,3.3 53.5,3.3 50.7))"
+            f"&parameter-name=ta,tg,ff,dd,fxx,pp,rh,vv,rg,r1h"
+            f"&datetime={start}/{end}"
+        )
+
+        data = await self._client.get(url)
+
+        if not isinstance(data, dict):
+            logger.warning("KNMI EDR response is not a dict (got %s)", type(data).__name__)
+            return []
+
+        # Build station name map from /locations (cached after first call)
+        if not self._station_names:
+            await self._load_station_names()
+
+        stations, readings = parse_edr_locations(data, station_names=self._station_names)
 
         for st in stations:
             sid = st["id"]
@@ -120,3 +147,19 @@ class KNMIWeatherPollingSource(RestPollingSource):
                 )
 
         return readings
+
+    async def _load_station_names(self) -> None:
+        """Fetch station metadata from /locations for name mapping."""
+        base_url = settings.knmi_weather_api_url.rstrip("/")
+        if base_url.endswith("/locations"):
+            base_url = base_url[: -len("/locations")]
+        try:
+            data = await self._client.get(f"{base_url}/locations")
+            if isinstance(data, dict):
+                for feature in data.get("features", []):
+                    fid = feature.get("id", "")
+                    name = feature.get("properties", {}).get("name", str(fid))
+                    self._station_names[str(fid)] = str(name)
+                logger.info("KNMI: loaded %d station names", len(self._station_names))
+        except Exception:
+            logger.warning("KNMI: could not load station names, using coordinates")

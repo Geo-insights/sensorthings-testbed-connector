@@ -438,108 +438,93 @@ class TestBuildEntitySet:
 # ---------------------------------------------------------------------------
 
 
-class TestParseEdrLocations:
-    def test_extracts_stations_from_geojson(self):
-        data = {
-            "type": "FeatureCollection",
-            "features": [
-                {
-                    "id": "06260",
-                    "geometry": {"type": "Point", "coordinates": [5.18, 52.10]},
-                    "properties": {
-                        "name": "De Bilt",
-                        "ta": 185,  # 0.1 °C
-                        "ff": 32,   # 0.1 m/s
-                        "dd": 225,
-                        "datetime": "2026-10-07T14:00:00Z",
-                    },
-                }
-            ],
+def _make_coverage(lon: float, lat: float, timestamps: list[str], **ranges: list) -> dict:
+    """Build a CoverageJSON Coverage for testing."""
+    cov: dict = {
+        "type": "Coverage",
+        "domain": {
+            "type": "Domain",
+            "domainType": "PointSeries",
+            "axes": {
+                "x": {"values": [lon]},
+                "y": {"values": [lat]},
+                "t": {"values": timestamps},
+            },
+        },
+        "ranges": {},
+    }
+    for param, values in ranges.items():
+        cov["ranges"][param] = {
+            "type": "NdArray",
+            "dataType": "float",
+            "values": values,
         }
+    return cov
+
+
+def _make_cov_collection(*coverages: dict) -> dict:
+    return {"type": "CoverageCollection", "coverages": list(coverages)}
+
+
+class TestParseEdrLocations:
+    def test_extracts_stations_from_coveragejson(self):
+        cov = _make_coverage(5.18, 52.10, ["2026-10-07T14:00:00Z"], ta=[18.5], ff=[3.2], dd=[225.0])
+        data = _make_cov_collection(cov)
         stations, readings = parse_edr_locations(data)
         assert len(stations) == 1
-        assert stations[0]["id"] == "06260"
         assert stations[0]["lat"] == pytest.approx(52.10)
         assert stations[0]["lon"] == pytest.approx(5.18)
         assert len(readings) >= 2
 
-    def test_temperature_scaled_from_deci_celsius(self):
-        data = {
-            "features": [{
-                "id": "06260",
-                "geometry": {"type": "Point", "coordinates": [5.18, 52.10]},
-                "properties": {"ta": 185, "datetime": "2026-10-07T14:00:00Z"},
-            }],
-        }
+    def test_temperature_in_real_celsius(self):
+        cov = _make_coverage(5.18, 52.10, ["2026-10-07T14:00:00Z"], ta=[18.5])
+        data = _make_cov_collection(cov)
         _, readings = parse_edr_locations(data)
         temp = [r for r in readings if r.observed_property == "temperature"]
         assert len(temp) == 1
         assert temp[0].value == pytest.approx(18.5)
 
-    def test_wind_speed_converted_deci_ms_to_kmh(self):
-        data = {
-            "features": [{
-                "id": "06260",
-                "geometry": {"type": "Point", "coordinates": [5.18, 52.10]},
-                "properties": {"ff": 32, "datetime": "2026-10-07T14:00:00Z"},
-            }],
-        }
+    def test_wind_speed_converted_ms_to_kmh(self):
+        cov = _make_coverage(5.18, 52.10, ["2026-10-07T14:00:00Z"], ff=[3.2])
+        data = _make_cov_collection(cov)
         _, readings = parse_edr_locations(data)
         wind = [r for r in readings if r.observed_property == "wind_speed"]
         assert len(wind) == 1
-        # 32 * 0.36 = 11.52 km/h
+        # 3.2 m/s * 3.6 = 11.52 km/h
         assert wind[0].value == pytest.approx(11.52)
         assert wind[0].unit == "km/h"
 
-    def test_empty_features_returns_empty(self):
-        stations, readings = parse_edr_locations({"features": []})
+    def test_empty_coverages_returns_empty(self):
+        stations, readings = parse_edr_locations({"coverages": []})
         assert stations == []
         assert readings == []
 
-    def test_feature_without_geometry_skipped(self):
-        data = {
-            "features": [{
-                "id": "06260",
-                "geometry": {},
-                "properties": {"ta": 185},
-            }],
-        }
-        stations, _ = parse_edr_locations(data)
+    def test_coverage_without_coordinates_skipped(self):
+        cov = {"type": "Coverage", "domain": {"axes": {}}, "ranges": {"ta": {"values": [18.5]}}}
+        stations, _ = parse_edr_locations({"coverages": [cov]})
         assert stations == []
 
     def test_multiple_stations_all_parsed(self):
-        data = {
-            "features": [
-                {
-                    "id": "06260",
-                    "geometry": {"type": "Point", "coordinates": [5.18, 52.10]},
-                    "properties": {"ta": 185},
-                },
-                {
-                    "id": "06380",
-                    "geometry": {"type": "Point", "coordinates": [5.76, 50.91]},
-                    "properties": {"ta": 172},
-                },
-            ],
-        }
-        stations, _readings = parse_edr_locations(data)
+        cov1 = _make_coverage(5.18, 52.10, ["2026-10-07T14:00:00Z"], ta=[18.5])
+        cov2 = _make_coverage(5.76, 50.91, ["2026-10-07T14:00:00Z"], ta=[17.2])
+        data = _make_cov_collection(cov1, cov2)
+        stations, _ = parse_edr_locations(data)
         assert len(stations) == 2
-        ids = {s["id"] for s in stations}
-        assert "06260" in ids
-        assert "06380" in ids
 
     def test_unknown_params_ignored(self):
-        data = {
-            "features": [{
-                "id": "06260",
-                "geometry": {"type": "Point", "coordinates": [5.18, 52.10]},
-                "properties": {"unknown_param": 999, "ta": 200},
-            }],
-        }
+        cov = _make_coverage(5.18, 52.10, ["2026-10-07T14:00:00Z"], ta=[20.0], unknown_param=[999])
+        data = _make_cov_collection(cov)
         _, readings = parse_edr_locations(data)
         props = {r.observed_property for r in readings}
         assert "temperature" in props
         assert len(props) == 1
+
+    def test_uses_latest_timestamp(self):
+        cov = _make_coverage(5.18, 52.10, ["2026-10-07T13:50:00Z", "2026-10-07T14:00:00Z"], ta=[17.0, 18.5])
+        data = _make_cov_collection(cov)
+        _, readings = parse_edr_locations(data)
+        temp = [r for r in readings if r.observed_property == "temperature"]
+        assert temp[0].value == pytest.approx(18.5)  # latest value
 
 
 # ---------------------------------------------------------------------------
