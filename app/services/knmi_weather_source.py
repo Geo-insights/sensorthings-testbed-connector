@@ -120,12 +120,13 @@ class KNMIWeatherPollingSource(RestPollingSource):
 
         # The KNMI EDR API requires literal unencoded WKT in the coords
         # parameter (spaces, parentheses, commas must NOT be percent-encoded).
-        # httpx always re-encodes query strings, so use requests in a thread.
+        # Both httpx and requests re-encode URLs. Use a PreparedRequest with
+        # the raw URL injected after preparation to bypass encoding.
         import asyncio
 
         import requests as req
 
-        url = (
+        raw_url = (
             f"{base_url}/area"
             f"?coords=POLYGON((3.3 50.7,7.2 50.7,7.2 53.5,3.3 53.5,3.3 50.7))"
             f"&parameter-name=ta,tg,ff,dd,fxx,pp,rh,vv,rg,r1h"
@@ -137,7 +138,11 @@ class KNMIWeatherPollingSource(RestPollingSource):
             headers["Authorization"] = settings.knmi_api_key
 
         def _do_request() -> dict:
-            resp = req.get(url, headers=headers, timeout=30)
+            s = req.Session()
+            prepared = req.Request("GET", raw_url, headers=headers).prepare()
+            # Override the encoded URL with the raw one
+            prepared.url = raw_url
+            resp = s.send(prepared, timeout=30)
             resp.raise_for_status()
             return resp.json()
 
