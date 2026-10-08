@@ -116,54 +116,73 @@ class LuchtmeetnetPollingSource(RestPollingSource):
         return all_readings
 
     async def _discover_stations(self, client: AsyncAPIClient) -> None:
-        """Populate ``_discovered_stations`` from the /stations endpoint."""
+        """Populate ``_discovered_stations`` from the /stations endpoint.
+
+        The API paginates at 25 stations per page. We follow all pages.
+        """
         logger.info("Luchtmeetnet: discovering stations from %s/stations", self._base_url)
-        try:
-            resp = await client.get("/stations")
-        except Exception:
-            logger.exception("Luchtmeetnet: failed to fetch station list")
-            return
+        page = 1
+        max_pages = 20  # safety cap
 
-        stations: list[Any] = []
-        if isinstance(resp, list):
-            stations = resp
-        elif isinstance(resp, dict):
-            # Some API versions wrap in {"data": [...]} or {"stations": [...]}
-            fallback: list[Any] = resp.get("stations", []) or []
-            stations = resp.get("data", fallback) or []
-
-        for station in stations:
-            if not isinstance(station, dict):
-                continue
-            number = str(station.get("number", "")).strip()
-            if not number:
-                continue
-
-            name = str(station.get("location", number)).strip() or number
-            lat_raw = station.get("latitude")
-            lon_raw = station.get("longitude")
-            components_raw = station.get("components", "")
-
+        while page <= max_pages:
             try:
-                lat = float(lat_raw) if lat_raw is not None else 52.0
-                lon = float(lon_raw) if lon_raw is not None else 5.0
-            except (ValueError, TypeError):
-                lat, lon = 52.0, 5.0
+                resp = await client.get("/stations", params={"page": str(page), "per_page": "100"})
+            except Exception:
+                logger.exception("Luchtmeetnet: failed to fetch station list (page %d)", page)
+                break
 
-            # components may be a comma-separated string or a list
-            if isinstance(components_raw, str):
-                components = [c.strip() for c in components_raw.split(",") if c.strip()]
-            elif isinstance(components_raw, list):
-                components = [str(c).strip() for c in components_raw if str(c).strip()]
+            stations: list[Any] = []
+            if isinstance(resp, list):
+                stations = resp
+            elif isinstance(resp, dict):
+                fallback: list[Any] = resp.get("stations", []) or []
+                stations = resp.get("data", fallback) or []
+
+            if not stations:
+                break
+
+            for station in stations:
+                if not isinstance(station, dict):
+                    continue
+                number = str(station.get("number", "")).strip()
+                if not number:
+                    continue
+
+                name = str(station.get("location", number)).strip() or number
+                lat_raw = station.get("latitude")
+                lon_raw = station.get("longitude")
+                components_raw = station.get("components", "")
+
+                try:
+                    lat = float(lat_raw) if lat_raw is not None else 52.0
+                    lon = float(lon_raw) if lon_raw is not None else 5.0
+                except (ValueError, TypeError):
+                    lat, lon = 52.0, 5.0
+
+                if isinstance(components_raw, str):
+                    components = [c.strip() for c in components_raw.split(",") if c.strip()]
+                elif isinstance(components_raw, list):
+                    components = [str(c).strip() for c in components_raw if str(c).strip()]
+                else:
+                    components = []
+
+                self._discovered_stations[number] = {
+                    "name": name,
+                    "lat": lat,
+                    "lon": lon,
+                    "components": components,
+                }
+
+            # Check if there are more pages
+            if isinstance(resp, dict):
+                pagination = resp.get("pagination", {})
+                last_page = pagination.get("last_page", 1)
+                if page >= last_page:
+                    break
             else:
-                components = []
+                break
 
-            self._discovered_stations[number] = {
-                "name": name,
-                "lat": lat,
-                "lon": lon,
-                "components": components,
-            }
+            page += 1
 
         logger.info(
             "Luchtmeetnet: discovered %d stations", len(self._discovered_stations)
