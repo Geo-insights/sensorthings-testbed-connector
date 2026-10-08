@@ -108,8 +108,6 @@ class KNMIWeatherPollingSource(RestPollingSource):
         """Fetch all NL stations via KNMI EDR /area query (CoverageJSON)."""
         from datetime import timedelta
 
-        import httpx
-
         now = datetime.now(UTC)
         start = (now - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
         end = now.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -121,8 +119,12 @@ class KNMIWeatherPollingSource(RestPollingSource):
             base_url = base_url[: -len("/locations")]
 
         # The KNMI EDR API requires literal unencoded WKT in the coords
-        # parameter. httpx and requests both encode parentheses/commas/spaces
-        # when using params=. Build the raw URL and pass it directly.
+        # parameter (spaces, parentheses, commas must NOT be percent-encoded).
+        # httpx always re-encodes query strings, so use requests in a thread.
+        import asyncio
+
+        import requests as req
+
         url = (
             f"{base_url}/area"
             f"?coords=POLYGON((3.3 50.7,7.2 50.7,7.2 53.5,3.3 53.5,3.3 50.7))"
@@ -134,11 +136,12 @@ class KNMIWeatherPollingSource(RestPollingSource):
         if settings.knmi_api_key:
             headers["Authorization"] = settings.knmi_api_key
 
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            # Use httpx.URL to prevent re-encoding the pre-built query string
-            resp = await client.get(httpx.URL(url, encoded=True), headers=headers)
+        def _do_request() -> dict:
+            resp = req.get(url, headers=headers, timeout=30)
             resp.raise_for_status()
-            data = resp.json()
+            return resp.json()
+
+        data = await asyncio.get_event_loop().run_in_executor(None, _do_request)
 
         if not isinstance(data, dict):
             logger.warning("KNMI EDR response is not a dict (got %s)", type(data).__name__)
