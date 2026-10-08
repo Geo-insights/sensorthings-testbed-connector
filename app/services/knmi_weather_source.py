@@ -108,7 +108,9 @@ class KNMIWeatherPollingSource(RestPollingSource):
         """Fetch all NL stations via KNMI EDR /area query (CoverageJSON)."""
         from datetime import timedelta
 
-        now = datetime.now(UTC)
+        # KNMI EDR rejects non-round datetimes -- truncate to 10-min boundary
+        now = datetime.now(UTC).replace(second=0, microsecond=0)
+        now = now.replace(minute=(now.minute // 10) * 10)
         start = (now - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
         end = now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
