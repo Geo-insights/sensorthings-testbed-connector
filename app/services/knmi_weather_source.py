@@ -108,6 +108,8 @@ class KNMIWeatherPollingSource(RestPollingSource):
         """Fetch all NL stations via KNMI EDR /area query (CoverageJSON)."""
         from datetime import timedelta
 
+        import httpx
+
         now = datetime.now(UTC)
         start = (now - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
         end = now.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -118,14 +120,22 @@ class KNMIWeatherPollingSource(RestPollingSource):
         if base_url.endswith("/locations"):
             base_url = base_url[: -len("/locations")]
 
-        url = (
-            f"{base_url}/area"
-            f"?coords=POLYGON((3.3 50.7,7.2 50.7,7.2 53.5,3.3 53.5,3.3 50.7))"
-            f"&parameter-name=ta,tg,ff,dd,fxx,pp,rh,vv,rg,r1h"
-            f"&datetime={start}/{end}"
-        )
+        # Build params dict -- httpx encodes these correctly without
+        # double-encoding the POLYGON WKT spaces.
+        params = {
+            "coords": "POLYGON((3.3 50.7,7.2 50.7,7.2 53.5,3.3 53.5,3.3 50.7))",
+            "parameter-name": "ta,tg,ff,dd,fxx,pp,rh,vv,rg,r1h",
+            "datetime": f"{start}/{end}",
+        }
 
-        data = await self._client.get(url)
+        headers = {"User-Agent": "GeoInsights-Connector/1.0"}
+        if settings.knmi_api_key:
+            headers["Authorization"] = settings.knmi_api_key
+
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            resp = await client.get(f"{base_url}/area", params=params, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
 
         if not isinstance(data, dict):
             logger.warning("KNMI EDR response is not a dict (got %s)", type(data).__name__)
