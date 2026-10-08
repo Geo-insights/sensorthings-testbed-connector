@@ -46,23 +46,37 @@ _DESCRIPTIONS: dict[str, str] = {
     "precipitation": "Precipitation amount (last hour) at KNMI weather station.",
 }
 
-# KNMI reports wind in 0.1 m/s; canonical WIND_SPEED is km/h.
-# Conversion: value * 0.1 (deci to base) * 3.6 (m/s to km/h) = * 0.36
-_WIND_DECI_MS_TO_KMH = 0.36
+# Wind conversion: m/s → km/h (canonical WIND_SPEED is km/h)
+_MS_TO_KMH = 3.6
 
-# KNMI parameter code → (normalizer field, scale factor)
-# Scale factors convert KNMI's integer-encoded values to real units.
+# KNMI EDR API parameter code → (normalizer field, scale factor)
+# EDR CoverageJSON returns values in real SI units (m/s, hPa, °C, %).
+_KNMI_EDR_PARAM_MAP: dict[str, tuple[str, float]] = {
+    "ta": ("temperature", 1.0),            # °C
+    "tg": ("groundtemperature", 1.0),      # °C
+    "ff": ("windspeedkmh", _MS_TO_KMH),   # m/s → km/h
+    "dd": ("winddirectiondegrees", 1.0),   # degrees
+    "fxx": ("windgustskmh", _MS_TO_KMH),  # m/s → km/h
+    "pp": ("airpressure", 1.0),            # hPa
+    "rh": ("humidity", 1.0),               # %
+    "vv": ("visibility", 1.0),             # m
+    "rg": ("sunpower", 1.0),              # J/cm2
+    "r1h": ("rainfalllasthour", 1.0),      # mm
+}
+
+# Legacy Buienradar integer-encoded scale factors (kept for backward compat)
+_WIND_DECI_MS_TO_KMH = 0.36
 _KNMI_PARAM_MAP: dict[str, tuple[str, float]] = {
-    "ta": ("temperature", 0.1),            # 0.1 °C → °C
-    "tg": ("groundtemperature", 0.1),      # 0.1 °C → °C
-    "ff": ("windspeedkmh", _WIND_DECI_MS_TO_KMH),  # 0.1 m/s → km/h
-    "dd": ("winddirectiondegrees", 1.0),   # degrees (no scaling)
-    "fxx": ("windgustskmh", _WIND_DECI_MS_TO_KMH),  # 0.1 m/s → km/h
-    "pp": ("airpressure", 0.1),            # 0.1 hPa → hPa
-    "rh": ("humidity", 1.0),               # % (no scaling)
-    "vv": ("visibility", 1.0),             # raw coded value (m approx)
-    "rg": ("sunpower", 1.0),              # J/cm2 → treat as W/m2 proxy
-    "r1h": ("rainfalllasthour", 0.1),      # 0.1 mm → mm
+    "ta": ("temperature", 0.1),
+    "tg": ("groundtemperature", 0.1),
+    "ff": ("windspeedkmh", _WIND_DECI_MS_TO_KMH),
+    "dd": ("winddirectiondegrees", 1.0),
+    "fxx": ("windgustskmh", _WIND_DECI_MS_TO_KMH),
+    "pp": ("airpressure", 0.1),
+    "rh": ("humidity", 1.0),
+    "vv": ("visibility", 1.0),
+    "rg": ("sunpower", 1.0),
+    "r1h": ("rainfalllasthour", 0.1),
 }
 
 
@@ -112,91 +126,99 @@ def build_entity_set(
 
 def parse_edr_locations(
     data: dict[str, Any],
+    station_names: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[SensorReading]]:
-    """Parse the KNMI EDR ``/locations`` GeoJSON response.
+    """Parse a KNMI EDR CoverageJSON area/position response.
+
+    The EDR ``/area`` endpoint returns a ``CoverageCollection`` with one
+    ``Coverage`` per station.  Each coverage has:
+
+    - ``domain.axes.x/y`` — lon/lat
+    - ``domain.axes.t`` — list of ISO timestamps
+    - ``ranges`` — dict of parameter code → NdArray with ``values``
 
     Returns:
         (stations, readings) — station metadata dicts for entity registration
-        and SensorReadings from the latest observations embedded in each Feature.
+        and SensorReadings from the latest observations per station.
     """
-    features = data.get("features", [])
-    if not isinstance(features, list):
-        features = []
+    coverages = data.get("coverages", [])
+    if not isinstance(coverages, list):
+        coverages = []
 
     stations: list[dict[str, Any]] = []
     all_readings: list[SensorReading] = []
+    names = station_names or {}
 
-    for feature in features:
-        if not isinstance(feature, dict):
+    for i, cov in enumerate(coverages):
+        if not isinstance(cov, dict):
             continue
 
-        props = feature.get("properties", {})
-        geom = feature.get("geometry", {})
-        station_id = feature.get("id", props.get("station_id", props.get("id", "")))
-        station_name = props.get("name", props.get("station_name", str(station_id)))
+        domain = cov.get("domain", {})
+        axes = domain.get("axes", {})
+        ranges = cov.get("ranges", {})
 
-        if not station_id:
+        x_vals = axes.get("x", {}).get("values", [])
+        y_vals = axes.get("y", {}).get("values", [])
+        t_vals = axes.get("t", {}).get("values", [])
+
+        if not x_vals or not y_vals:
             continue
 
-        # Extract coordinates from GeoJSON geometry
-        coords = geom.get("coordinates", []) if isinstance(geom, dict) else []
-        if len(coords) >= 2:
-            lon, lat = float(coords[0]), float(coords[1])
-        else:
-            continue
+        lon = float(x_vals[0])
+        lat = float(y_vals[0])
+
+        # Station ID: derive from coordinates (EDR area response has no station ID)
+        station_id = str(i)
+        station_name = names.get(station_id, f"KNMI-{lat:.2f}-{lon:.2f}")
 
         stations.append({
-            "id": str(station_id),
-            "name": str(station_name),
+            "id": station_id,
+            "name": station_name,
             "lat": lat,
             "lon": lon,
         })
 
-        # Extract observations from properties using KNMI parameter codes
-        readings = _parse_knmi_properties(props, str(station_id), str(station_name))
+        # Use the latest timestamp's values (last index in the t axis)
+        if not t_vals:
+            continue
+
+        latest_idx = len(t_vals) - 1
+        try:
+            ts = datetime.fromisoformat(str(t_vals[latest_idx]).replace("Z", "+00:00"))
+        except ValueError:
+            ts = datetime.now(UTC)
+
+        payload: dict[str, Any] = {}
+        for param_code, (norm_field, scale) in _KNMI_EDR_PARAM_MAP.items():
+            param_range = ranges.get(param_code)
+            if not isinstance(param_range, dict):
+                continue
+            values = param_range.get("values", [])
+            if not values or latest_idx >= len(values):
+                continue
+            raw = values[latest_idx]
+            if raw is None:
+                continue
+            try:
+                payload[norm_field] = float(raw) * scale
+            except (ValueError, TypeError):
+                continue
+
+        if not payload:
+            continue
+
+        normalizer = KNMIWeatherNormalizer.model_validate(payload)
+        readings = normalizer.to_readings(
+            sensor_id=f"knmi-{station_id}",
+            sensor_name=f"KNMI {station_name} sensor",
+            thing_name=f"KNMI {station_name}",
+            timestamp=ts,
+            location="nl",
+            quality="good",
+        )
         all_readings.extend(readings)
 
     return stations, all_readings
-
-
-def _parse_knmi_properties(
-    props: dict[str, Any],
-    station_id: str,
-    station_name: str,
-) -> list[SensorReading]:
-    """Extract observations from a Feature's properties dict."""
-    # Try to find a timestamp
-    ts_raw = props.get("datetime", props.get("timestamp", props.get("time", "")))
-    if ts_raw:
-        try:
-            ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
-        except ValueError:
-            ts = datetime.now(UTC)
-    else:
-        ts = datetime.now(UTC)
-
-    payload: dict[str, Any] = {}
-    for knmi_code, (norm_field, scale) in _KNMI_PARAM_MAP.items():
-        raw = props.get(knmi_code)
-        if raw is None:
-            continue
-        try:
-            payload[norm_field] = float(raw) * scale
-        except (ValueError, TypeError):
-            continue
-
-    if not payload:
-        return []
-
-    normalizer = KNMIWeatherNormalizer.model_validate(payload)
-    return normalizer.to_readings(
-        sensor_id=f"knmi-{station_id}",
-        sensor_name=f"KNMI {station_name} sensor",
-        thing_name=f"KNMI {station_name}",
-        timestamp=ts,
-        location="nl",
-        quality="good",
-    )
 
 
 # ---------------------------------------------------------------------------
