@@ -8,6 +8,7 @@ with canonical names, units, and display names.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any, ClassVar
@@ -67,6 +68,11 @@ class Normalizer(BaseModel):
             try:
                 float_val = float(value)
             except (ValueError, TypeError):
+                continue
+
+            # Reject NaN/inf -- FROST rejects non-finite values and one bad
+            # observation poisons the entire CreateObservations batch.
+            if not math.isfinite(float_val):
                 continue
 
             meta = canonical.meta
