@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class SensorReading(BaseModel):
@@ -13,6 +14,15 @@ class SensorReading(BaseModel):
     unit: str
     value: float
     timestamp: datetime
+
+    @field_validator("value")
+    @classmethod
+    def reject_non_finite(cls, v: float) -> float:
+        """Reject NaN/inf values that would poison FROST batch pushes."""
+        if not math.isfinite(v):
+            msg = f"non-finite value: {v}"
+            raise ValueError(msg)
+        return v
     quality: str = "good"
     location: str = "tgv"
     thing_name: str = "Climate adaptation setup"
