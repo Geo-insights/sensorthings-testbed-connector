@@ -16,6 +16,7 @@ API endpoint: https://data.sensor.community/airrohr/v1/filter/country=NL
 from __future__ import annotations
 
 import logging
+import math
 from datetime import UTC, datetime
 from typing import Any
 
@@ -155,6 +156,9 @@ def parse_sensor_data(sensor_entries: list[dict[str, Any]]) -> list[SensorReadin
                     value_type,
                     location_id,
                 )
+                continue
+
+            if not math.isfinite(value):
                 continue
 
             meta = canonical.meta
