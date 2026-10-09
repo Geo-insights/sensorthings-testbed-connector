@@ -2263,8 +2263,14 @@ class SensorThingsClient:
                 parsed = response.json()
                 if isinstance(parsed, list):
                     entries = parsed
+                    # Log first few entries for debug if any are errors
+                    error_entries = [e for e in entries[:5] if isinstance(e, str) and not e.startswith("http")]
+                    if error_entries:
+                        logger.warning("CreateObservations response errors (first %d): %s", len(error_entries), error_entries)
             except ValueError:
                 pass
+        else:
+            logger.warning("CreateObservations HTTP %d: %s", response.status_code, response.text[:300])
 
         per_obs_endpoint = self._endpoint_for_base_url(base_url, settings.observations_path)
         for i, (ds_id, payload, sensor_id) in enumerate(flat):
