@@ -520,9 +520,15 @@ async def _polling_ingest_loop(source):
                         except Exception:
                             logger.exception("%s: registration retry failed; pushing with cached IDs", source.source_name)
 
-                # Push readings regardless — if datastream IDs are cached from
-                # a previous run, observations can be pushed even before
-                # registration completes.
+                # Only push if entities are registered or we have cached IDs
+                # from a previous run. Pushing before registration generates
+                # thousands of DLQ entries on first boot for no reason.
+                if not entities_registered and not last_timestamps:
+                    logger.info(
+                        "%s: skipping push (%d readings) — entities not yet registered",
+                        source.source_name, len(readings),
+                    )
+                    continue
                 new_readings = _dedup_readings(readings, last_timestamps)
                 if new_readings:
                     _push_source = source.source_name.lower()
