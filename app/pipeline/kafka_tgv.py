@@ -100,6 +100,6 @@ class TGVMeasurementParser(Parser):
             location="tgv",
             thing_name=mapping["thing_name"],
             device_eui=device_id,
-            stream_key=measurement_id,
+            stream_key=canonical.value,
             observed_property_name=meta.display_name,
         )

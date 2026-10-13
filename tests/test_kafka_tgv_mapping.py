@@ -136,12 +136,12 @@ def test_avro_record_maps_temperature():
     assert r.thing_name == "TGV Office Lab"
 
 
-def test_avro_record_stream_key_equals_measurement_id():
+def test_avro_record_stream_key_equals_canonical_value():
     record = _make_record(measurements=[
         {"measurement_id": "Inside Relative Humidity", "value": 55.0, "unit": "%", "measurement_description": None}
     ])
     readings = avro_record_to_sensor_readings(record)
-    assert readings[0].stream_key == "Inside Relative Humidity"
+    assert readings[0].stream_key == "humidity"
 
 
 def test_avro_record_device_eui_equals_device_id():
@@ -333,6 +333,36 @@ def test_default_mapping_covers_all_tgv_sensors(measurement_id, expected_thing, 
     assert result["thing_name"] == expected_thing
     assert result["sensor_id"] == expected_sensor
     assert result["observed_property"] == expected_property
+
+
+@pytest.mark.parametrize("measurement_id,expected_display_name,expected_stream_key", [
+    ("Inside Temperature", "Air temperature", "temperature"),
+    ("Inside Relative Humidity", "Relative humidity", "humidity"),
+    ("Outside Temperature", "Air temperature", "air_temperature"),
+    ("Wind Speed", "Wind speed", "wind_speed"),
+    ("Wind Direction", "Wind direction", "wind_direction"),
+    ("Daily Rain", "Precipitation", "precipitation"),
+    ("Barometric Pressure", "Air pressure", "air_pressure"),
+    ("Solar Radiation", "Solar radiation", "solar_radiation"),
+    ("Outside Relative Humidity", "Relative humidity", "relative_humidity"),
+    ("Dew Point", "Dew point temperature", "dew_point"),
+    ("Heat Index", "Heat index", "heat_index"),
+    ("Wind Chill", "Wind chill", "wind_chill"),
+    ("10 Minutes Average Wind Gust", "Wind gust speed", "wind_gust"),
+    ("Rain Rate", "Rainfall rate", "rain_rate"),
+    ("Ultraviolet Radiation Index", "UV index", "uv_index"),
+    ("Wet Bulb Temperature (indication)", "Wet bulb temperature", "wet_bulb_temperature"),
+    ("Current Evapotranspiration", "Evapotranspiration", "evapotranspiration"),
+])
+def test_default_mapping_canonical_display_names(measurement_id, expected_display_name, expected_stream_key):
+    """Every TGV reading gets a canonical display name and stream_key, not a raw Avro field name."""
+    record = _make_record(measurements=[
+        {"measurement_id": measurement_id, "value": 1.0, "unit": None, "measurement_description": None}
+    ])
+    readings = avro_record_to_sensor_readings(record)
+    assert len(readings) == 1
+    assert readings[0].observed_property_name == expected_display_name
+    assert readings[0].stream_key == expected_stream_key
 
 
 def test_default_mapping_produces_readings_for_all_tgv_things():

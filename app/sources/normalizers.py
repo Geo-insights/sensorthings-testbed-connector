@@ -151,6 +151,6 @@ class TGVMeasurementNormalizer:
             location="tgv",
             thing_name=entry["thing_name"],
             device_eui=device_id,
-            stream_key=measurement_id,
+            stream_key=canonical.value,
             observed_property_name=meta.display_name,
         )
