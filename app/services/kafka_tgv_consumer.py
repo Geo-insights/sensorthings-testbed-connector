@@ -83,6 +83,8 @@ class KafkaTGVConsumer:
         self._consumer.subscribe(
             [settings.kafka_tgv_topic],
             on_assign=self._on_assign,
+            on_revoke=self._on_revoke,
+            on_lost=self._on_lost,
         )
         logger.info("KafkaTGVConsumer connected to topic %s", settings.kafka_tgv_topic)
 
@@ -240,14 +242,29 @@ class KafkaTGVConsumer:
         return str(response.json()["schema"])
 
     @staticmethod
-    def _on_assign(consumer: Consumer, partitions: list) -> None:
-        # Build partition summary without calling repr() on TopicPartition objects
-        # to avoid a Python 3.14 SystemError in confluent-kafka's __repr__ format string.
+    def _partition_summary(partitions: list) -> str:
         try:
-            summary = ", ".join(
+            return ", ".join(
                 f"{getattr(p, 'topic', '?')}[{getattr(p, 'partition', '?')}]"
                 for p in partitions
             )
         except Exception:
-            summary = f"<{len(partitions)} partition(s)>"
-        logger.debug("Kafka partition assignment: %s", summary)
+            return f"<{len(partitions)} partition(s)>"
+
+    @staticmethod
+    def _on_assign(consumer: Consumer, partitions: list) -> None:
+        logger.debug("Kafka partition assignment: %s", KafkaTGVConsumer._partition_summary(partitions))
+
+    @staticmethod
+    def _on_revoke(consumer: Consumer, partitions: list) -> None:
+        logger.warning(
+            "Kafka partitions revoked (rebalance): %s",
+            KafkaTGVConsumer._partition_summary(partitions),
+        )
+
+    @staticmethod
+    def _on_lost(consumer: Consumer, partitions: list) -> None:
+        logger.error(
+            "Kafka partitions lost (consumer evicted): %s",
+            KafkaTGVConsumer._partition_summary(partitions),
+        )

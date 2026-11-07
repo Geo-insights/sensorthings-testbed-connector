@@ -105,9 +105,12 @@ async def _kafka_ingest_loop():
     # consumer keeps sending heartbeats and stays in the group.
     poll_seconds = max(5, min(30, int(settings.kafka_tgv_poll_seconds)))
     stale_threshold = _kafka_stale_threshold(max(10, int(settings.kafka_tgv_poll_seconds)))
+    # Cycle timeout: hard cap on a single consume+push cycle to prevent
+    # exceeding max.poll.interval.ms when a FROST target is slow/stuck.
+    cycle_timeout = max(120, settings.kafka_tgv_max_poll_interval_ms // 1000 - 120)
     logger.info(
-        "Kafka ingest loop started (persistent consumer, poll every %ds, stall threshold %ds)",
-        poll_seconds, stale_threshold,
+        "Kafka ingest loop started (persistent consumer, poll every %ds, stall threshold %ds, cycle timeout %ds)",
+        poll_seconds, stale_threshold, cycle_timeout,
     )
 
     def _drop_consumer(c) -> None:
@@ -138,9 +141,31 @@ async def _kafka_ingest_loop():
                     context={"partitions": advanced, "group": settings.kafka_tgv_consumer_group},
                     force=True,
                 )
-            summary = await run_in_threadpool(
-                _consume_and_push_once, consumer, settings.kafka_tgv_batch_max_messages
-            )
+            try:
+                summary = await asyncio.wait_for(
+                    run_in_threadpool(
+                        _consume_and_push_once, consumer, settings.kafka_tgv_batch_max_messages
+                    ),
+                    timeout=cycle_timeout,
+                )
+            except TimeoutError:
+                logger.error(
+                    "Kafka consume+push cycle exceeded %ds timeout — forcing reconnect",
+                    cycle_timeout,
+                )
+                send_alert(
+                    "kafka.cycle_timeout",
+                    f"Kafka consume+push cycle exceeded {cycle_timeout}s — likely a stuck FROST target. "
+                    "Reconnecting consumer to avoid max.poll.interval eviction.",
+                    level="critical",
+                    context={"timeout_seconds": cycle_timeout},
+                    dedup_key="kafka.cycle_timeout",
+                )
+                if consumer is not None:
+                    await run_in_threadpool(_drop_consumer, consumer)
+                    consumer = None
+                await asyncio.sleep(poll_seconds)
+                continue
             consecutive_failures = 0
             if summary.get("pulled", 0) > 0:
                 health_monitor.record_source_success("kafka")

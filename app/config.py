@@ -443,7 +443,7 @@ class Settings:
     frost_batch_timeout_seconds: float = field(default_factory=lambda: _load_float("FROST_BATCH_TIMEOUT_SECONDS", "60"))
     # Circuit breaker: skip a target after N consecutive failed push cycles.
     frost_cb_failure_threshold: int = int(os.getenv("FROST_CB_FAILURE_THRESHOLD", "3"))
-    frost_cb_cooldown_seconds: float = field(default_factory=lambda: _load_float("FROST_CB_COOLDOWN_SECONDS", "600"))
+    frost_cb_cooldown_seconds: float = field(default_factory=lambda: _load_float("FROST_CB_COOLDOWN_SECONDS", "1800"))
     frost_cb_overrides: dict[str, dict[str, int | float]] = field(default_factory=_load_cb_overrides)
     # --- FROST push concurrency & async worker (throughput / decoupling) ---
     # Push the FROST_BATCH_MAX_OBSERVATIONS-sized chunks of one large

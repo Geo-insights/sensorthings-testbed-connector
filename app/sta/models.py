@@ -611,9 +611,12 @@ def adapt_observation_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Transform a v1.1 Observation dict payload to v2.0 format."""
     result = adapt_entity_refs(payload)
 
-    # v2.0: parameters -> properties
+    # v2.0: parameters -> properties (strip None values — FROST v2.0
+    # rejects JSON nulls in properties with HTTP 400).
     if "parameters" in result:
-        result["properties"] = result.pop("parameters")
+        result["properties"] = {
+            k: v for k, v in result.pop("parameters").items() if v is not None
+        }
 
     # v2.0: resultQuality is removed
     result.pop("resultQuality", None)
