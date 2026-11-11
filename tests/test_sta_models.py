@@ -326,7 +326,7 @@ class TestV2Payload:
         assert payload["resultType"]["type"] == "Category"
         assert "unitOfMeasurement" not in payload
 
-    def test_observation_v2_properties_not_parameters(self):
+    def test_observation_v2_keeps_parameters(self):
         obs = ObservationV2(
             phenomenonTime=datetime(2026, 7, 1, tzinfo=UTC),
             result=21.5,
@@ -334,8 +334,8 @@ class TestV2Payload:
             datastream_id="10",
         )
         payload = obs.as_frost_payload()
-        assert "parameters" not in payload
-        assert payload["properties"] == {"unit": "Cel", "sensor_id": "s1"}
+        assert "properties" not in payload
+        assert payload["parameters"] == {"unit": "Cel", "sensor_id": "s1"}
         assert "resultQuality" not in payload
         assert payload["Datastream"] == {"id": "10"}
 

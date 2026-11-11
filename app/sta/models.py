@@ -455,20 +455,20 @@ class ObservationV1(STAObservation):
 
 
 class ObservationV2(STAObservation):
-    """v2.0 Observation: ``properties`` replaces ``parameters``; no ``resultQuality``."""
+    """v2.0 Observation: keeps ``parameters``; no ``resultQuality``."""
 
     _sta_version: ClassVar[str] = "2.0"
     _content_fields: ClassVar[frozenset[str]] = frozenset(
-        {"phenomenonTime", "result", "properties"}
+        {"phenomenonTime", "result", "parameters"}
     )
 
     def as_frost_payload(self) -> dict[str, Any]:
         data = STAEntityBase.as_frost_payload(self)
 
-        # v2: parameters -> properties
-        params = data.pop("parameters", None)
+        # v2: strip None values from parameters (FROST rejects JSON nulls)
+        params = data.get("parameters")
         if params:
-            data["properties"] = params
+            data["parameters"] = {k: v for k, v in params.items() if v is not None}
 
         # v2: no resultQuality
         data.pop("resultQuality", None)
@@ -611,11 +611,11 @@ def adapt_observation_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Transform a v1.1 Observation dict payload to v2.0 format."""
     result = adapt_entity_refs(payload)
 
-    # v2.0: parameters -> properties (strip None values — FROST v2.0
-    # rejects JSON nulls in properties with HTTP 400).
+    # v2.0: keep parameters (strip None values — FROST v2.0
+    # rejects JSON nulls with HTTP 400).
     if "parameters" in result:
-        result["properties"] = {
-            k: v for k, v in result.pop("parameters").items() if v is not None
+        result["parameters"] = {
+            k: v for k, v in result["parameters"].items() if v is not None
         }
 
     # v2.0: resultQuality is removed
