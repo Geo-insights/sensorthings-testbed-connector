@@ -2303,7 +2303,7 @@ class SensorThingsClient:
             )
         return sent, results
 
-    def warm_datastream_cache(self, max_datastreams: int = 2000) -> int:
+    def warm_datastream_cache(self, max_datastreams: int = 10000) -> int:
         """Pre-populate the datastream-id cache from the primary FROST target.
 
         The push and monitoring-forward paths resolve datastream ids from
@@ -2311,6 +2311,9 @@ class SensorThingsClient:
         live OData lookup. Fetching the datastreams once at startup avoids that
         cold-cache walk on the first cycles after a (re)deploy. Best-effort:
         logs and returns 0 on any failure, never raises.
+
+        Also purges stale cached entries whose IDs don't exist on the current
+        server (e.g. carried over from a previously-configured FROST target).
         """
         base_url = self._primary_base_url()
         if not base_url:
@@ -2318,19 +2321,55 @@ class SensorThingsClient:
         stack = self._target_stack_for_url(base_url)
         fields = stack.fields if stack else odata_fields_for("1.1")
         endpoint = self._endpoint_for_base_url(base_url, settings.datastreams_path)
+
+        # Fetch all datastream IDs from the server (paginated).
+        server_ids: set[str] = set()
+        url: str | None = endpoint
+        page_params: dict[str, str] | None = {
+            "$select": f"{fields.id},name,properties",
+            "$top": str(min(max_datastreams, 1000)),
+        }
+        values: list[dict[str, Any]] = []
         try:
-            resp = requests.get(
-                endpoint,
-                params={"$select": f"{fields.id},name,properties", "$top": str(max_datastreams)},
-                headers=self._headers_for_url(base_url),
-                timeout=self._request_timeout(),
-            )
-            resp.raise_for_status()
-            values = resp.json().get("value", [])
+            while url and len(server_ids) < max_datastreams:
+                resp = requests.get(
+                    url,
+                    params=page_params,
+                    headers=self._headers_for_url(base_url),
+                    timeout=self._request_timeout(),
+                )
+                resp.raise_for_status()
+                body = resp.json()
+                page = body.get("value", [])
+                for ds in page:
+                    ds_id = ds.get(fields.id) or ds.get("@iot.id") or ds.get("id")
+                    if ds_id:
+                        server_ids.add(str(ds_id))
+                values.extend(page)
+                url = body.get(fields.next_link) or body.get("@iot.nextLink")
+                page_params = None  # nextLink already contains params
         except Exception:
             logger.debug("Datastream cache warm-up fetch failed", exc_info=True)
             return 0
 
+        # Purge stale cached entries whose IDs don't exist on the server.
+        purged = 0
+        if server_ids:
+            stale_keys = [
+                key for key, ds_id in self._datastream_ids.items()
+                if str(ds_id) not in server_ids
+            ]
+            for key in stale_keys:
+                del self._datastream_ids[key]
+                self._cache.drop("datastreams", key)
+                purged += 1
+            if purged:
+                logger.warning(
+                    "Datastream cache purged %d stale id(s) not found on %s",
+                    purged, base_url,
+                )
+
+        # Add newly discovered entries.
         warmed = 0
         for ds in values:
             ds_id = ds.get(fields.id) or ds.get("@iot.id") or ds.get("id")
@@ -2349,8 +2388,11 @@ class SensorThingsClient:
                 if key and key not in self._datastream_ids:
                     self._datastream_ids[key] = str(ds_id)
                     warmed += 1
-        if warmed:
-            logger.info("Datastream cache warmed: %d id(s) from %s", warmed, base_url)
+        if warmed or purged:
+            logger.info(
+                "Datastream cache warm-up: %d added, %d purged (%d server ids from %s)",
+                warmed, purged, len(server_ids), base_url,
+            )
         return warmed
 
     def push_observations(

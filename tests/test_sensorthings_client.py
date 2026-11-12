@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 from app.models import TaskingTaskCreateRequest, TaskingTaskQuery
@@ -393,3 +394,132 @@ def test_resolve_datastream_id_live_queries_by_device_eui_and_stream_key(monkeyp
     assert datastream_id == "777"
     assert any("Thing/properties/deviceEui eq 'ABC123'" in item for item in captured_filters)
     assert any("properties/streamKey eq 'temp'" in item for item in captured_filters)
+
+
+# -- warm_datastream_cache purge tests -----------------------------------------
+
+
+def _make_frost_response(datastreams, next_link=None):
+    """Build a mock FROST v1.1 Datastreams response."""
+    body = {"value": datastreams}
+    if next_link:
+        body["@iot.nextLink"] = next_link
+    return body
+
+
+class _FakeResponse:
+    def __init__(self, body, status_code=200):
+        self._body = body
+        self.status_code = status_code
+        self.ok = status_code < 400
+
+    def raise_for_status(self):
+        if not self.ok:
+            raise Exception(f"HTTP {self.status_code}")
+
+    def json(self):
+        return self._body
+
+
+def test_warm_datastream_cache_purges_stale_ids(monkeypatch, tmp_path):
+    """Cached DS IDs that don't exist on the server should be purged."""
+    # Pre-seed the cache with a stale entry (ID 9999) and a valid one (ID 10).
+    cache_data = {
+        "things": {},
+        "locations": {},
+        "sensors": {},
+        "observed_properties": {},
+        "datastreams": {
+            "valid-sensor::temperature": "10",
+            "stale-sensor::pm10": "9999",
+        },
+        "projects": {},
+        "actuators": {},
+        "tasking_capabilities": {},
+    }
+    cache_path = tmp_path / "registered_entities.json"
+    cache_path.write_text(json.dumps(cache_data))
+
+    monkeypatch.setattr(
+        "app.services.sensorthings_client.settings",
+        _settings(tmp_path, registered_entities_path=str(cache_path)),
+    )
+    client = SensorThingsClient()
+
+    # Verify both entries were loaded.
+    assert client._datastream_ids.get("stale-sensor::pm10") == "9999"
+    assert client._datastream_ids.get("valid-sensor::temperature") == "10"
+
+    # Server returns only DS ID 10 (valid).
+    server_response = _make_frost_response([
+        {"@iot.id": 10, "name": "GEO_temperature", "properties": {"sensor_id": "valid-sensor", "observed_property": "temperature"}},
+    ])
+    monkeypatch.setattr(
+        "app.services.sensorthings_client.requests.get",
+        lambda *a, **kw: _FakeResponse(server_response),
+    )
+    client.warm_datastream_cache()
+
+    # Stale entry should be purged from memory and cache file.
+    assert "stale-sensor::pm10" not in client._datastream_ids
+    assert client._datastream_ids.get("valid-sensor::temperature") == "10"
+    reloaded = json.loads(cache_path.read_text())
+    assert "stale-sensor::pm10" not in reloaded.get("datastreams", {})
+
+
+def test_warm_datastream_cache_follows_pagination(monkeypatch, tmp_path):
+    """Warm-up should follow nextLink to fetch all server datastreams."""
+    cache_path = tmp_path / "registered_entities.json"
+    monkeypatch.setattr(
+        "app.services.sensorthings_client.settings",
+        _settings(tmp_path, registered_entities_path=str(cache_path)),
+    )
+    client = SensorThingsClient()
+
+    page1 = _make_frost_response(
+        [{"@iot.id": 1, "name": "DS1", "properties": {"sensor_id": "s1", "observed_property": "temp"}}],
+        next_link="https://example.test/v1.1/Datastreams?$skip=1",
+    )
+    page2 = _make_frost_response(
+        [{"@iot.id": 2, "name": "DS2", "properties": {"sensor_id": "s2", "observed_property": "humidity"}}],
+    )
+    call_count = 0
+
+    def fake_get(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return _FakeResponse(page1 if call_count == 1 else page2)
+
+    monkeypatch.setattr("app.services.sensorthings_client.requests.get", fake_get)
+    client.warm_datastream_cache()
+
+    assert call_count == 2
+    assert client._datastream_ids.get("s1::temp") == "1"
+    assert client._datastream_ids.get("s2::humidity") == "2"
+
+
+def test_warm_datastream_cache_no_purge_on_fetch_failure(monkeypatch, tmp_path):
+    """If the server fetch fails, no entries should be purged."""
+    cache_data = {
+        "things": {}, "locations": {}, "sensors": {}, "observed_properties": {},
+        "datastreams": {"some-sensor::co2": "42"},
+        "projects": {}, "actuators": {}, "tasking_capabilities": {},
+    }
+    cache_path = tmp_path / "registered_entities.json"
+    cache_path.write_text(json.dumps(cache_data))
+
+    monkeypatch.setattr(
+        "app.services.sensorthings_client.settings",
+        _settings(tmp_path, registered_entities_path=str(cache_path)),
+    )
+    client = SensorThingsClient()
+    assert client._datastream_ids.get("some-sensor::co2") == "42"
+
+    def fail_get(*args, **kwargs):
+        raise ConnectionError("server down")
+
+    monkeypatch.setattr("app.services.sensorthings_client.requests.get", fail_get)
+    warmed = client.warm_datastream_cache()
+
+    assert warmed == 0
+    assert client._datastream_ids.get("some-sensor::co2") == "42"
