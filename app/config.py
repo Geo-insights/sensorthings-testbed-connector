@@ -424,9 +424,6 @@ class Settings:
     bro_poll_seconds: int = int(os.getenv("BRO_POLL_SECONDS", "3600"))
     bro_bbox: str = os.getenv("BRO_BBOX", "").strip()
     bro_max_wells: int = int(os.getenv("BRO_MAX_WELLS", "500"))
-    # --- Monitoring module direct push ---
-    monitoring_push_url: str = os.getenv("MONITORING_PUSH_URL", "").strip().rstrip("/")
-    monitoring_push_key: str = os.getenv("MONITORING_PUSH_KEY", "").strip()
     # --- Observation push reliability ---
     # Batch pushes via the SensorThings CreateObservations (dataArray) extension.
     frost_batch_push_enabled: bool = os.getenv("FROST_BATCH_PUSH_ENABLED", "true").lower() in {"1", "true", "yes", "on"}

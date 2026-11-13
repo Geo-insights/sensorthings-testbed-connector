@@ -34,11 +34,6 @@ def _consume_and_push_once(consumer, max_messages: int = 500, timeout: float = 5
     if not records:
         return {"pulled": 0}
     readings = avro_batch_to_sensor_readings(records)
-    # Forward to the monitoring module FIRST, before the (potentially slow,
-    # multi-target) FROST push below, so downstream freshness is not gated by
-    # FROST push latency. Fire-and-forget + idempotent: monitoring dedups via
-    # ON CONFLICT DO NOTHING.
-    _push_to_monitoring(readings, source="kafka")
     if settings.frost_async_push_enabled:
         # Decoupled path: hand the readings to the background FROST worker and
         # return immediately so the consume loop can pull the next batch. Kafka
@@ -278,119 +273,6 @@ def _is_kafka_auth_error(exc: BaseException) -> bool:
     )
 
 
-def _resolve_monitoring_datastream_id(reading) -> str | None:
-    """Resolve a reading's FROST datastream id for the primary base URL.
-
-    Mirrors the resolution chain used by ``client.push_observations`` so the
-    monitoring push and the FROST push agree on the same id:
-      sensor_id::observed_property  →  stream_key  →  sensor_id.
-
-    TGV Kafka readings map to pre-existing datastreams by ``stream_key`` (via
-    ``SENSORTHINGS_DATASTREAM_IDS_JSON``), so the sensor_id::op key alone is not
-    enough — the earlier implementation dropped every TGV reading here.
-
-    When the static id map has no entry (e.g. Kafka datastreams that are only
-    resolved live against FROST during the push), fall back to the same live
-    OData lookup ``client.push_observations`` uses, so the monitoring forward
-    agrees with the datastream the observation was actually pushed to.
-    """
-    ids = client._datastream_ids or dict(settings.datastream_ids)
-    ds_id = (
-        ids.get(client._datastream_key(reading.sensor_id, reading.observed_property))
-        or ids.get(getattr(reading, "stream_key", "") or "")
-        or ids.get(reading.sensor_id)
-    )
-    if ds_id:
-        return ds_id
-
-    base_url = client._http.primary_base_url or ""
-    if base_url:
-        try:
-            return client._resolve_datastream_id_live(base_url, reading)
-        except Exception:
-            logger.debug("Live datastream resolve failed for monitoring push", exc_info=True)
-    return None
-
-
-def _push_to_monitoring(readings: list, source: str = "unknown") -> None:
-    """Fire-and-forget push of readings to the monitoring module.
-
-    Runs before the (slow, multi-target) FROST push so monitoring freshness is
-    not gated by FROST latency. Failures are logged but never block the main
-    ingest loop; monitoring dedups via ON CONFLICT so re-forwarding is safe.
-    """
-    if not settings.monitoring_push_url or not settings.monitoring_push_key:
-        return
-    import requests as req
-
-    from app.services.validation import MONITORING_TARGET, classify_error
-    from app.services.validation import recorder as validation_recorder
-
-    base_url = client._http.primary_base_url or ""
-    forwarded = []
-    for r in readings:
-        ds_id = _resolve_monitoring_datastream_id(r)
-        if not ds_id:
-            continue
-        forwarded.append(
-            {
-                "server_url": base_url,
-                "datastream_id": str(ds_id),
-                "value": r.value,
-                "timestamp": r.timestamp.isoformat().replace("+00:00", "Z"),
-                "quality": getattr(r, "quality", "good") or "good",
-            }
-        )
-    payload = {"readings": forwarded}
-    if not payload["readings"]:
-        return
-    # The monitoring /readings/push endpoint caps each request at 2000 readings.
-    # A single Kafka cycle can map to more than that, which previously returned
-    # 422 and dropped the WHOLE cycle's data. Chunk so every reading is
-    # delivered regardless of batch size.
-    chunk_size = 1000
-    forwarded_count = 0
-    for start in range(0, len(forwarded), chunk_size):
-        chunk = forwarded[start : start + chunk_size]
-        t0 = time.perf_counter()
-        status_code: int | None = None
-        exc: BaseException | None = None
-        try:
-            resp = req.post(
-                f"{settings.monitoring_push_url}/readings/push",
-                json={"readings": chunk},
-                headers={"X-Connector-Key": settings.monitoring_push_key},
-                timeout=10,
-            )
-            status_code = resp.status_code
-            if resp.ok:
-                forwarded_count += len(chunk)
-            else:
-                logger.warning("Monitoring push failed: %s %s", resp.status_code, resp.text[:200])
-        except Exception as e:
-            exc = e
-            logger.warning("Monitoring push failed (connection error)", exc_info=True)
-        dur_ms = (time.perf_counter() - t0) * 1000.0
-        chunk_ok = status_code is not None and 200 <= status_code < 300
-        error_class = None if chunk_ok else classify_error(exc=exc, status_code=status_code)
-        error_msg = None if chunk_ok else (
-            f"http {status_code}" if status_code else f"{type(exc).__name__}: {exc}" if exc else "unknown"
-        )
-        validation_recorder.record_push_attempt(
-            source=source,
-            target=MONITORING_TARGET,
-            target_label="monitoring_http",
-            duration_ms=dur_ms,
-            readings_count=len(chunk),
-            sent_count=len(chunk) if chunk_ok else 0,
-            failed_count=0 if chunk_ok else len(chunk),
-            error_class=error_class,
-            error_msg=error_msg,
-        )
-    if forwarded_count:
-        logger.debug("Monitoring push: %d readings forwarded", forwarded_count)
-
-
 def _dedup_readings(
     readings: list,
     last_timestamps: dict[str, datetime],
@@ -571,8 +453,6 @@ async def _polling_ingest_loop(source):
                         len(new_readings),
                         result.get("total_sent", 0),
                     )
-                    # Forward to monitoring module (fire-and-forget)
-                    await run_in_threadpool(_push_to_monitoring, new_readings, _push_source)
                 else:
                     logger.debug("%s: all %d readings already pushed, skipping", source.source_name, len(readings))
         except Exception as exc:
