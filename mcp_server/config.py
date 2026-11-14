@@ -37,6 +37,7 @@ class McpSettings:
     supabase_project_url: str = os.getenv(
         "SUPABASE_URL", "https://upjxsqjnrnamsexrlkqx.supabase.co"
     )
+    supabase_anon_key: str = os.getenv("SUPABASE_ANON_KEY", "")
 
     port: int = int(os.getenv("MCP_PORT", "8030"))
 

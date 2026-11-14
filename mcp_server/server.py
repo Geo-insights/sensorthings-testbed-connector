@@ -17,9 +17,18 @@ from mcp.server.streamable_http import TransportSecuritySettings
 from mcp_types import ToolAnnotations
 from starlette.routing import Route
 
+from mcp_server import catalog_tools
 from mcp_server import tools as tool_impls
 from mcp_server.auth import auth_enabled
-from mcp_server.errors import classify_frost_error
+from mcp_server.catalog_schemas import (
+    CompareResult,
+    ContextSummary,
+    MunicipalityResult,
+    PolicyResult,
+    RankResult,
+    SearchMeasuresResult,
+)
+from mcp_server.errors import classify_frost_error, classify_supabase_error
 from mcp_server.freshness import freshness_endpoint
 from mcp_server.frost_client import CircuitOpen, FrostReadClient
 from mcp_server.middleware import request_logger
@@ -31,6 +40,7 @@ from mcp_server.schemas import (
     ReadingsResult,
     SourcesResult,
 )
+from mcp_server.supabase_client import SupabaseCircuitOpen, SupabaseReadClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -47,9 +57,13 @@ _READ_ONLY_ANNOTATIONS = ToolAnnotations(
 mcp = MCPServer(
     "Geo-Insights Environmental Data",
     instructions=(
-        "Query real-time Dutch environmental data from 10 sources "
-        "(KNMI, Luchtmeetnet, BRO, Samen Meten, Sensor.Community, and more). "
-        "All data is normalized to canonical parameter names with UCUM units. "
+        "Dutch environmental data and climate adaptation tools. "
+        "Sensor tools: real-time readings from 10 sources (KNMI, Luchtmeetnet, BRO, etc.) "
+        "with 35 normalized parameters. "
+        "Catalog tools: 44 BGI (Blue-Green Infrastructure) measures with performance data, "
+        "costs, goal scores, and per-municipality policy requirements. "
+        "Use search_bgi_measures to find measures, get_measure_detail for full specs, "
+        "get_policy_requirements for local regulations, and rank_measures for recommendations. "
         "No authentication required."
     ),
 )
@@ -68,6 +82,22 @@ def _get_client() -> FrostReadClient:
 def _raise_frost_error(exc: Exception) -> None:
     """Convert FROST errors to ToolError (sets isError=true at protocol level)."""
     raise ToolError(json.dumps(classify_frost_error(exc)))
+
+
+# Global Supabase client (initialized on startup)
+_supabase_client: SupabaseReadClient | None = None
+
+
+def _get_supabase() -> SupabaseReadClient:
+    global _supabase_client
+    if _supabase_client is None:
+        _supabase_client = SupabaseReadClient()
+    return _supabase_client
+
+
+def _raise_supabase_error(exc: Exception) -> None:
+    """Convert Supabase errors to ToolError."""
+    raise ToolError(json.dumps(classify_supabase_error(exc)))
 
 
 # -- MCP Resources (static catalogs, no tool call needed) ------------------
@@ -280,6 +310,237 @@ async def get_data_freshness() -> FreshnessResult:
     except (CircuitOpen, httpx.HTTPError, Exception) as exc:
         request_logger.log("get_data_freshness", int((time.monotonic() - start) * 1000), "", "", "error")
         _raise_frost_error(exc)
+
+
+# -- BGI Catalog Tools (Supabase-backed) ------------------------------------
+
+
+@mcp.tool(
+    title="Search BGI Measures",
+    annotations=_READ_ONLY_ANNOTATIONS,
+)
+async def search_bgi_measures(
+    goal: str | None = None,
+    category: str | None = None,
+    keyword: str | None = None,
+    limit: int = 20,
+) -> SearchMeasuresResult:
+    """Search the Blue-Green Infrastructure measure catalog (44 measures).
+
+    All parameters are optional — call with no args to list all measures.
+
+    Args:
+        goal: Filter by climate goal: flood, heat, drought, biodiversity, social
+        category: Filter by category: water_retention, heat_mitigation,
+                  surface_water, biodiversity
+        keyword: Search in name, Dutch name, and description (e.g. "dak", "roof")
+        limit: Max results (default 20, max 50)
+
+    Returns measures with goal scores, category, scale, and maintenance level.
+    Use get_measure_detail for full specs on a specific measure.
+    """
+    start = time.monotonic()
+    try:
+        result = await catalog_tools.search_bgi_measures(
+            _get_supabase(), goal, category, keyword, limit
+        )
+        request_logger.log("search_bgi_measures", int((time.monotonic() - start) * 1000), "", "", "ok")
+        return result
+    except ToolError:
+        raise
+    except (SupabaseCircuitOpen, httpx.HTTPError, Exception) as exc:
+        request_logger.log("search_bgi_measures", int((time.monotonic() - start) * 1000), "", "", "error")
+        _raise_supabase_error(exc)
+
+
+@mcp.tool(
+    title="Get BGI Measure Detail",
+    annotations=_READ_ONLY_ANNOTATIONS,
+)
+async def get_measure_detail(measure_id_or_slug: str) -> str:
+    """Get full detail for one BGI measure: performance, costs, scores, constraints.
+
+    Args:
+        measure_id_or_slug: UUID or slug (e.g. "green-roof", "bioswale",
+                           "permeable-paving"). Use search_bgi_measures to find
+                           valid slugs.
+
+    Returns complete measure spec: description, all goal scores with confidence,
+    performance parameters (retention, cooling, infiltration, etc.) with ranges
+    and units, CAPEX/OPEX costs, site requirements, co-benefits, constraint
+    compatibility, and evidence count.
+    """
+    start = time.monotonic()
+    try:
+        result = await catalog_tools.get_measure_detail(_get_supabase(), measure_id_or_slug)
+        request_logger.log("get_measure_detail", int((time.monotonic() - start) * 1000), "", "", "ok")
+        return json.dumps(result.model_dump())
+    except ToolError:
+        request_logger.log("get_measure_detail", int((time.monotonic() - start) * 1000), "", "", "validation_error")
+        raise
+    except (SupabaseCircuitOpen, httpx.HTTPError, Exception) as exc:
+        request_logger.log("get_measure_detail", int((time.monotonic() - start) * 1000), "", "", "error")
+        _raise_supabase_error(exc)
+
+
+@mcp.tool(
+    title="Get Municipality Policy Requirements",
+    annotations=_READ_ONLY_ANNOTATIONS,
+)
+async def get_policy_requirements(
+    gemeente_code_or_name: str,
+    measure_slug: str | None = None,
+) -> PolicyResult:
+    """Get BGI policy requirements for a Dutch municipality.
+
+    Extracted from Officiele Bekendmakingen (official government publications).
+    Shows what's required, recommended, or subsidized per gemeente.
+
+    Args:
+        gemeente_code_or_name: CBS code (e.g. "GM0599") or municipality name
+                              (e.g. "Rotterdam"). Use lookup_municipality to find codes.
+        measure_slug: Optional — filter to one measure's requirements
+
+    Returns requirements grouped by type (subsidy, regulation, obligation)
+    with document titles, dates, amounts, and source URLs.
+    """
+    start = time.monotonic()
+    try:
+        result = await catalog_tools.get_policy_requirements(
+            _get_supabase(), gemeente_code_or_name, measure_slug
+        )
+        request_logger.log("get_policy_requirements", int((time.monotonic() - start) * 1000), "", "", "ok")
+        return result
+    except ToolError:
+        request_logger.log("get_policy_requirements", int((time.monotonic() - start) * 1000), "", "", "validation_error")
+        raise
+    except (SupabaseCircuitOpen, httpx.HTTPError, Exception) as exc:
+        request_logger.log("get_policy_requirements", int((time.monotonic() - start) * 1000), "", "", "error")
+        _raise_supabase_error(exc)
+
+
+@mcp.tool(
+    title="Lookup Municipality",
+    annotations=_READ_ONLY_ANNOTATIONS,
+)
+async def lookup_municipality(
+    name: str | None = None,
+    province: str | None = None,
+) -> MunicipalityResult:
+    """Find Dutch municipalities by name or province.
+
+    Returns CBS codes needed for other tools (get_policy_requirements,
+    rank_measures). All 342 Dutch municipalities are searchable.
+
+    Args:
+        name: Partial name match (e.g. "Rotter" finds Rotterdam)
+        province: Filter by province name (e.g. "Zuid-Holland")
+    """
+    start = time.monotonic()
+    try:
+        result = await catalog_tools.lookup_municipality(_get_supabase(), name, province)
+        request_logger.log("lookup_municipality", int((time.monotonic() - start) * 1000), "", "", "ok")
+        return result
+    except (SupabaseCircuitOpen, httpx.HTTPError, Exception) as exc:
+        request_logger.log("lookup_municipality", int((time.monotonic() - start) * 1000), "", "", "error")
+        _raise_supabase_error(exc)
+
+
+@mcp.tool(
+    title="Rank BGI Measures for Municipality",
+    annotations=_READ_ONLY_ANNOTATIONS,
+)
+async def rank_measures(
+    gemeente_code: str,
+    goal: str | None = None,
+    policy_profile: str = "Balanced",
+    limit: int = 10,
+) -> RankResult:
+    """Rank BGI measures for a municipality using policy-weighted scoring.
+
+    Combines goal alignment, cost-effectiveness, and maintenance into a
+    single ranked list. Use different policy profiles to see how priorities
+    change the ranking.
+
+    Args:
+        gemeente_code: CBS municipality code (e.g. "GM0599" for Rotterdam).
+                      Use lookup_municipality to find codes.
+        goal: Optional boost for a specific goal (flood, heat, drought,
+              biodiversity, social)
+        policy_profile: Scoring profile — one of: Balanced, Flood-focused,
+                       Heat-focused, Drought-focused, Biodiversity-first,
+                       Cost-efficient (default: Balanced)
+        limit: Max results (default 10, max 50)
+    """
+    start = time.monotonic()
+    try:
+        result = await catalog_tools.rank_measures(
+            _get_supabase(), gemeente_code, goal, policy_profile, limit
+        )
+        request_logger.log("rank_measures", int((time.monotonic() - start) * 1000), "", "", "ok")
+        return result
+    except ToolError:
+        request_logger.log("rank_measures", int((time.monotonic() - start) * 1000), "", "", "validation_error")
+        raise
+    except (SupabaseCircuitOpen, httpx.HTTPError, Exception) as exc:
+        request_logger.log("rank_measures", int((time.monotonic() - start) * 1000), "", "", "error")
+        _raise_supabase_error(exc)
+
+
+@mcp.tool(
+    title="Get Environmental Context for Location",
+    annotations=_READ_ONLY_ANNOTATIONS,
+)
+async def get_context_summary(lat: float, lon: float) -> ContextSummary:
+    """Get environmental and socioeconomic context for a location in the Netherlands.
+
+    Returns the neighborhood (buurt), municipality, population density,
+    green space accessibility, health indicators, and livability scores.
+
+    Args:
+        lat: Latitude in WGS84 (e.g. 51.92 for Rotterdam)
+        lon: Longitude in WGS84 (e.g. 4.47 for Rotterdam)
+
+    Useful for understanding the local context before recommending BGI measures.
+    """
+    start = time.monotonic()
+    try:
+        result = await catalog_tools.get_context_summary(_get_supabase(), lat, lon)
+        request_logger.log("get_context_summary", int((time.monotonic() - start) * 1000), "", "", "ok")
+        return result
+    except ToolError:
+        request_logger.log("get_context_summary", int((time.monotonic() - start) * 1000), "", "", "validation_error")
+        raise
+    except (SupabaseCircuitOpen, httpx.HTTPError, Exception) as exc:
+        request_logger.log("get_context_summary", int((time.monotonic() - start) * 1000), "", "", "error")
+        _raise_supabase_error(exc)
+
+
+@mcp.tool(
+    title="Compare BGI Measures",
+    annotations=_READ_ONLY_ANNOTATIONS,
+)
+async def compare_measures(measure_slugs: list[str]) -> CompareResult:
+    """Side-by-side comparison of 2-5 BGI measures.
+
+    Args:
+        measure_slugs: List of 2-5 measure slugs (e.g. ["green-roof", "bioswale"]).
+                      Use search_bgi_measures to find valid slugs.
+
+    Returns aligned comparison with goal scores, key performance parameters
+    (retention, cooling, infiltration), costs, maintenance level, and scale.
+    """
+    start = time.monotonic()
+    try:
+        result = await catalog_tools.compare_measures(_get_supabase(), measure_slugs)
+        request_logger.log("compare_measures", int((time.monotonic() - start) * 1000), "", "", "ok")
+        return result
+    except ToolError:
+        request_logger.log("compare_measures", int((time.monotonic() - start) * 1000), "", "", "validation_error")
+        raise
+    except (SupabaseCircuitOpen, httpx.HTTPError, Exception) as exc:
+        request_logger.log("compare_measures", int((time.monotonic() - start) * 1000), "", "", "error")
+        _raise_supabase_error(exc)
 
 
 # Combine MCP transport with the freshness monitoring endpoint.

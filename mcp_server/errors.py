@@ -80,6 +80,31 @@ def invalid_parameter(value: str, valid_values: list[str]) -> dict[str, Any]:
     }
 
 
+def classify_supabase_error(exc: Exception) -> dict[str, Any]:
+    """Classify a Supabase PostgREST error into an agent-ready error shape."""
+    import httpx
+
+    from mcp_server.supabase_client import SupabaseCircuitOpen
+
+    base = {
+        "error": "catalog_unavailable",
+        "message": "BGI catalog data source is temporarily unreachable",
+        "side_effects": "none",
+    }
+    if isinstance(exc, SupabaseCircuitOpen):
+        return {**base, "cause": "circuit_breaker_open", "fix": "Retry after 60 seconds", "retry_after_seconds": 60}
+    if isinstance(exc, httpx.ReadTimeout):
+        return {**base, "cause": "timeout", "fix": "Retry after 30 seconds", "retry_after_seconds": 30}
+    if isinstance(exc, httpx.ConnectTimeout):
+        return {**base, "cause": "connection_timeout", "fix": "Retry after 60 seconds", "retry_after_seconds": 60}
+    if isinstance(exc, httpx.ConnectError):
+        return {**base, "cause": "connection_failed", "fix": "Retry after 60 seconds", "retry_after_seconds": 60}
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        return {**base, "cause": f"http_{status}", "fix": "Retry after 30 seconds", "retry_after_seconds": 30}
+    return {**base, "cause": type(exc).__name__, "fix": "Retry after 60 seconds", "retry_after_seconds": 60}
+
+
 def invalid_coordinates(lat: float, lon: float) -> dict[str, Any]:
     return {
         "error": "invalid_coordinates",
