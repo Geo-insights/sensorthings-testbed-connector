@@ -68,6 +68,36 @@ async def list_sources() -> str:
         return _handle_frost_error(exc)
 
 
+@mcp.resource(
+    "sensorthings://sources",
+    name="sources",
+    description=(
+        "Catalog of all environmental data sources with station counts "
+        "and geographic coverage. Returns a JSON array of sources."
+    ),
+    mime_type="application/json",
+)
+async def sources_resource() -> str:
+    """Read handler for the sources resource."""
+    result = await tool_impls.list_sources(_get_client())
+    return json.dumps(result)
+
+
+@mcp.resource(
+    "sensorthings://parameters",
+    name="parameters",
+    description=(
+        "All 35 canonical environmental parameters with units, aliases, "
+        "and CF Conventions definition URLs. In-memory lookup, no FROST query."
+    ),
+    mime_type="application/json",
+)
+async def parameters_resource() -> str:
+    """Read handler for the parameters resource."""
+    result = await tool_impls.get_parameters()
+    return json.dumps(result)
+
+
 @mcp.tool()
 async def get_parameters() -> str:
     """List all 35 available environmental parameters with units and aliases.
