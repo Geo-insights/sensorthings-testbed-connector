@@ -28,10 +28,15 @@ FROST_BASE = "https://sta.wbd-rd.nl/FROST-Server/v1.1"
 FROST_AUTH = (settings.auth_username, settings.auth_password)
 DS_IDS = dict(settings.datastream_ids)  # stream_key → frost DS id
 
-DB_URL = (
-    "postgresql://postgres.upjxsqjnrnamsexrlkqx:"
-    "***REMOVED***@aws-1-eu-central-2.pooler.supabase.com:5432/postgres"
-)
+import os
+
+DB_URL = os.getenv("SUPABASE_DB_URL", "")
+if not DB_URL:
+    raise RuntimeError(
+        "SUPABASE_DB_URL env var is required. "
+        "Set it to: postgresql://postgres.upjxsqjnrnamsexrlkqx:<password>"
+        "@aws-1-eu-central-2.pooler.supabase.com:5432/postgres"
+    )
 
 # monitoring sensor_id by frost_datastream_id
 MONITORING_SENSOR_MAP: dict[str, str] = {}
