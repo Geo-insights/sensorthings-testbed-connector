@@ -18,7 +18,7 @@ class McpSettings:
     frost_auth_username: str = os.getenv("FROST_AUTH_USERNAME", "")
     frost_auth_password: str = os.getenv("FROST_AUTH_PASSWORD", "")
     frost_timeout_seconds: float = float(
-        os.getenv("MCP_REQUEST_TIMEOUT_SECONDS", "15")
+        os.getenv("MCP_REQUEST_TIMEOUT_SECONDS", "30")
     )
 
     rate_limit_rpm: int = int(os.getenv("MCP_RATE_LIMIT_RPM", "100"))
