@@ -113,8 +113,17 @@ async def parameters_resource() -> str:
 async def list_sources() -> SourcesResult:
     """List all environmental data sources with station counts and geographic coverage.
 
-    Returns sources with name, station_count, datastream_count, and
-    source_attribution fields. Use this to discover what data is available.
+    Call this first to discover which data sources are available and how many
+    stations each one has. Returns sources with name, station_count,
+    datastream_count, and source_attribution (CC-BY license info).
+
+    Sources include KNMI (weather), Luchtmeetnet (air quality), BRO
+    (groundwater), Samen Meten (citizen science), Sensor.Community, and more.
+
+    Typical workflow: list_sources → get_parameters → get_latest_readings.
+
+    On error, returns a structured error with cause (timeout, circuit_breaker_open,
+    connection_failed) and retry_after_seconds.
     """
     start = time.monotonic()
     try:
@@ -133,9 +142,13 @@ async def list_sources() -> SourcesResult:
 async def get_parameters() -> ParametersResult:
     """List all 35 available environmental parameters with units and aliases.
 
-    Returns parameters with name, display_name, unit (UCUM), definition_url
-    (CF Conventions), and aliases (alternative names you can use in
-    get_latest_readings). No FROST query needed — this is an in-memory lookup.
+    Returns parameters with name, display_name, unit_display (human-readable),
+    unit_ucum (formal UCUM code), definition_url (CF Conventions), and aliases.
+    Use aliases in the 'parameter' argument of get_latest_readings or
+    get_readings_history (e.g. "pm25", "temperature", "no2").
+
+    No FROST query needed — this is an instant in-memory lookup. Call it to
+    discover valid parameter names before querying readings.
     """
     start = time.monotonic()
     result = await tool_impls.get_parameters()
@@ -154,7 +167,7 @@ async def get_latest_readings(
     parameter: str | None = None,
     limit: int = 100,
 ) -> ReadingsResult:
-    """Get latest environmental readings near a location.
+    """Get the most recent environmental readings near a location.
 
     Args:
         lat: Latitude in WGS84 (e.g. 51.92 for Rotterdam)
@@ -165,8 +178,16 @@ async def get_latest_readings(
                    all valid names and aliases.
         limit: Maximum number of readings to return (default 100, max 500)
 
-    Returns readings with parameter, value, unit, timestamp, station_name,
-    coordinates, source, and source_attribution.
+    Returns the single most recent reading per datastream within the radius.
+    Each reading includes parameter, value, unit, timestamp, station_name,
+    lat, lon, source, and source_attribution.
+
+    For time-range queries, use get_readings_history instead.
+
+    Invalid coordinates return an error with the valid ranges.
+    An unrecognized parameter returns an error with the full list of valid names.
+    If the data source is unreachable, returns cause (timeout, circuit_breaker_open)
+    and retry_after_seconds.
     """
     start = time.monotonic()
     try:
@@ -198,18 +219,25 @@ async def get_readings_history(
 ) -> HistoryResult:
     """Get historical environmental readings near a location over a time range.
 
+    Use this for trend analysis, comparisons, and time-series queries.
+    Unlike get_latest_readings (which returns only the most recent value),
+    this returns multiple observations per station within the time window.
+
     Args:
         lat: Latitude in WGS84 (e.g. 51.92 for Rotterdam)
         lon: Longitude in WGS84 (e.g. 4.47 for Rotterdam)
-        parameter: Parameter name or alias (e.g. "temperature", "pm25", "no2").
-                   Use get_parameters() to see all valid names and aliases.
+        parameter: Parameter name or alias (required — e.g. "temperature",
+                   "pm25", "no2"). Use get_parameters() for valid names.
         start: Start of time range in ISO 8601 (e.g. "2026-11-01T00:00:00Z")
         end: End of time range in ISO 8601 (default: now)
         radius_km: Search radius in kilometers (default 10, max 50)
         limit: Maximum readings per station (default 100, max 1000)
 
-    Returns stations with their historical readings, parameter info, and
-    time range metadata.
+    Returns stations grouped by location, each with a time-ordered array of
+    readings, plus parameter info and the actual time range covered.
+
+    Invalid coordinates, unrecognized parameters, or unparseable dates return
+    a structured error. Data source failures include cause and retry timing.
     """
     start_t = time.monotonic()
     try:
@@ -234,8 +262,15 @@ async def get_data_freshness() -> FreshnessResult:
     """Check how fresh the data is for each of the 10 sources.
 
     Returns sources with latest_observation timestamp, age_seconds, and a
-    status classification: "fresh" (<1h), "stale" (<24h), or "offline" (>24h).
-    Use this to check if a specific data source is currently delivering data.
+    status classification: "fresh" (<1h), "stale" (<24h), "offline" (>24h),
+    or "unreachable" (query failed for that source).
+
+    Use this to verify data availability before querying readings, or to
+    monitor source health. Individual source failures are reported per-source
+    (status: "unreachable") rather than failing the entire call.
+
+    This is also the server's health check — if this tool works, the server
+    is operational.
     """
     start = time.monotonic()
     try:
