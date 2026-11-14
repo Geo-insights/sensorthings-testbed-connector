@@ -18,10 +18,12 @@ from mcp_types import ToolAnnotations
 from starlette.routing import Route
 
 from mcp_server import tools as tool_impls
+from mcp_server.auth import auth_enabled
 from mcp_server.errors import classify_frost_error
 from mcp_server.freshness import freshness_endpoint
 from mcp_server.frost_client import CircuitOpen, FrostReadClient
 from mcp_server.middleware import request_logger
+from mcp_server.oauth_discovery import oauth_protected_resource_endpoint
 from mcp_server.schemas import (
     FreshnessResult,
     HistoryResult,
@@ -260,3 +262,22 @@ app = mcp.streamable_http_app(
     ),
 )
 app.routes.insert(0, Route("/freshness", freshness_endpoint))
+if auth_enabled():
+    app.routes.insert(
+        0, Route("/.well-known/oauth-protected-resource", oauth_protected_resource_endpoint)
+    )
+
+# Glama connector ownership verification
+# https://glama.ai/mcp/connectors — must be served at /.well-known/glama.json
+_GLAMA_CLAIM = {
+    "$schema": "https://glama.ai/mcp/schemas/connector.json",
+    "claim": "glama_claim_m6KSXae8bIt80Mim9KtadQUJo0DMEEzM",
+}
+
+
+async def _glama_claim_endpoint(request):  # type: ignore[no-untyped-def]
+    from starlette.responses import JSONResponse as _JSONResponse
+    return _JSONResponse(_GLAMA_CLAIM)
+
+
+app.routes.insert(0, Route("/.well-known/glama.json", _glama_claim_endpoint))
