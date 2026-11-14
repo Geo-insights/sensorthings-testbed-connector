@@ -16,9 +16,7 @@ from mcp.server.streamable_http import TransportSecuritySettings
 from starlette.routing import Route
 
 from mcp_server import tools as tool_impls
-from mcp_server.errors import (
-    sensor_data_unavailable,
-)
+from mcp_server.errors import classify_frost_error
 from mcp_server.freshness import freshness_endpoint
 from mcp_server.frost_client import CircuitOpen, FrostReadClient
 from mcp_server.middleware import request_logger
@@ -49,12 +47,8 @@ def _get_client() -> FrostReadClient:
 
 
 def _handle_frost_error(exc: Exception) -> str:
-    """Convert FROST errors to agent-ready JSON error strings."""
-    if isinstance(exc, CircuitOpen):
-        return json.dumps(sensor_data_unavailable(retry_after_seconds=60))
-    if isinstance(exc, httpx.HTTPStatusError):
-        return json.dumps(sensor_data_unavailable(retry_after_seconds=30))
-    return json.dumps(sensor_data_unavailable(retry_after_seconds=60))
+    """Convert FROST errors to agent-ready JSON error strings with cause."""
+    return json.dumps(classify_frost_error(exc))
 
 
 @mcp.tool()

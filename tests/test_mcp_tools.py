@@ -166,23 +166,49 @@ async def test_get_data_freshness_classifies_status():
     offline_time = (now - datetime.timedelta(days=3)).isoformat()
 
     mock_client = AsyncMock()
-    mock_client.get_datastreams.return_value = {"value": [
-        {
-            "Thing": {"properties": {"source": "knmi"}},
-            "Observations": [{"phenomenonTime": fresh_time}],
-        },
-        {
-            "Thing": {"properties": {"source": "bro"}},
-            "Observations": [{"phenomenonTime": stale_time}],
-        },
-        {
-            "Thing": {"properties": {"source": "bridge"}},
-            "Observations": [{"phenomenonTime": offline_time}],
-        },
+    # Step 1: get_things returns sources
+    mock_client.get_things.return_value = {"value": [
+        {"@iot.id": 1, "properties": {"source": "knmi"}},
+        {"@iot.id": 2, "properties": {"source": "bro"}},
+        {"@iot.id": 3, "properties": {"source": "bridge"}},
     ]}
+    # Step 2: get_observations called per source in sorted order: bridge, bro, knmi
+    mock_client.get_observations.side_effect = [
+        {"value": [{"phenomenonTime": offline_time}]},   # bridge
+        {"value": [{"phenomenonTime": stale_time}]},     # bro
+        {"value": [{"phenomenonTime": fresh_time}]},     # knmi
+    ]
 
     result = await tool_impls.get_data_freshness(mock_client)
     statuses = {r["source"]: r["status"] for r in result}
     assert statuses["knmi"] == "fresh"
     assert statuses["bro"] == "stale"
     assert statuses["bridge"] == "offline"
+
+
+@pytest.mark.asyncio
+async def test_get_data_freshness_marks_unreachable():
+    """protects=partial failure resilience; fails_when=entire call fails on one source timeout; no_claim=none"""
+    import datetime
+
+    now = datetime.datetime.now(datetime.UTC)
+    fresh_time = (now - datetime.timedelta(minutes=5)).isoformat()
+
+    mock_client = AsyncMock()
+    mock_client.get_things.return_value = {"value": [
+        {"@iot.id": 1, "properties": {"source": "knmi"}},
+        {"@iot.id": 2, "properties": {"source": "bro"}},
+    ]}
+    import httpx
+    # Sorted order: bro, knmi
+    mock_client.get_observations.side_effect = [
+        httpx.ReadTimeout("timeout"),                      # bro
+        {"value": [{"phenomenonTime": fresh_time}]},       # knmi
+    ]
+
+    result = await tool_impls.get_data_freshness(mock_client)
+    assert len(result) == 2
+    knmi = next(r for r in result if r["source"] == "knmi")
+    bro = next(r for r in result if r["source"] == "bro")
+    assert knmi["status"] == "fresh"
+    assert bro["status"] == "unreachable"

@@ -49,7 +49,7 @@ async def list_sources(client: FrostReadClient) -> list[dict[str, Any]]:
             expand="Locations,Datastreams($count=true;$top=0)",
         )
     except (httpx.HTTPError, Exception) as exc:
-        logger.error("FROST query failed for list_sources details: %s", exc)
+        logger.error("FROST query failed for list_sources: %s: %s", type(exc).__name__, exc)
         raise
 
     for thing in things_data.get("value", []):
@@ -193,69 +193,80 @@ async def get_latest_readings(
 
 
 async def get_data_freshness(client: FrostReadClient) -> list[dict[str, Any]]:
-    """Check data freshness per source."""
+    """Check data freshness per source.
+
+    Never fails entirely — marks individual sources as "unreachable" if the
+    FROST query times out, so callers always get a usable response.
+    """
     import datetime
 
+    now = datetime.datetime.now(datetime.UTC)
+
+    # Step 1: Get all Things (lightweight, no $expand on Observations)
     try:
-        data = await client.get_datastreams(
-            top=1000,
-            expand="Thing,Observations($top=1;$orderby=phenomenonTime desc)",
-        )
+        things_data = await client.get_things(top=1000)
     except CircuitOpen:
         raise
     except (httpx.HTTPError, Exception) as exc:
-        logger.error("FROST query failed for get_data_freshness: %s", exc)
+        logger.error("FROST query failed for get_data_freshness (Things): %s: %s", type(exc).__name__, exc)
         raise
 
-    # Group by source, track the most recent observation per source
-    source_freshness: dict[str, dict[str, Any]] = {}
-    now = datetime.datetime.now(datetime.UTC)
-
-    for ds in data.get("value", []):
-        thing = ds.get("Thing", {})
+    # Group things by source
+    sources: dict[str, list[int]] = {}
+    for thing in things_data.get("value", []):
         source = thing.get("properties", {}).get("source", "unknown")
+        thing_id = thing.get("@iot.id")
+        if thing_id is not None:
+            sources.setdefault(source, []).append(thing_id)
 
-        observations = ds.get("Observations", [])
-        if not observations:
-            continue
-
-        obs_time_str = observations[0].get("phenomenonTime", "")
-        if not obs_time_str:
-            continue
-
-        # Parse the observation time
-        try:
-            # Handle both ISO formats FROST might return
-            obs_time_str_clean = obs_time_str.split("/")[0]  # Handle interval format
-            if obs_time_str_clean.endswith("Z"):
-                obs_time_str_clean = obs_time_str_clean[:-1] + "+00:00"
-            obs_time = datetime.datetime.fromisoformat(obs_time_str_clean)
-            if obs_time.tzinfo is None:
-                obs_time = obs_time.replace(tzinfo=datetime.UTC)
-        except (ValueError, IndexError):
-            continue
-
-        age_seconds = (now - obs_time).total_seconds()
-
-        if source not in source_freshness or age_seconds < source_freshness[source]["age_seconds"]:
-            source_freshness[source] = {
-                "source": source,
-                "latest_observation": obs_time_str,
-                "age_seconds": int(age_seconds),
-                "source_attribution": _get_attribution(source),
-            }
-
-    # Classify freshness
+    # Step 2: For each source, query ONE latest observation (much lighter)
     result: list[dict[str, Any]] = []
-    for info in sorted(source_freshness.values(), key=lambda x: x["age_seconds"]):
-        age = info["age_seconds"]
-        if age < 3600:
-            status = "fresh"
-        elif age < 86400:
-            status = "stale"
-        else:
-            status = "offline"
-        info["status"] = status
-        result.append(info)
+    for source, _thing_ids in sorted(sources.items()):
+        entry: dict[str, Any] = {
+            "source": source,
+            "source_attribution": _get_attribution(source),
+        }
+        try:
+            # Get the single most recent observation across all datastreams for this source
+            obs_data = await client.get_observations(
+                top=1,
+                orderby="phenomenonTime desc",
+                filter_=f"Datastream/Thing/properties/source eq '{source}'",
+            )
+            observations = obs_data.get("value", [])
+            if observations:
+                obs_time_str = observations[0].get("phenomenonTime", "")
+                if obs_time_str:
+                    obs_time_str_clean = obs_time_str.split("/")[0]
+                    if obs_time_str_clean.endswith("Z"):
+                        obs_time_str_clean = obs_time_str_clean[:-1] + "+00:00"
+                    obs_time = datetime.datetime.fromisoformat(obs_time_str_clean)
+                    if obs_time.tzinfo is None:
+                        obs_time = obs_time.replace(tzinfo=datetime.UTC)
+                    age = int((now - obs_time).total_seconds())
+                    entry["latest_observation"] = obs_time_str
+                    entry["age_seconds"] = age
+                    if age < 3600:
+                        entry["status"] = "fresh"
+                    elif age < 86400:
+                        entry["status"] = "stale"
+                    else:
+                        entry["status"] = "offline"
+                else:
+                    entry["status"] = "no_data"
+                    entry["age_seconds"] = None
+            else:
+                entry["status"] = "no_data"
+                entry["age_seconds"] = None
+        except (httpx.HTTPError, Exception) as exc:
+            logger.warning("FROST query failed for source %s freshness: %s: %s", source, type(exc).__name__, exc)
+            entry["status"] = "unreachable"
+            entry["age_seconds"] = None
+            entry["error"] = type(exc).__name__
 
+        result.append(entry)
+
+    # Sort: fresh first, then stale, then offline, then unreachable
+    status_order = {"fresh": 0, "stale": 1, "offline": 2, "no_data": 3, "unreachable": 4}
+    result.sort(key=lambda x: (status_order.get(x["status"], 5), x.get("age_seconds") or 999999))
     return result

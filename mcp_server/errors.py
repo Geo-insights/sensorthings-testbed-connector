@@ -19,14 +19,56 @@ def rate_limit_error(limit: int, retry_after_seconds: int) -> dict[str, Any]:
     }
 
 
-def sensor_data_unavailable(retry_after_seconds: int = 60) -> dict[str, Any]:
+def sensor_data_unavailable(
+    retry_after_seconds: int = 60,
+    cause: str = "unknown",
+) -> dict[str, Any]:
     return {
         "error": "sensor_data_unavailable",
         "message": "Environmental sensor data source is temporarily unreachable",
+        "cause": cause,
         "fix": f"Retry after {retry_after_seconds} seconds",
         "retry_after_seconds": retry_after_seconds,
         "side_effects": "none",
     }
+
+
+def classify_frost_error(exc: Exception) -> dict[str, Any]:
+    """Classify a FROST error into an agent-ready error shape with cause detail."""
+    import httpx
+
+    from mcp_server.frost_client import CircuitOpen
+
+    if isinstance(exc, CircuitOpen):
+        return sensor_data_unavailable(
+            retry_after_seconds=60,
+            cause="circuit_breaker_open (data source had repeated failures, backing off)",
+        )
+    if isinstance(exc, httpx.ReadTimeout):
+        return sensor_data_unavailable(
+            retry_after_seconds=30,
+            cause="timeout (data source query took too long)",
+        )
+    if isinstance(exc, httpx.ConnectTimeout):
+        return sensor_data_unavailable(
+            retry_after_seconds=60,
+            cause="connection_timeout (could not reach data source)",
+        )
+    if isinstance(exc, httpx.ConnectError):
+        return sensor_data_unavailable(
+            retry_after_seconds=60,
+            cause="connection_failed (DNS or network error reaching data source)",
+        )
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        return sensor_data_unavailable(
+            retry_after_seconds=30,
+            cause=f"http_{status} (data source returned error status {status})",
+        )
+    return sensor_data_unavailable(
+        retry_after_seconds=60,
+        cause=f"{type(exc).__name__}",
+    )
 
 
 def invalid_parameter(value: str, valid_values: list[str]) -> dict[str, Any]:
