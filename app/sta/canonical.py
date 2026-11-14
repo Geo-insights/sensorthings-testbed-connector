@@ -5,9 +5,9 @@ Conventions definition URLs across every source mapper. Source mappers must
 resolve raw incoming names through :func:`resolve` and read the unit symbol
 from ``.meta`` — never pass a source-provided unit string through to FROST.
 
-Unit symbols follow pragmatic UCUM (``°C`` not ``Cel``, ``ppm`` not
-``[ppm]``, ``deg`` not ``degrees``) so dashboards stay readable while every
-target FROST server sees identical strings across sources.
+``unit`` is the display symbol (``°C``, ``ppm``) pushed to FROST and shown
+on dashboards.  ``ucum`` is the formal UCUM code (``Cel``, ``[ppm]``)
+returned by the MCP server for standards compliance.
 
 Governance: this enum covers *environmental observations* only.  Device
 telemetry fields (battery voltage, RSSI, etc.) do not belong here — they
@@ -22,8 +22,9 @@ from typing import NamedTuple
 
 class DatastreamMeta(NamedTuple):
     display_name: str
-    unit: str
-    definition: str
+    unit: str          # display symbol pushed to FROST (e.g. "°C")
+    definition: str    # CF Conventions URL
+    ucum: str = ""     # formal UCUM code (e.g. "Cel"); empty = unit IS the UCUM code
 
 
 _CF = "https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html"
@@ -78,12 +79,15 @@ class CanonicalDatastream(StrEnum):
         return _META[self]
 
 
+# No CF standard name exists for these; link to the CF table root instead.
+_CF_NONE = f"{_CF}"
+
 _META: dict[CanonicalDatastream, DatastreamMeta] = {
     CanonicalDatastream.TEMPERATURE: DatastreamMeta(
-        "Air temperature", "°C", f"{_CF}#air_temperature",
+        "Air temperature", "°C", f"{_CF}#air_temperature", "Cel",
     ),
     CanonicalDatastream.AIR_TEMPERATURE: DatastreamMeta(
-        "Air temperature", "°C", f"{_CF}#air_temperature",
+        "Air temperature", "°C", f"{_CF}#air_temperature", "Cel",
     ),
     CanonicalDatastream.HUMIDITY: DatastreamMeta(
         "Relative humidity", "%", f"{_CF}#relative_humidity",
@@ -93,7 +97,7 @@ _META: dict[CanonicalDatastream, DatastreamMeta] = {
     ),
     CanonicalDatastream.CO2: DatastreamMeta(
         "CO2 concentration", "ppm",
-        f"{_CF}#mole_fraction_of_carbon_dioxide_in_air",
+        f"{_CF}#mole_fraction_of_carbon_dioxide_in_air", "[ppm]",
     ),
     CanonicalDatastream.PRESSURE: DatastreamMeta(
         "Air pressure", "hPa", f"{_CF}#air_pressure",
@@ -110,16 +114,19 @@ _META: dict[CanonicalDatastream, DatastreamMeta] = {
     CanonicalDatastream.WIND_DIRECTION: DatastreamMeta(
         "Wind direction", "deg", f"{_CF}#wind_from_direction",
     ),
+    # Accumulation period depends on source (hourly for KNMI/Buienradar).
     CanonicalDatastream.PRECIPITATION: DatastreamMeta(
-        "Precipitation", "mm", f"{_CF}#precipitation_amount",
+        "Precipitation", "mm",
+        f"{_CF}#precipitation_amount",
     ),
     CanonicalDatastream.SOLAR_RADIATION: DatastreamMeta(
         "Solar radiation", "W/m2",
         f"{_CF}#surface_downwelling_shortwave_flux_in_air",
     ),
     CanonicalDatastream.WATER_LEVEL: DatastreamMeta(
+        # BRO groundwater level — distinct from surface water level.
         "Groundwater level", "m",
-        f"{_CF}#water_surface_height_above_reference_datum",
+        f"{_CF}#depth_below_geoid", "m",
     ),
     CanonicalDatastream.PM2_5: DatastreamMeta(
         "PM2.5 concentration", "ug/m3",
@@ -130,13 +137,15 @@ _META: dict[CanonicalDatastream, DatastreamMeta] = {
         f"{_CF}#mass_concentration_of_pm10_ambient_aerosol_particles_in_air",
     ),
     CanonicalDatastream.DEW_POINT: DatastreamMeta(
-        "Dew point temperature", "°C", f"{_CF}#dew_point_temperature",
+        "Dew point temperature", "°C", f"{_CF}#dew_point_temperature", "Cel",
     ),
     CanonicalDatastream.HEAT_INDEX: DatastreamMeta(
-        "Heat index", "°C", f"{_CF}#heat_index_of_air_temperature",
+        # No CF standard name for heat index.
+        "Heat index", "°C", _CF_NONE, "Cel",
     ),
     CanonicalDatastream.WIND_CHILL: DatastreamMeta(
-        "Wind chill", "°C", f"{_CF}#wind_chill_of_air_temperature",
+        # No CF standard name for wind chill.
+        "Wind chill", "°C", _CF_NONE, "Cel",
     ),
     CanonicalDatastream.WIND_GUST: DatastreamMeta(
         "Wind gust speed", "km/h", f"{_CF}#wind_speed_of_gust",
@@ -145,13 +154,16 @@ _META: dict[CanonicalDatastream, DatastreamMeta] = {
         "Rainfall rate", "mm/h", f"{_CF}#rainfall_rate",
     ),
     CanonicalDatastream.UV_INDEX: DatastreamMeta(
-        "UV index", "1", f"{_CF}#ultraviolet_index",
+        # No CF standard name for UV index.
+        "UV index", "1", _CF_NONE,
     ),
     CanonicalDatastream.WET_BULB_TEMPERATURE: DatastreamMeta(
-        "Wet bulb temperature", "°C", f"{_CF}#wet_bulb_temperature",
+        "Wet bulb temperature", "°C", f"{_CF}#wet_bulb_temperature", "Cel",
     ),
+    # Accumulation period depends on source.
     CanonicalDatastream.EVAPOTRANSPIRATION: DatastreamMeta(
-        "Evapotranspiration", "mm", f"{_CF}#water_evapotranspiration_amount",
+        "Evapotranspiration", "mm",
+        f"{_CF}#water_evapotranspiration_amount",
     ),
     # Luchtmeetnet air quality (#11)
     CanonicalDatastream.NO2: DatastreamMeta(
@@ -181,25 +193,27 @@ _META: dict[CanonicalDatastream, DatastreamMeta] = {
     # Sensor.Community noise (#12)
     CanonicalDatastream.NOISE_LAEQ: DatastreamMeta(
         "Noise level (LAeq)", "dB(A)",
-        f"{_CF}#equivalent_continuous_a_weighted_sound_pressure_level_in_air",
+        f"{_CF}#sound_pressure_level_in_air", "dB",
     ),
     CanonicalDatastream.NOISE_LAMIN: DatastreamMeta(
         "Noise level minimum (LAmin)", "dB(A)",
-        f"{_CF}#equivalent_continuous_a_weighted_sound_pressure_level_in_air",
+        f"{_CF}#sound_pressure_level_in_air", "dB",
     ),
     CanonicalDatastream.NOISE_LAMAX: DatastreamMeta(
         "Noise level maximum (LAmax)", "dB(A)",
-        f"{_CF}#equivalent_continuous_a_weighted_sound_pressure_level_in_air",
+        f"{_CF}#sound_pressure_level_in_air", "dB",
     ),
     # Buienradar weather (#14)
     CanonicalDatastream.VISIBILITY: DatastreamMeta(
         "Visibility", "m", f"{_CF}#visibility_in_air",
     ),
     CanonicalDatastream.GROUND_TEMPERATURE: DatastreamMeta(
-        "Ground temperature", "°C", f"{_CF}#soil_temperature",
+        "Ground surface temperature", "°C",
+        f"{_CF}#surface_temperature", "Cel",
     ),
     CanonicalDatastream.FEEL_TEMPERATURE: DatastreamMeta(
-        "Feels-like temperature", "°C", f"{_CF}#air_temperature",
+        # Apparent / feels-like temperature — no CF standard name.
+        "Feels-like temperature", "°C", _CF_NONE, "Cel",
     ),
     # Meet je Stad soil (#15)
     CanonicalDatastream.SOIL_MOISTURE: DatastreamMeta(
@@ -208,7 +222,7 @@ _META: dict[CanonicalDatastream, DatastreamMeta] = {
     ),
     CanonicalDatastream.SOIL_TEMPERATURE: DatastreamMeta(
         "Soil temperature", "°C",
-        f"{_CF}#soil_temperature",
+        f"{_CF}#soil_temperature", "Cel",
     ),
 }
 

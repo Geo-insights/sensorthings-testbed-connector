@@ -54,17 +54,18 @@ async def test_list_sources_circuit_open():
 @pytest.mark.asyncio
 async def test_get_parameters_returns_all_canonical():
     """protects=all 35 params returned; fails_when=missing params; no_claim=none (in-memory)"""
+    from app.sta.canonical import CanonicalDatastream
 
     result = await tool_impls.get_parameters()
-    # Should have entries (some share display_name so deduped)
-    assert len(result) > 0
-    # Each entry has required fields
+    assert len(result) == len(CanonicalDatastream)  # all 35, no dedup
     for param in result:
         assert "name" in param
         assert "display_name" in param
-        assert "unit" in param
+        assert "unit_display" in param
+        assert "unit_ucum" in param
         assert "aliases" in param
         assert isinstance(param["aliases"], list)
+        assert param["unit_ucum"]  # never empty
 
 
 @pytest.mark.asyncio
@@ -74,6 +75,19 @@ async def test_get_parameters_includes_aliases():
     pm25 = next((p for p in result if p["name"] == "pm2_5"), None)
     assert pm25 is not None
     assert "pm25" in pm25["aliases"] or "pm2.5" in pm25["aliases"]
+
+
+@pytest.mark.asyncio
+async def test_get_parameters_ucum_codes():
+    """protects=UCUM code correctness; fails_when=°C returned as ucum code; no_claim=none"""
+    result = await tool_impls.get_parameters()
+    temp = next(p for p in result if p["name"] == "temperature")
+    assert temp["unit_display"] == "°C"
+    assert temp["unit_ucum"] == "Cel"
+    co2 = next(p for p in result if p["name"] == "co2")
+    assert co2["unit_ucum"] == "[ppm]"
+    noise = next(p for p in result if p["name"] == "noise_laeq")
+    assert noise["unit_ucum"] == "dB"
 
 
 # -- get_latest_readings ---------------------------------------------------

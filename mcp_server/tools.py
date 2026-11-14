@@ -72,6 +72,8 @@ async def list_sources(client: FrostReadClient) -> list[dict[str, Any]]:
 async def get_parameters() -> list[dict[str, Any]]:
     """List all available environmental parameters with units and aliases.
 
+    Returns all 35 canonical parameter names. Each is a valid value for the
+    ``parameter`` argument in ``get_latest_readings``.
     This is a pure in-memory lookup — no FROST query needed.
     """
     from app.sta.canonical import _ALIASES
@@ -82,24 +84,14 @@ async def get_parameters() -> list[dict[str, Any]]:
         alias_map.setdefault(canonical.value, []).append(alias)
 
     result: list[dict[str, Any]] = []
-    seen: set[str] = set()
     for member in CanonicalDatastream:
-        # Deduplicate entries that share the same display name
         meta: DatastreamMeta = member.meta
-        if meta.display_name in seen:
-            # Merge aliases into the existing entry
-            for entry in result:
-                if entry["display_name"] == meta.display_name:
-                    entry["aliases"] = sorted(
-                        set(entry["aliases"]) | set(alias_map.get(member.value, []))
-                        | {member.value}
-                    )
-            continue
-        seen.add(meta.display_name)
+        ucum_code = meta.ucum if meta.ucum else meta.unit
         result.append({
             "name": member.value,
             "display_name": meta.display_name,
-            "unit": meta.unit,
+            "unit_display": meta.unit,
+            "unit_ucum": ucum_code,
             "definition_url": meta.definition,
             "aliases": sorted(
                 set(alias_map.get(member.value, [])) | {member.value}
