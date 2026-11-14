@@ -6,14 +6,29 @@ with source attribution for CC-BY compliance.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
 import httpx
+from mcp.server.mcpserver.exceptions import ToolError
 
 from app.sta.canonical import CanonicalDatastream, DatastreamMeta, resolve
 from mcp_server.errors import invalid_coordinates, invalid_parameter
 from mcp_server.frost_client import CircuitOpen, FrostReadClient
+from mcp_server.schemas import (
+    FreshnessEntry,
+    FreshnessResult,
+    HistoryReading,
+    HistoryResult,
+    ParameterInfo,
+    ParametersResult,
+    Reading,
+    ReadingsResult,
+    SourceInfo,
+    SourcesResult,
+    StationHistory,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +54,7 @@ def _get_attribution(source_name: str) -> str:
     return _ATTRIBUTION.get(key, _DEFAULT_ATTRIBUTION)
 
 
-async def list_sources(client: FrostReadClient) -> list[dict[str, Any]]:
+async def list_sources(client: FrostReadClient) -> SourcesResult:
     """List all environmental data sources with station counts."""
     # Group Things by their source property
     sources: dict[str, dict[str, Any]] = {}
@@ -66,10 +81,12 @@ async def list_sources(client: FrostReadClient) -> list[dict[str, Any]]:
         ds_count = thing.get("Datastreams@iot.count", 0)
         sources[source]["datastream_count"] += ds_count
 
-    return list(sources.values())
+    return SourcesResult(
+        sources=[SourceInfo(**s) for s in sources.values()]
+    )
 
 
-async def get_parameters() -> list[dict[str, Any]]:
+async def get_parameters() -> ParametersResult:
     """List all available environmental parameters with units and aliases.
 
     Returns all 35 canonical parameter names. Each is a valid value for the
@@ -83,22 +100,22 @@ async def get_parameters() -> list[dict[str, Any]]:
     for alias, canonical in _ALIASES.items():
         alias_map.setdefault(canonical.value, []).append(alias)
 
-    result: list[dict[str, Any]] = []
+    params: list[ParameterInfo] = []
     for member in CanonicalDatastream:
         meta: DatastreamMeta = member.meta
         ucum_code = meta.ucum if meta.ucum else meta.unit
-        result.append({
-            "name": member.value,
-            "display_name": meta.display_name,
-            "unit_display": meta.unit,
-            "unit_ucum": ucum_code,
-            "definition_url": meta.definition,
-            "aliases": sorted(
+        params.append(ParameterInfo(
+            name=member.value,
+            display_name=meta.display_name,
+            unit_display=meta.unit,
+            unit_ucum=ucum_code,
+            definition_url=meta.definition,
+            aliases=sorted(
                 set(alias_map.get(member.value, [])) | {member.value}
             ),
-        })
+        ))
 
-    return result
+    return ParametersResult(parameters=params)
 
 
 async def get_latest_readings(
@@ -108,11 +125,11 @@ async def get_latest_readings(
     radius_km: float = 10.0,
     parameter: str | None = None,
     limit: int = 100,
-) -> dict[str, Any]:
+) -> ReadingsResult:
     """Get latest environmental readings near a location."""
     # Validate coordinates
     if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
-        return {"error": True, **invalid_coordinates(lat, lon)}
+        raise ToolError(json.dumps(invalid_coordinates(lat, lon)))
 
     # Validate parameter if provided
     canonical = None
@@ -120,7 +137,7 @@ async def get_latest_readings(
         canonical = resolve(parameter)
         if canonical is None:
             valid = sorted(m.value for m in CanonicalDatastream)
-            return {"error": True, **invalid_parameter(parameter, valid)}
+            raise ToolError(json.dumps(invalid_parameter(parameter, valid)))
 
     # Clamp limit
     limit = max(1, min(limit, 500))
@@ -155,7 +172,7 @@ async def get_latest_readings(
         logger.error("FROST query failed for get_latest_readings: %s", exc)
         raise
 
-    readings: list[dict[str, Any]] = []
+    readings: list[Reading] = []
     for ds in data.get("value", []):
         observations = ds.get("Observations", [])
         if not observations:
@@ -169,22 +186,163 @@ async def get_latest_readings(
 
         source = thing.get("properties", {}).get("source", "unknown")
 
-        readings.append({
-            "parameter": ds.get("ObservedProperty", {}).get("name", ds.get("name", "")),
-            "value": obs.get("result"),
-            "unit": ds.get("unitOfMeasurement", {}).get("symbol", ""),
-            "timestamp": obs.get("phenomenonTime"),
-            "station_name": thing.get("name", ""),
-            "lat": coords[1] if len(coords) > 1 else None,
-            "lon": coords[0] if len(coords) > 0 else None,
-            "source": source,
-            "source_attribution": _get_attribution(source),
-        })
+        readings.append(Reading(
+            parameter=ds.get("ObservedProperty", {}).get("name", ds.get("name", "")),
+            value=obs.get("result"),
+            unit=ds.get("unitOfMeasurement", {}).get("symbol", ""),
+            timestamp=obs.get("phenomenonTime"),
+            station_name=thing.get("name", ""),
+            lat=coords[1] if len(coords) > 1 else None,
+            lon=coords[0] if len(coords) > 0 else None,
+            source=source,
+            source_attribution=_get_attribution(source),
+        ))
 
-    return {"readings": readings, "count": len(readings)}
+    return ReadingsResult(readings=readings, count=len(readings))
 
 
-async def get_data_freshness(client: FrostReadClient) -> list[dict[str, Any]]:
+async def get_readings_history(
+    client: FrostReadClient,
+    lat: float,
+    lon: float,
+    parameter: str,
+    start: str,
+    end: str | None = None,
+    radius_km: float = 10.0,
+    limit: int = 100,
+) -> HistoryResult:
+    """Get historical environmental readings near a location over a time range."""
+    import datetime
+
+    # Validate coordinates
+    if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+        raise ToolError(json.dumps(invalid_coordinates(lat, lon)))
+
+    # Validate parameter (required, must resolve)
+    canonical = resolve(parameter)
+    if canonical is None:
+        valid = sorted(m.value for m in CanonicalDatastream)
+        raise ToolError(json.dumps(invalid_parameter(parameter, valid)))
+
+    # Parse start time
+    try:
+        start_dt = datetime.datetime.fromisoformat(start)
+        if start_dt.tzinfo is None:
+            start_dt = start_dt.replace(tzinfo=datetime.UTC)
+    except (ValueError, TypeError):
+        raise ToolError(json.dumps({
+            "error": "invalid_start_time",
+            "message": f"Cannot parse start time '{start}' as ISO 8601",
+            "fix": "Use ISO 8601 format, e.g. '2026-11-01T00:00:00Z'",
+        })) from None
+
+    # Parse end time (default: now)
+    now = datetime.datetime.now(datetime.UTC)
+    if end is not None:
+        try:
+            end_dt = datetime.datetime.fromisoformat(end)
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=datetime.UTC)
+        except (ValueError, TypeError):
+            raise ToolError(json.dumps({
+                "error": "invalid_end_time",
+                "message": f"Cannot parse end time '{end}' as ISO 8601",
+                "fix": "Use ISO 8601 format, e.g. '2026-11-14T00:00:00Z'",
+            })) from None
+    else:
+        end_dt = now
+
+    # Max time window: 30 days
+    if (end_dt - start_dt).total_seconds() > 30 * 86400:
+        raise ToolError(json.dumps({
+            "error": "time_window_too_large",
+            "message": "Time window exceeds maximum of 30 days",
+            "fix": "Reduce the time range to 30 days or less",
+        }))
+
+    # Clamp radius and limit
+    radius_km = min(radius_km, 50.0)
+    limit = max(1, min(limit, 1000))
+    radius_m = radius_km * 1000
+
+    # Format times for OData
+    start_iso = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_iso = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Build FROST OData query
+    geo_filter = (
+        f"Thing/Locations/location/geography'POINT({lon} {lat})' lt {radius_m}"
+    )
+    filter_parts = [
+        f"geo.distance({geo_filter})",
+        f"substringof('{canonical.value}',name)",
+    ]
+
+    try:
+        data = await client.get_datastreams(
+            top=100,  # max 100 stations
+            filter_=" and ".join(filter_parts),
+            expand=(
+                "Thing/Locations,"
+                "ObservedProperty,"
+                f"Observations("
+                f"$filter=phenomenonTime ge {start_iso} and phenomenonTime le {end_iso};"
+                f"$orderby=phenomenonTime asc;"
+                f"$top={limit})"
+            ),
+        )
+    except CircuitOpen:
+        raise
+    except (httpx.HTTPError, Exception) as exc:
+        logger.error("FROST query failed for get_readings_history: %s", exc)
+        raise
+
+    # Group results by station (Thing)
+    stations: list[StationHistory] = []
+    total_readings = 0
+    for ds in data.get("value", []):
+        observations = ds.get("Observations", [])
+        if not observations:
+            continue
+
+        thing = ds.get("Thing", {})
+        locations = thing.get("Locations", [])
+        location = locations[0] if locations else {}
+        coords = location.get("location", {}).get("coordinates", [None, None])
+        source = thing.get("properties", {}).get("source", "unknown")
+        unit = ds.get("unitOfMeasurement", {}).get("symbol", "")
+
+        readings: list[HistoryReading] = []
+        for obs in observations:
+            ts = obs.get("phenomenonTime")
+            if ts:
+                readings.append(HistoryReading(
+                    timestamp=ts,
+                    value=obs.get("result"),
+                    unit=unit,
+                ))
+
+        if readings:
+            total_readings += len(readings)
+            stations.append(StationHistory(
+                station_name=thing.get("name", ""),
+                source=source,
+                source_attribution=_get_attribution(source),
+                lat=coords[1] if len(coords) > 1 else None,
+                lon=coords[0] if len(coords) > 0 else None,
+                readings=readings,
+            ))
+
+    return HistoryResult(
+        stations=stations,
+        parameter=canonical.value,
+        period_start=start_iso,
+        period_end=end_iso,
+        total_readings=total_readings,
+    )
+
+
+async def get_data_freshness(client: FrostReadClient) -> FreshnessResult:
     """Check data freshness per source.
 
     Never fails entirely — marks individual sources as "unreachable" if the
@@ -212,12 +370,9 @@ async def get_data_freshness(client: FrostReadClient) -> list[dict[str, Any]]:
             sources.setdefault(source, []).append(thing_id)
 
     # Step 2: For each source, query ONE latest observation (much lighter)
-    result: list[dict[str, Any]] = []
+    entries: list[FreshnessEntry] = []
     for source, _thing_ids in sorted(sources.items()):
-        entry: dict[str, Any] = {
-            "source": source,
-            "source_attribution": _get_attribution(source),
-        }
+        attribution = _get_attribution(source)
         try:
             # Get the single most recent observation across all datastreams for this source
             obs_data = await client.get_observations(
@@ -236,29 +391,41 @@ async def get_data_freshness(client: FrostReadClient) -> list[dict[str, Any]]:
                     if obs_time.tzinfo is None:
                         obs_time = obs_time.replace(tzinfo=datetime.UTC)
                     age = int((now - obs_time).total_seconds())
-                    entry["latest_observation"] = obs_time_str
-                    entry["age_seconds"] = age
                     if age < 3600:
-                        entry["status"] = "fresh"
+                        status = "fresh"
                     elif age < 86400:
-                        entry["status"] = "stale"
+                        status = "stale"
                     else:
-                        entry["status"] = "offline"
+                        status = "offline"
+                    entries.append(FreshnessEntry(
+                        source=source,
+                        source_attribution=attribution,
+                        latest_observation=obs_time_str,
+                        age_seconds=age,
+                        status=status,
+                    ))
                 else:
-                    entry["status"] = "no_data"
-                    entry["age_seconds"] = None
+                    entries.append(FreshnessEntry(
+                        source=source,
+                        source_attribution=attribution,
+                        status="no_data",
+                    ))
             else:
-                entry["status"] = "no_data"
-                entry["age_seconds"] = None
+                entries.append(FreshnessEntry(
+                    source=source,
+                    source_attribution=attribution,
+                    status="no_data",
+                ))
         except (httpx.HTTPError, Exception) as exc:
             logger.warning("FROST query failed for source %s freshness: %s: %s", source, type(exc).__name__, exc)
-            entry["status"] = "unreachable"
-            entry["age_seconds"] = None
-            entry["error"] = type(exc).__name__
-
-        result.append(entry)
+            entries.append(FreshnessEntry(
+                source=source,
+                source_attribution=attribution,
+                status="unreachable",
+                error=type(exc).__name__,
+            ))
 
     # Sort: fresh first, then stale, then offline, then unreachable
     status_order = {"fresh": 0, "stale": 1, "offline": 2, "no_data": 3, "unreachable": 4}
-    result.sort(key=lambda x: (status_order.get(x["status"], 5), x.get("age_seconds") or 999999))
-    return result
+    entries.sort(key=lambda x: (status_order.get(x.status, 5), x.age_seconds or 999999))
+    return FreshnessResult(sources=entries)
