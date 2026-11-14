@@ -22,6 +22,7 @@ fi
 if [ "$SERVICE" = "all" ] || [ "$SERVICE" = "monitoring" ]; then
     git -C monitoring_module pull --ff-only
 fi
+# MCP server uses the same repo as the connector — no separate pull needed
 
 # Build and restart
 if [ "$SERVICE" = "all" ]; then
@@ -38,10 +39,13 @@ docker image prune -f
 echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) Deploy complete"
 
 # Quick health check
-sleep 5
+sleep 15
 if [ "$SERVICE" = "all" ] || [ "$SERVICE" = "connector" ]; then
     curl -sf http://localhost:8010/health && echo " connector OK" || echo " connector FAIL"
 fi
 if [ "$SERVICE" = "all" ] || [ "$SERVICE" = "monitoring" ]; then
     curl -sf http://localhost:8020/health && echo " monitoring OK" || echo " monitoring FAIL"
+fi
+if [ "$SERVICE" = "all" ] || [ "$SERVICE" = "mcp" ]; then
+    curl -sf http://localhost:8030/freshness && echo " mcp OK" || echo " mcp FAIL"
 fi
