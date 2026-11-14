@@ -1,7 +1,7 @@
 """MCP Server for Geo-Insights environmental data.
 
-Streamable HTTP transport exposing 5 free tools that query the FROST
-SensorThings API. Rate-limited and logged for analytics.
+Streamable HTTP transport exposing 5 free tools + 2 resources that query the
+FROST SensorThings API. Rate-limited and logged for analytics.
 """
 
 from __future__ import annotations
@@ -66,6 +66,42 @@ def _get_client() -> FrostReadClient:
 def _raise_frost_error(exc: Exception) -> None:
     """Convert FROST errors to ToolError (sets isError=true at protocol level)."""
     raise ToolError(json.dumps(classify_frost_error(exc)))
+
+
+# -- MCP Resources (static catalogs, no tool call needed) ------------------
+
+
+@mcp.resource(
+    "sensorthings://sources",
+    name="sources",
+    description=(
+        "Catalog of all environmental data sources with station counts "
+        "and geographic coverage. Returns a JSON array of sources."
+    ),
+    mime_type="application/json",
+)
+async def sources_resource() -> str:
+    """Read handler for the sources resource."""
+    result = await tool_impls.list_sources(_get_client())
+    return json.dumps(result.model_dump())
+
+
+@mcp.resource(
+    "sensorthings://parameters",
+    name="parameters",
+    description=(
+        "All 35 canonical environmental parameters with units, aliases, "
+        "and CF Conventions definition URLs. In-memory lookup, no FROST query."
+    ),
+    mime_type="application/json",
+)
+async def parameters_resource() -> str:
+    """Read handler for the parameters resource."""
+    result = await tool_impls.get_parameters()
+    return json.dumps(result.model_dump())
+
+
+# -- MCP Tools -------------------------------------------------------------
 
 
 @mcp.tool(
