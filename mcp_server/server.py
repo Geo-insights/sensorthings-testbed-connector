@@ -11,7 +11,7 @@ import logging
 import time
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from starlette.routing import Route
 
 from mcp_server import tools as tool_impls
@@ -26,7 +26,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname
 logger = logging.getLogger(__name__)
 
 # Create the MCP server
-mcp = FastMCP(
+mcp = MCPServer(
     "Geo-Insights Environmental Data",
     instructions=(
         "Query real-time Dutch environmental data from 10 sources "
