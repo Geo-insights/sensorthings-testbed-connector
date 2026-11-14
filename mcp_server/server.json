@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.mathisvfr/environmental-data",
   "title": "Geo-Insights Environmental Data",
-  "description": "Real-time Dutch environmental data: 10 sources, 35 parameters, UCUM units. No auth.",
-  "version": "1.0.0",
+  "description": "Real-time and historical Dutch environmental data from 10 sources (KNMI, Luchtmeetnet, BRO, Samen Meten, Sensor.Community, and more). 5 tools + 2 resources, 35 canonical parameters with UCUM units. No auth required.",
+  "version": "1.1.0",
   "remotes": [
     {
       "type": "streamable-http",

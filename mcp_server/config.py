@@ -22,11 +22,20 @@ class McpSettings:
     )
 
     rate_limit_rpm: int = int(os.getenv("MCP_RATE_LIMIT_RPM", "100"))
+    rate_limit_authenticated_rpm: int = int(
+        os.getenv("MCP_RATE_LIMIT_AUTHENTICATED_RPM", "500")
+    )
     circuit_breaker_threshold: int = int(
         os.getenv("MCP_CIRCUIT_BREAKER_THRESHOLD", "5")
     )
     circuit_breaker_cooldown_seconds: float = float(
         os.getenv("MCP_CIRCUIT_BREAKER_COOLDOWN_SECONDS", "300")
+    )
+
+    # Supabase JWT auth (optional — empty secret disables auth)
+    supabase_jwt_secret: str = os.getenv("SUPABASE_JWT_SECRET", "")
+    supabase_project_url: str = os.getenv(
+        "SUPABASE_URL", "https://upjxsqjnrnamsexrlkqx.supabase.co"
     )
 
     port: int = int(os.getenv("MCP_PORT", "8030"))
