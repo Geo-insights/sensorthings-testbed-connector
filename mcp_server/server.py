@@ -12,6 +12,7 @@ import time
 
 import httpx
 from mcp.server.mcpserver import MCPServer
+from starlette.applications import Starlette
 from starlette.routing import Route
 
 from mcp_server import tools as tool_impls
@@ -144,7 +145,14 @@ async def get_data_freshness() -> str:
         return _handle_frost_error(exc)
 
 
-# The MCP SDK handles Streamable HTTP transport via its own ASGI app.
-# We add the /freshness route for operational monitoring.
-app = mcp.streamable_http_app()
-app.routes.append(Route("/freshness", freshness_endpoint))
+# Combine MCP transport with the freshness monitoring endpoint.
+# The MCP app owns /mcp; we mount it inside a parent Starlette app
+# that also serves /freshness for healthchecks and operational monitoring.
+_mcp_app = mcp.streamable_http_app()
+
+app = Starlette(
+    routes=[
+        Route("/freshness", freshness_endpoint),
+    ],
+)
+app.mount("/", _mcp_app)
