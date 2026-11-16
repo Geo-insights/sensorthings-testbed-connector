@@ -20,6 +20,10 @@ class McpSettings:
     frost_timeout_seconds: float = float(
         os.getenv("MCP_REQUEST_TIMEOUT_SECONDS", "30")
     )
+    # Direct connection to the FROST PostgreSQL database for server-side
+    # queries that bypass the STA HTTP API. On the FROST server itself,
+    # use localhost: postgresql://sensorthings:pass@localhost:5432/sensorthings
+    frost_db_url: str = os.getenv("FROST_DB_URL", "")
 
     rate_limit_rpm: int = int(os.getenv("MCP_RATE_LIMIT_RPM", "100"))
     rate_limit_authenticated_rpm: int = int(

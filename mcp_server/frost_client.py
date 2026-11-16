@@ -156,5 +156,80 @@ class FrostReadClient:
             params["$count"] = "true"
         return await self.get("Observations", params)
 
+    async def get_observations_sql(
+        self,
+        datastream_id: int,
+        *,
+        since: str | None = None,
+        until: str | None = None,
+        limit: int = 100,
+        orderby_desc: bool = True,
+    ) -> dict[str, Any]:
+        """Fetch observations via direct FROST Postgres (bypasses HTTP + CB).
+
+        Returns the same shape as ``get_observations`` for compatibility.
+        Falls back to HTTP when ``FROST_DB_URL`` is not configured.
+        """
+        if not settings.frost_db_url:
+            # Fall back to HTTP
+            filter_parts = [f"Datastream/id eq {datastream_id}"]
+            if since:
+                filter_parts.append(f"phenomenonTime gt {since}")
+            if until:
+                filter_parts.append(f"phenomenonTime lt {until}")
+            return await self.get_observations(
+                top=limit,
+                filter_=" and ".join(filter_parts),
+                orderby=f"phenomenonTime {'desc' if orderby_desc else 'asc'}",
+            )
+
+        import sqlalchemy
+
+        clauses = ['"DATASTREAM_ID" = :ds_id', '"RESULT_NUMBER" IS NOT NULL']
+        params: dict = {"ds_id": datastream_id, "limit": limit}
+        if since:
+            clauses.append('"PHENOMENON_TIME_START" > :since')
+            params["since"] = since
+        if until:
+            clauses.append('"PHENOMENON_TIME_START" < :until')
+            params["until"] = until
+
+        where = " AND ".join(clauses)
+        order = "DESC" if orderby_desc else "ASC"
+
+        engine = sqlalchemy.create_engine(
+            settings.frost_db_url,
+            pool_pre_ping=True,
+            connect_args={"connect_timeout": 15},
+        )
+        try:
+            with engine.connect() as conn:
+                rows = conn.execute(
+                    sqlalchemy.text(f"""
+                        SELECT "ID", "PHENOMENON_TIME_START", "RESULT_NUMBER",
+                               "RESULT_QUALITY", "DATASTREAM_ID"
+                        FROM "OBSERVATIONS"
+                        WHERE {where}
+                        ORDER BY "PHENOMENON_TIME_START" {order}
+                        LIMIT :limit
+                    """),
+                    params,
+                ).fetchall()
+        finally:
+            engine.dispose()
+
+        return {
+            "value": [
+                {
+                    "@iot.id": r.ID,
+                    "phenomenonTime": r.PHENOMENON_TIME_START.isoformat() if r.PHENOMENON_TIME_START else None,
+                    "result": r.RESULT_NUMBER,
+                    "resultQuality": r.RESULT_QUALITY,
+                    "Datastream@iot.navigationLink": f"Datastreams({r.DATASTREAM_ID})",
+                }
+                for r in rows
+            ],
+        }
+
     async def close(self) -> None:
         await self._client.aclose()
