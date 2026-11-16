@@ -401,7 +401,7 @@ class Settings:
     samen_meten_enabled: bool = os.getenv("SAMEN_METEN_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     samen_meten_api_url: str = os.getenv("SAMEN_METEN_API_URL", "https://api-samenmeten.rivm.nl/v1.0").strip().rstrip("/")
     samen_meten_poll_seconds: int = int(os.getenv("SAMEN_METEN_POLL_SECONDS", "600"))
-    samen_meten_max_things: int = int(os.getenv("SAMEN_METEN_MAX_THINGS", "500"))
+    samen_meten_max_things: int = int(os.getenv("SAMEN_METEN_MAX_THINGS", "0"))  # 0 = no cap
     # --- Buienradar weather (#14) ---
     buienradar_enabled: bool = os.getenv("BUIENRADAR_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     buienradar_api_url: str = os.getenv("BUIENRADAR_API_URL", "https://data.buienradar.nl/2.0/feed/json").strip()

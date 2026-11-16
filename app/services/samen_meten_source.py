@@ -138,9 +138,8 @@ class SamenMetenPollingSource(RestPollingSource):
         return all_readings
 
     async def _discover_things(self) -> None:
-        """Paginate through /Things until all Things are loaded or the cap is hit."""
-        max_things = settings.samen_meten_max_things
-        discovered = 0
+        """Paginate through /Things until all are loaded (or optional cap is hit)."""
+        max_things = settings.samen_meten_max_things  # 0 = no cap
 
         # First page URL — relative path; client will prepend base_url
         next_path: str | None = (
@@ -149,7 +148,7 @@ class SamenMetenPollingSource(RestPollingSource):
             "&$top=100"
         )
 
-        while next_path and discovered < max_things:
+        while next_path:
             try:
                 data = await self._client.get(next_path)
             except Exception:
@@ -166,12 +165,10 @@ class SamenMetenPollingSource(RestPollingSource):
             for thing in things:
                 thing_id = thing["thing_id"]
                 if thing_id not in self._discovered_things:
-                    logger.info(
-                        "samen_meten: discovered Thing %d %r (lat=%.4f, lon=%.4f, %d datastreams)",
+                    logger.debug(
+                        "samen_meten: discovered Thing %d %r (%d datastreams)",
                         thing_id,
                         thing["name"],
-                        thing["lat"],
-                        thing["lon"],
                         len(thing["datastreams"]),
                     )
                 self._discovered_things[thing_id] = {
@@ -180,19 +177,17 @@ class SamenMetenPollingSource(RestPollingSource):
                     "lon": thing["lon"],
                     "datastreams": thing["datastreams"],
                 }
-                discovered += 1
-                if discovered >= max_things:
-                    logger.info(
-                        "samen_meten: reached max_things cap (%d) — stopping discovery",
-                        max_things,
-                    )
-                    break
+
+            if max_things and len(self._discovered_things) >= max_things:
+                logger.info(
+                    "samen_meten: reached max_things cap (%d) — stopping discovery",
+                    max_things,
+                )
+                break
 
             # Follow @iot.nextLink for the next page
             next_link = data.get("@iot.nextLink")
-            if next_link and discovered < max_things:
-                # The nextLink is an absolute URL; strip the base_url prefix so
-                # AsyncAPIClient can prepend it again correctly.
+            if next_link:
                 base = settings.samen_meten_api_url
                 if str(next_link).startswith(base):
                     next_path = str(next_link)[len(base):]
