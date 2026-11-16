@@ -12,6 +12,7 @@ import time
 
 import httpx
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.context import Context
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.streamable_http import TransportSecuritySettings
 from mcp_types import ToolAnnotations
@@ -19,7 +20,7 @@ from starlette.routing import Route
 
 from mcp_server import catalog_tools
 from mcp_server import tools as tool_impls
-from mcp_server.auth import auth_enabled
+from mcp_server.auth import SCOPE_PREMIUM, auth_enabled, auth_from_headers, require_scope
 from mcp_server.catalog_schemas import (
     CompareResult,
     ContextSummary,
@@ -28,6 +29,7 @@ from mcp_server.catalog_schemas import (
     RankResult,
     SearchMeasuresResult,
 )
+from mcp_server.config import settings
 from mcp_server.errors import classify_frost_error, classify_supabase_error
 from mcp_server.freshness import freshness_endpoint
 from mcp_server.frost_client import CircuitOpen, FrostReadClient
@@ -39,6 +41,11 @@ from mcp_server.schemas import (
     ParametersResult,
     ReadingsResult,
     SourcesResult,
+)
+from mcp_server.stripe_webhook import (
+    create_checkout_endpoint,
+    stripe_enabled,
+    stripe_webhook_endpoint,
 )
 from mcp_server.supabase_client import SupabaseCircuitOpen, SupabaseReadClient
 
@@ -455,6 +462,7 @@ async def rank_measures(
     goal: str | None = None,
     policy_profile: str = "Balanced",
     limit: int = 10,
+    ctx: Context | None = None,
 ) -> RankResult:
     """Rank BGI measures for a municipality using policy-weighted scoring.
 
@@ -471,8 +479,14 @@ async def rank_measures(
                        Heat-focused, Drought-focused, Biodiversity-first,
                        Cost-efficient (default: Balanced)
         limit: Max results (default 10, max 50)
+
+    Premium tool — requires mcp:tools:premium scope when premium gating is
+    enabled (MCP_PREMIUM_GATING=true).
     """
     start = time.monotonic()
+    if settings.premium_gating_enabled and ctx is not None:
+        auth = auth_from_headers(ctx.headers)
+        require_scope(auth, SCOPE_PREMIUM)
     try:
         result = await catalog_tools.rank_measures(
             _get_supabase(), gemeente_code, goal, policy_profile, limit
@@ -577,3 +591,8 @@ async def _glama_claim_endpoint(request):  # type: ignore[no-untyped-def]
 
 
 app.routes.insert(0, Route("/.well-known/glama.json", _glama_claim_endpoint))
+
+# Stripe payment endpoints (only when STRIPE_SECRET_KEY is configured)
+if stripe_enabled():
+    app.routes.insert(0, Route("/webhook/stripe", stripe_webhook_endpoint, methods=["POST"]))
+    app.routes.insert(0, Route("/checkout", create_checkout_endpoint, methods=["POST"]))
