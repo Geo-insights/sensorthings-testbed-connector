@@ -145,7 +145,7 @@ async def auth_page(request: Request) -> HTMLResponse:
 
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
     <script>
-        const supabase = window.supabase.createClient('{supabase_url}', '{anon_key}');
+        const sbClient = window.supabase.createClient('{supabase_url}', '{anon_key}');
         let currentMode = 'login';
 
         function showTab(mode) {{
@@ -174,9 +174,9 @@ async def auth_page(request: Request) -> HTMLResponse:
 
             let result;
             if (currentMode === 'signup') {{
-                result = await supabase.auth.signUp({{ email, password }});
+                result = await sbClient.auth.signUp({{ email, password }});
             }} else {{
-                result = await supabase.auth.signInWithPassword({{ email, password }});
+                result = await sbClient.auth.signInWithPassword({{ email, password }});
             }}
 
             btn.disabled = false;
@@ -190,7 +190,7 @@ async def auth_page(request: Request) -> HTMLResponse:
         }}
 
         async function signOut() {{
-            await supabase.auth.signOut();
+            await sbClient.auth.signOut();
         }}
 
         function copyToken() {{
@@ -233,10 +233,10 @@ async def auth_page(request: Request) -> HTMLResponse:
         }}
 
         // Listen for auth changes
-        supabase.auth.onAuthStateChange((event, session) => updateUI(session));
+        sbClient.auth.onAuthStateChange((event, session) => updateUI(session));
 
         // Check existing session
-        supabase.auth.getSession().then(({{ data }}) => updateUI(data.session));
+        sbClient.auth.getSession().then(({{ data }}) => updateUI(data.session));
     </script>
 </body>
 </html>""")
@@ -306,7 +306,7 @@ async def pricing_page(request: Request) -> HTMLResponse:
 
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
     <script>
-        const supabase = window.supabase.createClient(
+        const sbClient = window.supabase.createClient(
             '{settings.supabase_project_url}', '{settings.supabase_anon_key}'
         );
 
@@ -318,7 +318,7 @@ async def pricing_page(request: Request) -> HTMLResponse:
         }}
 
         async function startCheckout() {{
-            const {{ data }} = await supabase.auth.getSession();
+            const {{ data }} = await sbClient.auth.getSession();
             if (!data.session) {{
                 window.location.href = '/auth';
                 return;
