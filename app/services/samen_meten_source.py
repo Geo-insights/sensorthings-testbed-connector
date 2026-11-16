@@ -43,6 +43,8 @@ class SamenMetenPollingSource(RestPollingSource):
         self._discovered_things: dict[int, dict[str, Any]] = {}
         # Last observation timestamp per Datastream id (for incremental fetch)
         self._last_ts: dict[int, datetime] = {}
+        # Datastreams that returned errors — skipped until retry (1h cooldown)
+        self._dead_ds: dict[int, datetime] = {}
 
     def is_enabled(self) -> bool:
         return settings.samen_meten_enabled
@@ -72,8 +74,12 @@ class SamenMetenPollingSource(RestPollingSource):
                 Things are loaded (respects samen_meten_max_things cap).
         Step 2: for each discovered Datastream, GET
                 /Datastreams({id})/Observations filtered to new data.
+                Uses concurrent fetches (20 at a time) and skips datastreams
+                that previously returned errors (retried once per hour).
         Step 3: parse observations into SensorReadings.
         """
+        import asyncio
+
         # Step 1: discover Things
         if not self._discovered_things:
             await self._discover_things()
@@ -81,20 +87,30 @@ class SamenMetenPollingSource(RestPollingSource):
                 logger.warning("samen_meten: no Things discovered")
                 return []
 
-        # Step 2 & 3: fetch observations per Datastream
+        # Step 2 & 3: fetch observations per Datastream (concurrent)
+        sem = asyncio.Semaphore(20)
         all_readings: list[SensorReading] = []
-        for thing_id, meta in self._discovered_things.items():
-            for ds_info in meta.get("datastreams", []):
-                ds_id: int = ds_info["ds_id"]
-                observed_property: str = ds_info["observed_property"]
+        lock = asyncio.Lock()
+        now = datetime.now(UTC)
 
-                # Determine the filter timestamp
-                last = self._last_ts.get(ds_id)
-                if last is None:
-                    last = datetime.now(UTC) - timedelta(hours=_DEFAULT_LOOKBACK_HOURS)
+        # Retry blacklisted datastreams once per hour
+        retry_cutoff = now - timedelta(hours=1)
 
-                filter_ts = last.strftime("%Y-%m-%dT%H:%M:%SZ")
+        async def _fetch_one(thing_id: int, meta: dict, ds_info: dict) -> None:
+            ds_id: int = ds_info["ds_id"]
+            observed_property: str = ds_info["observed_property"]
 
+            # Skip blacklisted datastreams (retry after 1 hour)
+            blacklisted_at = self._dead_ds.get(ds_id)
+            if blacklisted_at is not None and blacklisted_at > retry_cutoff:
+                return
+
+            last = self._last_ts.get(ds_id)
+            if last is None:
+                last = now - timedelta(hours=_DEFAULT_LOOKBACK_HOURS)
+            filter_ts = last.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            async with sem:
                 try:
                     obs_data = await self._client.get(
                         f"/Datastreams({ds_id})/Observations",
@@ -105,35 +121,50 @@ class SamenMetenPollingSource(RestPollingSource):
                         },
                     )
                 except Exception:
-                    logger.exception(
-                        "samen_meten: failed to fetch observations for Datastream %d", ds_id
-                    )
-                    continue
+                    # Blacklist this datastream to skip on future cycles
+                    self._dead_ds[ds_id] = now
+                    return
 
-                if not isinstance(obs_data, dict):
-                    continue
+            if not isinstance(obs_data, dict):
+                return
 
-                observations = obs_data.get("value", [])
-                if not isinstance(observations, list) or not observations:
-                    continue
+            observations = obs_data.get("value", [])
+            if not isinstance(observations, list) or not observations:
+                return
 
-                thing_name = meta["name"]
-                sensor_id = f"sm-{thing_id}"
-                sensor_name = f"SamenMeten {thing_name} sensor"
-                full_thing_name = f"SamenMeten {thing_name}"
+            # Clear from blacklist on success
+            self._dead_ds.pop(ds_id, None)
 
-                readings = parse_observations(
-                    observations=observations,
-                    sensor_id=sensor_id,
-                    sensor_name=sensor_name,
-                    observed_property=observed_property,
-                    thing_name=full_thing_name,
-                )
-                if readings:
-                    # Advance the last-seen timestamp for this Datastream
-                    newest_ts = max(r.timestamp for r in readings)
+            thing_name = meta["name"]
+            sensor_id = f"sm-{thing_id}"
+            sensor_name = f"SamenMeten {thing_name} sensor"
+            full_thing_name = f"SamenMeten {thing_name}"
+
+            readings = parse_observations(
+                observations=observations,
+                sensor_id=sensor_id,
+                sensor_name=sensor_name,
+                observed_property=observed_property,
+                thing_name=full_thing_name,
+            )
+            if readings:
+                newest_ts = max(r.timestamp for r in readings)
+                async with lock:
                     self._last_ts[ds_id] = newest_ts
                     all_readings.extend(readings)
+
+        # Build task list
+        tasks = []
+        for thing_id, meta in self._discovered_things.items():
+            for ds_info in meta.get("datastreams", []):
+                tasks.append(_fetch_one(thing_id, meta, ds_info))
+
+        # Run all concurrently (bounded by semaphore)
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        skipped = sum(1 for ts in self._dead_ds.values() if ts > retry_cutoff)
+        if skipped:
+            logger.info("samen_meten: skipped %d blacklisted datastreams", skipped)
 
         return all_readings
 
