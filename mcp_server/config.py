@@ -38,6 +38,7 @@ class McpSettings:
         "SUPABASE_URL", "https://upjxsqjnrnamsexrlkqx.supabase.co"
     )
     supabase_anon_key: str = os.getenv("SUPABASE_ANON_KEY", "")
+    supabase_service_role_key: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 
     # Premium tool gating (false = all tools free, true = enforce scopes)
     premium_gating_enabled: bool = os.getenv("MCP_PREMIUM_GATING", "false").lower() == "true"
@@ -47,10 +48,10 @@ class McpSettings:
     stripe_webhook_secret: str = os.getenv("STRIPE_WEBHOOK_SECRET", "")
     stripe_price_id: str = os.getenv("STRIPE_PRICE_ID", "")
     stripe_success_url: str = os.getenv(
-        "STRIPE_SUCCESS_URL", "https://geo-insights.nl/payment/success"
+        "STRIPE_SUCCESS_URL", "https://mcp.geo-insights.nl/payment/success"
     )
     stripe_cancel_url: str = os.getenv(
-        "STRIPE_CANCEL_URL", "https://geo-insights.nl/pricing"
+        "STRIPE_CANCEL_URL", "https://mcp.geo-insights.nl/pricing"
     )
 
     port: int = int(os.getenv("MCP_PORT", "8030"))

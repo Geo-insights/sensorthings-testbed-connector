@@ -43,7 +43,7 @@ async def test_grant_premium_updates_scopes():
         patch("mcp_server.payments.settings") as mock_settings,
         patch("mcp_server.payments.httpx.AsyncClient", return_value=mock_client),
     ):
-        mock_settings.supabase_jwt_secret = "test-service-role-key"
+        mock_settings.supabase_service_role_key = "test-service-role-key"
         mock_settings.supabase_project_url = "https://test.supabase.co"
 
         result = await grant_premium("user-123")
@@ -82,7 +82,7 @@ async def test_revoke_premium_removes_scope():
         patch("mcp_server.payments.settings") as mock_settings,
         patch("mcp_server.payments.httpx.AsyncClient", return_value=mock_client),
     ):
-        mock_settings.supabase_jwt_secret = "test-service-role-key"
+        mock_settings.supabase_service_role_key = "test-service-role-key"
         mock_settings.supabase_project_url = "https://test.supabase.co"
 
         result = await revoke_premium("user-123")
@@ -95,12 +95,12 @@ async def test_revoke_premium_removes_scope():
 
 
 @pytest.mark.asyncio
-async def test_grant_premium_fails_without_secret():
-    """grant_premium returns False when JWT secret is not configured."""
+async def test_grant_premium_fails_without_service_role_key():
+    """grant_premium returns False when service_role key is not configured."""
     from mcp_server.payments import grant_premium
 
     with patch("mcp_server.payments.settings") as mock_settings:
-        mock_settings.supabase_jwt_secret = ""
+        mock_settings.supabase_service_role_key = ""
         result = await grant_premium("user-123")
     assert result is False
 

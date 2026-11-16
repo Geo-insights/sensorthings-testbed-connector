@@ -35,6 +35,7 @@ from mcp_server.freshness import freshness_endpoint
 from mcp_server.frost_client import CircuitOpen, FrostReadClient
 from mcp_server.middleware import request_logger
 from mcp_server.oauth_discovery import oauth_protected_resource_endpoint
+from mcp_server.pages import auth_page, payment_success_page, pricing_page
 from mcp_server.schemas import (
     FreshnessResult,
     HistoryResult,
@@ -572,6 +573,11 @@ app = mcp.streamable_http_app(
     ),
 )
 app.routes.insert(0, Route("/freshness", freshness_endpoint))
+
+# Auth + Pricing HTML pages
+app.routes.insert(0, Route("/auth", auth_page))
+app.routes.insert(0, Route("/pricing", pricing_page))
+app.routes.insert(0, Route("/payment/success", payment_success_page))
 if auth_enabled():
     app.routes.insert(
         0, Route("/.well-known/oauth-protected-resource", oauth_protected_resource_endpoint)

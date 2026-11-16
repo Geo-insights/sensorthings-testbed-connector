@@ -45,9 +45,9 @@ async def _update_scopes(
     Uses the Supabase Auth Admin API: ``PUT /auth/v1/admin/users/{id}``.
     Requires the service_role key (not the anon key).
     """
-    service_key = settings.supabase_jwt_secret  # service_role key doubles as JWT secret
+    service_key = settings.supabase_service_role_key
     if not service_key:
-        logger.error("Cannot update user scopes: SUPABASE_JWT_SECRET not set")
+        logger.error("Cannot update user scopes: SUPABASE_SERVICE_ROLE_KEY not set")
         return False
 
     base_url = settings.supabase_project_url.rstrip("/")
