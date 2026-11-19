@@ -240,8 +240,12 @@ class ApiKeyResolver:
         self.enabled = bool(service_key)
         self._client = httpx.AsyncClient(
             base_url=f"{url.rstrip('/')}/rest/v1",
+            # resolve_api_key and org_subscriptions live in `public`, but this project's
+            # PostgREST defaults to bgi_catalog: without the profile headers both answer
+            # 404 (found in production on 2026-11-19, where every key read as "unavailable").
             headers={"apikey": service_key, "Authorization": f"Bearer {service_key}",
-                     "Accept": "application/json"},
+                     "Accept": "application/json",
+                     "Accept-Profile": "public", "Content-Profile": "public"},
             timeout=httpx.Timeout(5.0),
             transport=transport,
         )

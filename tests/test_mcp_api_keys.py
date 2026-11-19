@@ -58,6 +58,11 @@ def supabase(subscriptions: dict[str, list[dict]] | None = None, fail: bool = Fa
         calls.append(request)
         if fail:
             return httpx.Response(503)
+        # Like production: this PostgREST defaults to bgi_catalog, so a request for the
+        # public schema's objects must name it, or it is a 404.
+        profile = request.headers.get("content-profile" if request.method == "POST" else "accept-profile")
+        if profile != "public":
+            return httpx.Response(404, json={"code": "PGRST202", "message": "not in schema cache"})
         if request.url.path.endswith("/rpc/resolve_api_key"):
             key_hash = json.loads(request.content)["p_key_hash"]
             if key_hash not in ORGS:
