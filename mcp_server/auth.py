@@ -29,7 +29,6 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -203,22 +202,15 @@ API_KEY_RE = re.compile(r"^gi_[0-9a-f]{8}_[A-Za-z0-9_-]{20,}$")
 PREMIUM_TIERS = frozenset({"pro", "enterprise"})
 
 
-def _active(expires_at: str | None) -> bool:
-    if not expires_at:
-        return True
-    try:
-        return datetime.fromisoformat(expires_at.replace("Z", "+00:00")) > datetime.now(UTC)
-    except ValueError:
-        return False
-
-
 class ApiKeyResolver:
-    """Organization API key -> org -> that org's ``api`` plan.
+    """Organization API key -> org -> that org's ``api`` plan, in one RPC.
 
-    Uses the platform's own rules: ``public.resolve_api_key`` (migration 047;
-    executable by service_role only) and ``public.org_subscriptions`` (active or
-    trialing, not expired). The key never leaves this process: only its sha256 is
-    sent, as the platform stores it.
+    Calls ``bgi_catalog.resolve_mcp_access`` (platform migration 049; executable by
+    service_role only), which wraps the platform's own rules: ``public.resolve_api_key``
+    and the effective-tier rule (active or trialing, not expired; no row is free). It
+    lives in bgi_catalog because that is the only schema this project exposes over
+    REST; ``public`` is not reachable at all (found in production on 2026-11-19). The
+    key never leaves this process: only its sha256 is sent, as the platform stores it.
 
     Results are cached for ``ttl`` seconds, unknown keys included, so a burst of
     calls (or of made-up keys) costs one lookup. A revoked key or a cancelled plan
@@ -240,12 +232,10 @@ class ApiKeyResolver:
         self.enabled = bool(service_key)
         self._client = httpx.AsyncClient(
             base_url=f"{url.rstrip('/')}/rest/v1",
-            # resolve_api_key and org_subscriptions live in `public`, but this project's
-            # PostgREST defaults to bgi_catalog: without the profile headers both answer
-            # 404 (found in production on 2026-11-19, where every key read as "unavailable").
+            # Named explicitly, although bgi_catalog is also the default profile.
             headers={"apikey": service_key, "Authorization": f"Bearer {service_key}",
                      "Accept": "application/json",
-                     "Accept-Profile": "public", "Content-Profile": "public"},
+                     "Accept-Profile": "bgi_catalog", "Content-Profile": "bgi_catalog"},
             timeout=httpx.Timeout(5.0),
             transport=transport,
         )
@@ -270,23 +260,17 @@ class ApiKeyResolver:
         if hit is not None and hit[0] > self._clock():
             return hit[1]
         try:
-            resp = await self._client.post("/rpc/resolve_api_key", json={"p_key_hash": key_hash})
+            resp = await self._client.post("/rpc/resolve_mcp_access", json={"p_key_hash": key_hash})
             resp.raise_for_status()
             rows = resp.json()
-            row = rows[0] if isinstance(rows, list) and rows else None
-            if row is None or not row.get("org_id") or "read" not in (row.get("scopes") or []):
-                return self._remember(key_hash, ANONYMOUS)
-            org_id = str(row["org_id"])
-            subs = await self._client.get("/org_subscriptions", params={
-                "select": "tier,expires_at", "org_id": f"eq.{org_id}", "product": "eq.api",
-                "status": "in.(active,trialing)",
-            })
-            subs.raise_for_status()
-            tiers = {s.get("tier") for s in subs.json() if _active(s.get("expires_at"))}
-        except (httpx.HTTPError, ValueError, KeyError) as exc:
+        except (httpx.HTTPError, ValueError) as exc:
             logger.warning("API key check failed: %s", type(exc).__name__)
             return AuthContext(auth_unavailable=True)
-        premium = bool(tiers & PREMIUM_TIERS)
+        row = rows[0] if isinstance(rows, list) and rows else None
+        if row is None or not row.get("org_id") or "read" not in (row.get("scopes") or []):
+            return self._remember(key_hash, ANONYMOUS)
+        org_id = str(row["org_id"])
+        premium = row.get("api_tier") in PREMIUM_TIERS
         return self._remember(key_hash, AuthContext(
             authenticated=True,
             role="api_key",

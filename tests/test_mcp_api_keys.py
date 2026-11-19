@@ -13,7 +13,6 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
-from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -32,12 +31,22 @@ from mcp_server.auth import (
 
 PRO_KEY = "gi_0123abcd_" + "p" * 30
 FREE_KEY = "gi_89efabcd_" + "f" * 30
+ENTERPRISE_KEY = "gi_eeeeeeee_" + "e" * 30
 WRITE_ONLY_KEY = "gi_00000000_" + "w" * 30
 UNKNOWN_KEY = "gi_ffffffff_" + "u" * 30
-ORGS = {
-    hashlib.sha256(PRO_KEY.encode()).hexdigest(): ("org-pro", ["read"]),
-    hashlib.sha256(FREE_KEY.encode()).hexdigest(): ("org-free", ["read"]),
-    hashlib.sha256(WRITE_ONLY_KEY.encode()).hexdigest(): ("org-pro", ["write"]),
+
+
+def _h(key: str) -> str:
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+# What bgi_catalog.resolve_mcp_access returns per key hash (its tier rules are tested
+# in the platform's supabase/tests/049_mcp_access.sql).
+ACCESS = {
+    _h(PRO_KEY): {"org_id": "org-pro", "scopes": ["read"], "api_tier": "pro"},
+    _h(FREE_KEY): {"org_id": "org-free", "scopes": ["read"], "api_tier": "free"},
+    _h(ENTERPRISE_KEY): {"org_id": "org-ent", "scopes": ["read", "write"], "api_tier": "enterprise"},
+    _h(WRITE_ONLY_KEY): {"org_id": "org-pro", "scopes": ["write"], "api_tier": "pro"},
 }
 
 
@@ -49,31 +58,21 @@ class Clock:
         return self.now
 
 
-def supabase(subscriptions: dict[str, list[dict]] | None = None, fail: bool = False):
-    """A fake PostgREST: resolve_api_key by hash, org_subscriptions by org."""
-    subs = subscriptions if subscriptions is not None else {"org-pro": [{"tier": "pro", "expires_at": None}]}
+def supabase(fail: bool = False):
+    """A fake PostgREST that behaves like this project's: only bgi_catalog is exposed."""
     calls: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request)
         if fail:
             return httpx.Response(503)
-        # Like production: this PostgREST defaults to bgi_catalog, so a request for the
-        # public schema's objects must name it, or it is a 404.
-        profile = request.headers.get("content-profile" if request.method == "POST" else "accept-profile")
-        if profile != "public":
-            return httpx.Response(404, json={"code": "PGRST202", "message": "not in schema cache"})
-        if request.url.path.endswith("/rpc/resolve_api_key"):
-            key_hash = json.loads(request.content)["p_key_hash"]
-            if key_hash not in ORGS:
-                return httpx.Response(200, json=[])
-            org, scopes = ORGS[key_hash]
-            return httpx.Response(200, json=[{"key_id": "k", "org_id": org, "project_id": None, "scopes": scopes}])
-        if request.url.path.endswith("/org_subscriptions"):
-            org = request.url.params["org_id"].removeprefix("eq.")
-            assert request.url.params["product"] == "eq.api"
-            return httpx.Response(200, json=subs.get(org, []))
-        return httpx.Response(404)
+        profile = request.headers.get("content-profile") or "bgi_catalog"
+        if profile != "bgi_catalog":
+            return httpx.Response(406, json={"code": "PGRST106", "message": f"Invalid schema: {profile}"})
+        if request.url.path.endswith("/rpc/resolve_mcp_access"):
+            row = ACCESS.get(json.loads(request.content)["p_key_hash"])
+            return httpx.Response(200, json=[row] if row else [])
+        return httpx.Response(404, json={"code": "PGRST202", "message": "not in schema cache"})
 
     return httpx.MockTransport(handler), calls
 
@@ -103,13 +102,18 @@ async def test_free_org_key_is_authenticated_but_not_premium():
 
 
 @pytest.mark.asyncio
-async def test_enterprise_counts_and_an_expired_pro_does_not():
-    past = (datetime.now(UTC) - timedelta(days=1)).isoformat()
-    future = (datetime.now(UTC) + timedelta(days=30)).isoformat()
-    transport, _ = supabase({"org-pro": [{"tier": "pro", "expires_at": past}]})
-    assert not (await resolver(transport).resolve(PRO_KEY)).has_scope(SCOPE_PREMIUM)
-    transport, _ = supabase({"org-pro": [{"tier": "enterprise", "expires_at": future}]})
-    assert (await resolver(transport).resolve(PRO_KEY)).has_scope(SCOPE_PREMIUM)
+async def test_enterprise_counts_as_premium():
+    transport, _ = supabase()
+    assert (await resolver(transport).resolve(ENTERPRISE_KEY)).has_scope(SCOPE_PREMIUM)
+
+
+@pytest.mark.asyncio
+async def test_asks_the_exposed_schema_in_one_call():
+    """Only bgi_catalog is exposed over REST here; `public` answers 406 (production, 2026-11-19)."""
+    transport, calls = supabase()
+    await resolver(transport).resolve(PRO_KEY)
+    assert len(calls) == 1 and calls[0].url.path.endswith("/rpc/resolve_mcp_access")
+    assert calls[0].headers["content-profile"] == "bgi_catalog"
 
 
 @pytest.mark.asyncio
@@ -144,10 +148,10 @@ async def test_results_are_cached_for_the_ttl_including_unknown_keys():
     for _ in range(5):
         await r.resolve(PRO_KEY)
         await r.resolve(UNKNOWN_KEY)
-    assert len(calls) == 3  # pro: rpc + subscriptions; unknown: rpc only
+    assert len(calls) == 2  # one lookup each, the unknown key included
     clock.now += 61
     await r.resolve(PRO_KEY)
-    assert len(calls) == 5, "after the ttl the plan is checked again (a cancelled plan takes effect)"
+    assert len(calls) == 3, "after the ttl the plan is checked again (a cancelled plan takes effect)"
 
 
 @pytest.mark.asyncio
