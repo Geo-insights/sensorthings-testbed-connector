@@ -20,7 +20,7 @@ from starlette.routing import Route
 
 from mcp_server import catalog_tools
 from mcp_server import tools as tool_impls
-from mcp_server.auth import SCOPE_PREMIUM, auth_enabled, auth_from_headers, require_scope
+from mcp_server.auth import SCOPE_PREMIUM, ApiKeyResolver, auth_enabled, auth_from_request, require_scope
 from mcp_server.catalog_schemas import (
     CompareResult,
     ContextSummary,
@@ -101,6 +101,18 @@ def _get_supabase() -> SupabaseReadClient:
     if _supabase_client is None:
         _supabase_client = SupabaseReadClient()
     return _supabase_client
+
+
+# Organization API keys -> premium (platform Epic 2 step 12, option B). One resolver per
+# process, so its cache is shared by every request.
+_key_resolver: ApiKeyResolver | None = None
+
+
+def _get_key_resolver() -> ApiKeyResolver:
+    global _key_resolver
+    if _key_resolver is None:
+        _key_resolver = ApiKeyResolver()
+    return _key_resolver
 
 
 def _raise_supabase_error(exc: Exception) -> None:
@@ -486,7 +498,7 @@ async def rank_measures(
     """
     start = time.monotonic()
     if settings.premium_gating_enabled and ctx is not None:
-        auth = auth_from_headers(ctx.headers)
+        auth = await auth_from_request(ctx.headers, _get_key_resolver())
         require_scope(auth, SCOPE_PREMIUM)
     try:
         result = await catalog_tools.rank_measures(
