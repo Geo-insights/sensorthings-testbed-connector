@@ -17,6 +17,9 @@ Covers:
   fetch afterwards reads back over the held-back cycles
 - the 3 h look-back applies from the first cycle; with the ingest loop's
   seeded high-water marks a restart fills the gap without duplicates
+- each station's window starts 3 h before the end of its last successful
+  fetch (at most 24 h back), so failed fetches (5xx, transport errors,
+  malformed bodies, a rate limit that stops the cycle) lose no hours
 - entity sets carry one Datastream per canonical component, and registering
   them where the Thing already exists adds the missing Datastreams
 - readings for registered components are pushable into the right Datastream
@@ -506,6 +509,8 @@ class _FakeLuchtmeetnetAPI:
         list_status: dict[int, int] | None = None,
         list_bodies: dict[int, Any] | None = None,
         measurement_status: dict[str, int] | None = None,
+        measurement_bodies: dict[str, Any] | None = None,
+        measurement_errors: set[str] | None = None,
         filter_window: bool = False,
         delay: float = 0.0,
     ) -> None:
@@ -518,6 +523,10 @@ class _FakeLuchtmeetnetAPI:
         # 200 bodies served instead of the real page (empty or malformed lists)
         self.list_bodies = list_bodies or {}
         self.measurement_status = measurement_status or {}
+        # 200 bodies served instead of the measurements (malformed answers)
+        self.measurement_bodies = measurement_bodies or {}
+        # stations whose measurement requests fail at the transport level
+        self.measurement_errors = measurement_errors or set()
         # Serve only measurements inside the requested start/end, like the live API
         self.filter_window = filter_window
         self.delay = delay
@@ -572,9 +581,13 @@ class _FakeLuchtmeetnetAPI:
             return httpx.Response(200, json={"data": self.details[number]})
         if path == "/measurements":
             number = params.get("station_number", "")
+            if number in self.measurement_errors:
+                raise httpx.ConnectError("connection refused", request=request)
             status = self.measurement_status.get(number, 200)
             if status != 200:
                 return httpx.Response(status, json={"message": "Too Many Requests"})
+            if number in self.measurement_bodies:
+                return httpx.Response(200, json=self.measurement_bodies[number])
             data = self.measurements.get(number, [])
             if self.filter_window:
                 start = datetime.fromisoformat(params["start"])
@@ -1165,10 +1178,11 @@ class TestReadingsArePushable:
         _run(src._do_fetch_readings())
         assert {(p["start"], p["end"]) for p in api.measurement_params()} == {(_iso(t0 - timedelta(hours=3)), _iso(t0))}
 
+        # Afterwards: three hours before the end of the station's last successful fetch.
         clock.now = t0 + timedelta(hours=1)
         _run(src._do_fetch_readings())
         last = api.measurement_params()[-1]
-        assert (last["start"], last["end"]) == (_iso(t0 - timedelta(hours=2)), _iso(t0 + timedelta(hours=1)))
+        assert (last["start"], last["end"]) == (_iso(t0 - timedelta(hours=3)), _iso(t0 + timedelta(hours=1)))
 
     def test_restart_fills_the_gap_without_pushing_anything_twice(self, install_api, clock):
         """The ingest loop's seeded high-water marks drop what the previous process already pushed."""
@@ -1208,10 +1222,11 @@ class TestReadingsArePushable:
         released = api.measurement_params()
         assert {(p["start"], p["end"]) for p in released} == {(_iso(t0 - timedelta(hours=3)), _iso(clock.now))}
 
-        clock.now = t0 + timedelta(hours=3, minutes=3)  # back to the plain look-back
+        released_at = clock.now
+        clock.now = t0 + timedelta(hours=3, minutes=3)  # back to the look-back before the last fetch
         _run(src._do_fetch_readings())
         last = api.measurement_params()[-1]
-        assert (last["start"], last["end"]) == (_iso(clock.now - timedelta(hours=3)), _iso(clock.now))
+        assert (last["start"], last["end"]) == (_iso(released_at - timedelta(hours=3)), _iso(clock.now))
 
     def test_catch_up_after_holding_back_is_bounded(self, install_api, monkeypatch, clock):
         monkeypatch.setattr(asyncio, "sleep", _no_sleep)
@@ -1317,6 +1332,124 @@ class TestReadingsArePushable:
             ds = datastreams[obs["Datastream"]["@iot.id"]]
             assert ds["properties"]["sensor_id"] == obs["parameters"]["sensor_id"]
             assert ds["properties"]["observed_property"] == obs["parameters"]["observed_property"]
+
+
+# ---------------------------------------------------------------------------
+# Catch-up after failed measurement fetches
+# ---------------------------------------------------------------------------
+
+
+def _windows_of_next_cycle(api: _FakeLuchtmeetnetAPI, src: LuchtmeetnetPollingSource) -> dict[str, tuple[str, str]]:
+    """Run one cycle; ``{station: (start, end)}`` of its measurement requests."""
+    before = len(api.measurement_params())
+    _run(src._do_fetch_readings())
+    return {p["station_number"]: (p["start"], p["end"]) for p in api.measurement_params()[before:]}
+
+
+class TestCatchUpAfterFailedFetches:
+    def test_hours_of_failed_cycles_are_read_on_the_next_successful_fetch(self, install_api, monkeypatch, clock):
+        """HTTP 503 from 11:17 to 15:17: a 3 h window from each poll lost hours 11, 12 and 13."""
+        monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+        hours = [datetime(2026, 11, 20, hour, 0, tzinfo=UTC) for hour in range(24)]
+        measurements = {"NL10450": [_measurement("NL10450", "NO2", float(h.hour), _iso(h)) for h in hours]}
+        api = install_api(
+            _FakeLuchtmeetnetAPI(
+                [_STATIONS[1]], {"NL10450": _detail(4.318551, 52.062537, ["NO2"])}, measurements, filter_window=True
+            )
+        )
+        src = _make_source()
+        start = datetime(2026, 11, 20, 10, 17, tzinfo=UTC)
+        returned: set[int] = set()
+        for step in range(7):
+            clock.now = start + timedelta(hours=step)
+            api.measurement_status = {"NL10450": 503} if 1 <= step <= 5 else {}
+            returned |= {reading.timestamp.hour for reading in _run(src._do_fetch_readings())}
+
+        assert sorted(returned) == list(range(8, 17))
+        last = api.measurement_params()[-1]
+        assert (last["start"], last["end"]) == (_iso(start - timedelta(hours=3)), _iso(clock.now))
+
+    @pytest.mark.parametrize("failure", ["http-503", "transport-error", "body-not-a-dict", "data-not-a-list"])
+    def test_a_failed_fetch_leaves_the_station_window_where_it_was(self, install_api, monkeypatch, clock, failure):
+        monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+        api = install_api(_FakeLuchtmeetnetAPI(_STATIONS, _DETAILS, _MEASUREMENTS))
+        src = _make_source()
+        t0 = clock.now
+        _run(src._do_fetch_readings())  # every station fetched up to t0
+
+        clock.now = t0 + timedelta(hours=1)
+        if failure == "http-503":
+            api.measurement_status = {"NL10450": 503}
+        elif failure == "transport-error":
+            api.measurement_errors = {"NL10450"}
+        elif failure == "body-not-a-dict":
+            api.measurement_bodies = {"NL10450": [{"formula": "NO2"}]}
+        else:
+            api.measurement_bodies = {"NL10450": {"pagination": {"last_page": 1}, "data": "unavailable"}}
+        assert {r.sensor_id for r in _run(src._do_fetch_readings())} == {"luchtmeetnet-NL49565"}
+
+        api.measurement_status, api.measurement_errors, api.measurement_bodies = {}, set(), {}
+        clock.now = t0 + timedelta(hours=2)
+        windows = _windows_of_next_cycle(api, src)
+        assert windows["NL10450"] == (_iso(t0 - timedelta(hours=3)), _iso(clock.now))  # back over the failed cycle
+        assert windows["NL49565"] == (_iso(t0 - timedelta(hours=2)), _iso(clock.now))  # fetched an hour later
+        assert windows["NL50002"] == windows["NL49565"]
+
+    def test_stations_left_after_a_rate_limit_stop_read_back_over_that_cycle(self, install_api, monkeypatch, clock):
+        monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+        api = install_api(_FakeLuchtmeetnetAPI(_STATIONS, _DETAILS, _MEASUREMENTS))
+        src = _make_source()
+        t0 = clock.now
+        _run(src._do_fetch_readings())
+
+        clock.now = t0 + timedelta(hours=1)
+        api.measurement_status = {"NL49565": 429}  # the first station: the cycle stops there
+        assert set(_windows_of_next_cycle(api, src)) == {"NL49565"}
+
+        api.measurement_status = {}
+        clock.now = t0 + timedelta(hours=2)
+        windows = _windows_of_next_cycle(api, src)
+        assert windows == {number: (_iso(t0 - timedelta(hours=3)), _iso(clock.now)) for number in ("NL49565", "NL10450", "NL50002")}
+
+    def test_station_without_a_successful_fetch_reads_back_to_its_first_window(self, install_api, monkeypatch, clock):
+        monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+        api = install_api(_FakeLuchtmeetnetAPI(_STATIONS, _DETAILS, _MEASUREMENTS, measurement_status={"NL10450": 503}))
+        src = _make_source()
+        t0 = clock.now
+        _run(src._do_fetch_readings())  # NL10450 fails from the first cycle on
+        clock.now = t0 + timedelta(hours=1)
+        _run(src._do_fetch_readings())
+
+        api.measurement_status = {}
+        clock.now = t0 + timedelta(hours=2)
+        windows = _windows_of_next_cycle(api, src)
+        assert windows["NL10450"] == (_iso(t0 - timedelta(hours=3)), _iso(clock.now))
+        assert windows["NL49565"] == (_iso(t0 - timedelta(hours=2)), _iso(clock.now))
+
+    def test_catch_up_after_failed_fetches_is_bounded(self, install_api, monkeypatch, clock):
+        """At most 24 h: about 250 values for a station with every component, under the 1000-value cap."""
+        monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+        api = install_api(_FakeLuchtmeetnetAPI(_STATIONS, _DETAILS, _MEASUREMENTS))
+        src = _make_source()
+        t0 = clock.now
+        _run(src._do_fetch_readings())
+
+        api.measurement_status = {"NL10450": 503}
+        for hours in (1, 12, 29):
+            clock.now = t0 + timedelta(hours=hours)
+            _run(src._do_fetch_readings())
+
+        api.measurement_status = {}
+        clock.now = t0 + timedelta(hours=30)
+        windows = _windows_of_next_cycle(api, src)
+        assert windows["NL10450"] == (_iso(clock.now - timedelta(hours=24)), _iso(clock.now))
+        assert windows["NL49565"] == (_iso(t0 + timedelta(hours=29) - timedelta(hours=3)), _iso(clock.now))
+
+    def test_a_restart_starts_with_the_three_hour_look_back(self, install_api, monkeypatch, clock):
+        """The process before the restart is unknown: three hours back, as before, not 24."""
+        api = install_api(_FakeLuchtmeetnetAPI(_STATIONS, _DETAILS, _MEASUREMENTS))
+        windows = _windows_of_next_cycle(api, _make_source())
+        assert set(windows.values()) == {(_iso(clock.now - timedelta(hours=3)), _iso(clock.now))}
 
 
 # ---------------------------------------------------------------------------

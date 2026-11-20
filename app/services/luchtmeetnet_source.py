@@ -40,21 +40,26 @@ _DETAIL_CONCURRENCY = 4
 # held-back cycle's window would have started (bounded by
 # _MAX_CATCH_UP_LOOKBACK).
 _MAX_HOLD_BACK_CYCLES = 2
-# Measurement look-back per poll cycle, the first cycle after a restart
-# included. Hourly values appear some time after the hour (many not yet at
-# :17), so a one-hour window polled early in the hour misses most of them for
-# good; three hours lets the next cycle pick them up, and after a restart it
-# fills the gap left since the previous process's last cycle. The overlap is
-# harmless: the ingest loop drops readings at or before its high-water mark per
-# sensor+property, and after a restart it seeds those marks from FROST for
-# every Datastream of the source.
+# Measurement look-back. Hourly values appear some time after the hour (many
+# not yet at :17), so a window ending at the poll misses the latest hours; each
+# station's window therefore starts this long before the end of its last
+# successful fetch, and the next cycle picks those hours up. A station without
+# a successful fetch in this process (the first cycle after a restart
+# included) starts this long before the end of its first window, which after a
+# restart fills the gap since the previous process's last cycle. The overlap
+# is harmless: the ingest loop drops readings at or before its high-water mark
+# per sensor+property, and after a restart it seeds those marks from FROST for
+# every Datastream of the source. A restart does not read back further: the
+# seed is best effort (a partial seed re-posts what it did not reach), so a
+# longer first window would only re-post more.
 _MEASUREMENT_LOOKBACK = timedelta(hours=3)
-# Bound on the catch-up window after cycles that fetched no measurements
-# (discovery not ready). GET /measurements returns at most 1000 values per
-# request without paging (a 7-day window returned exactly 1000, last_page=1);
-# 24 h is well below that for a station with every component. Hold-backs
-# longer than 24 h minus the look-back (a poll interval above about 10 h) lose
-# the hours before the window.
+# Bound on every window: after failed fetches (exceptions, 5xx, malformed
+# bodies, a rate limit that stopped the cycle) and after cycles that fetched no
+# measurements (discovery not ready). GET /measurements returns at most 1000
+# values per request without paging (a 7-day window returned exactly 1000,
+# last_page=1); 24 h is about 250 values for a station with every component.
+# An outage or hold-back longer than 24 h minus the look-back loses the hours
+# before the window.
 _MAX_CATCH_UP_LOOKBACK = timedelta(hours=24)
 
 
@@ -73,10 +78,13 @@ class LuchtmeetnetPollingSource(RestPollingSource):
     record has no usable coordinates, or that the detail endpoint does not know,
     is skipped with a warning; it is never registered at a made-up location.
 
-    Each cycle then fetches the recent hourly measurements per station (see
-    ``_MEASUREMENT_LOOKBACK``) and keeps only readings for the station's
-    canonical components, i.e. exactly the Datastreams that
-    :meth:`entity_sets` registers.
+    Each cycle then fetches the recent hourly measurements per station and
+    keeps only readings for the station's canonical components, i.e. exactly
+    the Datastreams that :meth:`entity_sets` registers. Each station's window
+    starts the look-back before the end of its last successful fetch, so the
+    hours of cycles whose request for that station failed are read on its next
+    successful fetch (see ``_MEASUREMENT_LOOKBACK`` and
+    ``_MAX_CATCH_UP_LOOKBACK``).
     """
 
     source_name = "luchtmeetnet"
@@ -98,6 +106,11 @@ class LuchtmeetnetPollingSource(RestPollingSource):
         # Start of the window the first cycle without a measurement fetch would
         # have read; the next fetch reads back to it (see _MAX_HOLD_BACK_CYCLES).
         self._unfetched_since: datetime | None = None
+        # {station_number: end of its last successful measurement fetch}
+        self._fetched_until: dict[str, datetime] = {}
+        # {station_number: start of the first window it was due}, for stations
+        # without a successful measurement fetch yet
+        self._due_since: dict[str, datetime] = {}
 
     def is_enabled(self) -> bool:
         return settings.luchtmeetnet_enabled
@@ -167,18 +180,24 @@ class LuchtmeetnetPollingSource(RestPollingSource):
             self._readings_released = True
 
         all_readings: list[SensorReading] = []
-        start = end - _MEASUREMENT_LOOKBACK
+        # Where a station without a successful fetch starts: the plain look-back,
+        # or, catching up on cycles without a measurement fetch, where the first
+        # of them would have started.
+        first_start = end - _MEASUREMENT_LOOKBACK
         if self._unfetched_since is not None:
-            # Catch up on what the cycles without a measurement fetch would have read.
-            start = max(min(start, self._unfetched_since), end - _MAX_CATCH_UP_LOOKBACK)
+            first_start = min(first_start, self._unfetched_since)
             self._unfetched_since = None
-        start_str = start.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-        end_str = end.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        due = [
+            (station_number, meta, allowed)
+            for station_number, meta in self._discovered_stations.items()
+            if (allowed := canonical_components(_station_components(meta)))
+        ]
+        for station_number, _meta, _allowed in due:
+            if station_number not in self._fetched_until:
+                self._due_since.setdefault(station_number, first_start)
+        end_str = _api_time(end)
 
-        for station_number, meta in self._discovered_stations.items():
-            allowed = canonical_components(_station_components(meta))
-            if not allowed:
-                continue
+        for station_number, meta, allowed in due:
             station_name = str(meta.get("name", station_number))
             try:
                 # No ``formula`` filter: the API honours only the first formula of
@@ -187,14 +206,15 @@ class LuchtmeetnetPollingSource(RestPollingSource):
                     "/measurements",
                     params={
                         "station_number": station_number,
-                        "start": start_str,
+                        "start": _api_time(self._window_start(station_number, end)),
                         "end": end_str,
                     },
                 )
             except Exception as exc:
                 if _is_rate_limited(exc):
                     # Still 429 after the client's retries: further requests would
-                    # only prolong the block. The look-back covers the rest next cycle.
+                    # only prolong the block. The stations not fetched read back
+                    # over this cycle on their next successful fetch.
                     logger.warning(
                         "Luchtmeetnet: rate limited (HTTP 429) at station %s — stopping this cycle's "
                         "measurement requests",
@@ -221,6 +241,9 @@ class LuchtmeetnetPollingSource(RestPollingSource):
                 )
                 continue
 
+            # Only a well-formed answer moves the station's window on.
+            self._fetched_until[station_number] = end
+            self._due_since.pop(station_number, None)
             readings = _registered_readings(
                 parse_measurements(data, station_number, station_name), allowed, station_number
             )
@@ -273,6 +296,22 @@ class LuchtmeetnetPollingSource(RestPollingSource):
         """Remember where the window of a cycle that fetched no measurements would have started."""
         if self._unfetched_since is None:
             self._unfetched_since = now - _MEASUREMENT_LOOKBACK
+
+    def _window_start(self, station_number: str, end: datetime) -> datetime:
+        """Start of a station's measurement window for a cycle ending at *end*.
+
+        The look-back before the end of the station's last successful fetch
+        (never later than the look-back before *end*), so the hours of failed
+        fetches in between are read too; for a station without a successful
+        fetch, the start of the first window it was due. Never more than
+        ``_MAX_CATCH_UP_LOOKBACK`` before *end*.
+        """
+        fetched_until = self._fetched_until.get(station_number)
+        if fetched_until is not None:
+            start = min(end - _MEASUREMENT_LOOKBACK, fetched_until - _MEASUREMENT_LOOKBACK)
+        else:
+            start = self._due_since.get(station_number, end - _MEASUREMENT_LOOKBACK)
+        return max(start, end - _MAX_CATCH_UP_LOOKBACK)
 
     async def _fetch_station_list(self, client: AsyncAPIClient) -> None:
         """Read the paged ``GET /stations`` list into ``_station_names``.
@@ -372,6 +411,11 @@ class LuchtmeetnetPollingSource(RestPollingSource):
 
 def _is_rate_limited(exc: BaseException) -> bool:
     return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429
+
+
+def _api_time(moment: datetime) -> str:
+    """A UTC time as the start/end measurement parameters take it."""
+    return moment.strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
 
 def _list_items(resp: Any) -> list[Any]:
