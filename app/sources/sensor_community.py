@@ -7,7 +7,7 @@ co-exist at the same physical location (identified by ``location.id``).
 
 Supported sensor types:
 - SDS011 — particulate matter (P1→PM10, P2→PM2.5)
-- BME280 / BMP280 — temperature, humidity, pressure
+- BME280 / BMP280 — temperature, humidity, pressure (reported in Pa, pushed as hPa)
 - DNMS — noise levels (noise_LAeq, noise_LAmin, noise_LAmax)
 
 API endpoint: https://data.sensor.community/airrohr/v1/filter/country=NL
@@ -18,12 +18,78 @@ from __future__ import annotations
 import logging
 import math
 from datetime import UTC, datetime
-from typing import Any
+from decimal import Decimal
+from typing import Any, NamedTuple
 
 from app.models import SensorReading
-from app.sta.canonical import resolve
+from app.sta.canonical import CanonicalDatastream, resolve
 
 logger = logging.getLogger(__name__)
+
+
+class UnitScale(NamedTuple):
+    """Conversion of one Sensor.Community value_type into its canonical unit."""
+
+    factor: Decimal  # canonical value = raw value * factor
+    source_unit: str  # the unit Sensor.Community reports
+    band: tuple[float, float]  # open interval of raw values that are plainly in source_unit
+
+
+# Raw pressures strictly inside this band are plainly pascal. At or below the
+# lower bound the value is already hPa (no surface air pressure is 20 hPa); at or
+# above the upper bound it is implausible in either unit (2000 hPa) and is left
+# as is. Every scaled value lands below the lower bound, so the conversion is
+# idempotent: no value is ever divided twice. scripts/fix_sc_pressure_units.py
+# applies the same band to the history already in FROST.
+PA_BAND: tuple[float, float] = (2_000.0, 200_000.0)
+PA_TO_HPA = Decimal("0.01")
+
+# Canonical datastreams whose unit differs from the one Sensor.Community reports
+# for the value_types that resolve to them. canonical.py owns units and canonical
+# always wins (see CLAUDE.md), so the value is converted here, at the source
+# boundary. Keyed by the canonical member resolve() returns, not by the raw
+# value_type, so every alias of such a datastream ("pressure", "Air Pressure",
+# "air_pressure", ...) is converted alike.
+#
+# Pressure: the airrohr firmware (github.com/opendata-stuttgart/sensors-software,
+# airrohr-firmware/airrohr-firmware.ino) sends the BMP180/BMP280/BME280 reading
+# as returned by readPressure(), in pascal (``BME280_pressure``), and divides by
+# 100 only for its own hPa display. The data API serves it as value_type
+# "pressure", e.g. "100391.86"; canonical Air pressure is hPa. Every hPa
+# datastream is therefore scaled from Pa. A few stations on other firmware
+# already report hPa (e.g. "1001.1"): the band leaves those as is.
+# "pressure_at_sealevel" is in Pa as well but resolves to no canonical
+# datastream, so it is skipped before it gets here.
+UNIT_SCALES: dict[CanonicalDatastream, UnitScale] = {
+    member: UnitScale(PA_TO_HPA, "Pa", PA_BAND) for member in CanonicalDatastream if member.meta.unit == "hPa"
+}
+
+
+def to_canonical_unit(canonical: CanonicalDatastream, value: float, location_id: object = None) -> float:
+    """Convert a raw Sensor.Community value to the unit of its canonical datastream.
+
+    Values for datastreams without an entry in ``UNIT_SCALES`` are returned
+    unchanged, as are values outside the entry's band (logged at debug).
+    """
+    scale = UNIT_SCALES.get(canonical)
+    if scale is None:
+        return value
+    low, high = scale.band
+    if not low < value < high:
+        logger.debug(
+            "sensor_community: %s=%r at location %s is outside the %s band (%s, %s) — not scaled",
+            canonical.value,
+            value,
+            location_id,
+            scale.source_unit,
+            low,
+            high,
+        )
+        return value
+    # Exact decimal arithmetic: in binary floating point 99954.35 / 100 is
+    # 999.5435000000001, which FROST would store and serve verbatim.
+    return float(Decimal(repr(value)) * scale.factor)
+
 
 # Source-specific descriptions per canonical observed property. Unit + display
 # name + CF definition all come from canonical.py at read time.
@@ -160,6 +226,8 @@ def parse_sensor_data(sensor_entries: list[dict[str, Any]]) -> list[SensorReadin
 
             if not math.isfinite(value):
                 continue
+
+            value = to_canonical_unit(canonical, value, location_id)
 
             meta = canonical.meta
             readings.append(
