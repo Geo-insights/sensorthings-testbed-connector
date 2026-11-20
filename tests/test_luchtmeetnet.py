@@ -3,6 +3,9 @@
 Covers:
 - parse_measurements() with valid data produces correct canonical names / units
 - parse_measurements() with an unknown formula is skipped
+- FORMULA_UNITS: every pushed formula declares the unit the API serves it in;
+  where that differs from the canonical unit (CO: µg/m³ vs mg/m³) a declared
+  scale converts it exactly, and formulas without a declared unit are dropped
 - build_entity_set() produces a valid entity-set dict
 - LuchtmeetnetPollingSource is a RestPollingSource subclass with
   uses_dynamic_discovery = True
@@ -32,6 +35,7 @@ import logging
 import re
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any, ClassVar
 from urllib.parse import urlsplit
@@ -49,13 +53,16 @@ from app.services.luchtmeetnet_source import LuchtmeetnetPollingSource
 from app.services.rest_polling_source import RestPollingSource
 from app.services.sensorthings_client import SensorThingsClient
 from app.sources.luchtmeetnet import (
+    FORMULA_UNITS,
     StationDetail,
     build_entity_set,
     canonical_components,
+    formula_unit,
     parse_measurements,
     parse_station_detail,
 )
-from app.sta.canonical import CanonicalDatastream
+from app.sta import canonical as canonical_module
+from app.sta.canonical import CanonicalDatastream, resolve
 from scripts import repair_luchtmeetnet_locations as repair
 
 # ---------------------------------------------------------------------------
@@ -117,12 +124,29 @@ class TestParseMeasurements:
         assert len(readings) == 1
         assert readings[0].observed_property == "so2"
 
-    def test_co_maps_to_canonical(self):
-        data = [_make_entry("CO", 0.25)]
-        readings = parse_measurements(data, "NL49007", "Test")
+    def test_co_is_converted_from_the_api_ug_m3_to_canonical_mg_m3(self):
+        """GET /measurements serves CO in µg/m³ (NL49007 at 22:00 on 2026-11-20: 559.3); canonical CO is mg/m³."""
+        data = [_make_entry("CO", 559.3, "2026-11-20T22:00:00+00:00")]
+        readings = parse_measurements(data, "NL49007", "Amsterdam-Einsteinweg")
         assert len(readings) == 1
         assert readings[0].observed_property == "co"
         assert readings[0].unit == "mg/m3"
+        assert readings[0].value == 0.5593
+
+    @pytest.mark.parametrize(
+        ("api_value", "pushed"),
+        # Live values (µg/m³) from the six CO stations, Nov 2026; 226.2 * 0.001 is
+        # 0.22619999999999998 in binary floating point.
+        [(207.6, 0.2076), (226.2, 0.2262), (645.9, 0.6459), (843.0, 0.843), (0.0, 0.0), (-1.5, -0.0015)],
+    )
+    def test_co_conversion_is_exact(self, api_value, pushed):
+        (reading,) = parse_measurements([_make_entry("CO", api_value)], "NL49553", "Wijk aan Zee-De Banjaert")
+        assert reading.value == pushed
+
+    def test_other_components_keep_their_api_value(self):
+        data = [_make_entry(formula, 32.1) for formula in ("NO2", "O3", "PM10", "PM25", "SO2", "NH3", "C6H6")]
+        readings = parse_measurements(data, "NL49007", "Test")
+        assert [(r.value, r.unit) for r in readings] == [(32.1, "ug/m3")] * 7
 
     def test_nh3_maps_to_canonical(self):
         data = [_make_entry("NH3", 7.4)]
@@ -180,6 +204,66 @@ class TestParseMeasurements:
         data = [_make_entry("NO2", 5.0)]
         readings = parse_measurements(data, "NL49007", "Test")
         assert readings[0].quality == "good"
+
+
+# ---------------------------------------------------------------------------
+# FORMULA_UNITS: the API unit of every pushed formula next to its canonical unit
+# ---------------------------------------------------------------------------
+
+# Conversions between mass concentration units: value in the second unit = value
+# in the first unit * factor.
+_KNOWN_SCALES = {("ug/m3", "mg/m3"): Decimal("0.001"), ("mg/m3", "ug/m3"): Decimal(1000)}
+# Every formula GET /components lists (Nov 2026), the spellings station records
+# use, and every canonical name and alias, i.e. whatever canonical.resolve() maps.
+_LIVE_FORMULAS = [
+    "BCWB", "C10H8", "C6H6", "C7H8", "C8H10", "CO", "FN", "H2S", "NH3", "NO", "NO2", "NOx", "O3", "PM10",
+    "PM25", "PM2.5", "PS", "SO2",
+]
+_CANDIDATE_FORMULAS = sorted({*_LIVE_FORMULAS, *(member.value for member in CanonicalDatastream), *canonical_module._ALIASES})
+
+
+class TestFormulaUnits:
+    @pytest.mark.parametrize("formula", sorted(FORMULA_UNITS))
+    def test_api_unit_differs_from_canonical_only_with_a_declared_scale(self, formula):
+        declared = FORMULA_UNITS[formula]
+        canonical_unit = declared.canonical.meta.unit
+        if declared.api_unit == canonical_unit:
+            assert declared.scale == 1, f"{formula}: served in its canonical unit, yet scaled by {declared.scale}"
+        else:
+            assert (declared.api_unit, canonical_unit) in _KNOWN_SCALES, (
+                f"{formula}: no known conversion from {declared.api_unit} to {canonical_unit}"
+            )
+            assert declared.scale == _KNOWN_SCALES[(declared.api_unit, canonical_unit)], (
+                f"{formula}: served in {declared.api_unit}, pushed as {canonical_unit}, without the declared scale"
+            )
+
+    @pytest.mark.parametrize("formula", sorted(FORMULA_UNITS))
+    def test_table_agrees_with_canonical_resolve(self, formula):
+        assert resolve(formula) is FORMULA_UNITS[formula].canonical
+
+    def test_api_units_as_the_live_components_endpoint_gives_them(self):
+        """GET /components/{formula}, Nov 2026: every pushed formula is served in µg/m³."""
+        assert {formula: declared.api_unit for formula, declared in FORMULA_UNITS.items()} == dict.fromkeys(
+            ["NO2", "O3", "PM10", "PM25", "PM2.5", "SO2", "CO", "NH3", "C6H6"], "ug/m3"
+        )
+        # Canonical CO stays mg/m3: Samen Meten maps onto the same datastream.
+        assert FORMULA_UNITS["CO"].canonical.meta.unit == "mg/m3"
+
+    def test_every_emitted_formula_has_a_declared_api_unit(self):
+        """Whatever becomes a reading or a Datastream is in FORMULA_UNITS and arrives in its canonical unit."""
+        for formula in _CANDIDATE_FORMULAS:
+            readings = parse_measurements([_make_entry(formula, 250.5)], "NL49007", "Test")
+            declared = formula_unit(formula)
+            if declared is None:
+                assert readings == [], f"{formula} is emitted without a declared API unit"
+                assert canonical_components([formula]) == [], f"{formula} gets a Datastream without a declared API unit"
+                continue
+            assert len(readings) == 1, formula
+            reading = readings[0]
+            assert reading.observed_property == declared.canonical.value, formula
+            assert reading.unit == declared.canonical.meta.unit, formula
+            assert reading.value == float(Decimal("250.5") * declared.scale), formula
+            assert canonical_components([formula]) == [declared.canonical.value], formula
 
 
 # ---------------------------------------------------------------------------
@@ -1156,6 +1240,38 @@ class TestReadingsArePushable:
         _run(src._do_fetch_readings())
         last = api.measurement_params()[-1]
         assert (last["start"], last["end"]) == (_iso(t0 - timedelta(hours=3)), _iso(clock.now))
+
+    def test_co_is_registered_and_pushed_in_mg_m3(self, install_api, monkeypatch, tmp_path):
+        """Live NL49007 (Nov 2026): its CO Datastream is in mg/m³, and so are the values pushed into it."""
+        station = {"number": "NL49007", "location": "Amsterdam-Einsteinweg"}
+        detail = _detail(4.845233, 52.381331, ["PM25", "NO", "CO", "FN", "PM10", "NO2"])
+        measurements = {
+            "NL49007": [  # as served: µg/m³
+                _measurement("NL49007", "CO", 559.3, "2026-11-20T22:00:00+00:00"),
+                _measurement("NL49007", "CO", 757.9, "2026-11-20T21:00:00+00:00"),
+                _measurement("NL49007", "NO2", 32.1, "2026-11-20T22:00:00+00:00"),
+                _measurement("NL49007", "FN", 1.58, "2026-11-20T22:00:00+00:00"),
+            ]
+        }
+        install_api(_FakeLuchtmeetnetAPI([station], {"NL49007": detail}, measurements))
+        src = _make_source()
+        readings = _run(src._do_fetch_readings())
+
+        frost = _FakeFrost()
+        client = _client_on(frost, monkeypatch, tmp_path)
+        for entity_set in src.entity_sets():
+            client.register_entity_set(entity_set)
+        client.push_observations(readings, source="luchtmeetnet")
+
+        by_property = {ds["properties"]["observed_property"]: ds for ds in frost.entities["Datastreams"].values()}
+        assert sorted(by_property) == ["co", "no2", "pm10", "pm2_5"]
+        assert by_property["co"]["unitOfMeasurement"]["symbol"] == "mg/m3"
+        assert by_property["no2"]["unitOfMeasurement"]["symbol"] == "ug/m3"
+        pushed: dict[str, list[float]] = {}
+        for obs in frost.posted("Observations"):
+            datastream = frost.entities["Datastreams"][obs["Datastream"]["@iot.id"]]
+            pushed.setdefault(datastream["properties"]["observed_property"], []).append(obs["result"])
+        assert pushed == {"co": [0.7579, 0.5593], "no2": [32.1]}
 
     def test_only_registered_components_are_emitted_oldest_first(self, install_api):
         install_api(_FakeLuchtmeetnetAPI(_STATIONS, _DETAILS, _MEASUREMENTS))
