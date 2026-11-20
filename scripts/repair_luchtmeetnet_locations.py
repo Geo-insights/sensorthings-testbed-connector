@@ -7,22 +7,41 @@ was created at POINT(5 52). Registration finds an existing Location by name and
 never updates it, so this one-off script looks up each station's coordinates
 in ``GET /stations/{number}`` and PATCHes its Location.
 
-Run it before the fixed connector pushes any Luchtmeetnet Observation. FROST
-generates a FeatureOfInterest from a Thing's Location when the first
+Run it before the fixed connector pushes any Luchtmeetnet Observation: before
+the connector deploy, or deploy with LUCHTMEETNET_ENABLED=false until it has
+run. FROST generates a FeatureOfInterest from a Thing's Location when the first
 Observation arrives and keeps reusing it after the Location is PATCHed (checked
 on FROST 2.8), so Observations pushed before the repair stay at the
 placeholder. The script checks this precondition: when a Luchtmeetnet
-Datastream already has an Observation it prints a warning and refuses
-``--apply`` unless ``--allow-observations`` is given. With that flag it also
-PATCHes the placeholder FeaturesOfInterest it finds through one Observation of
-every Luchtmeetnet Datastream (FROST reuses one generated FeatureOfInterest per
-Location).
+Datastream already has an Observation and there is something to move, it
+prints a warning and refuses ``--apply`` unless ``--allow-observations`` is
+given. With that flag it also PATCHes the placeholder FeaturesOfInterest it
+finds through one Observation of every Luchtmeetnet Datastream (FROST reuses one
+generated FeatureOfInterest per Location).
+
+Those Datastreams keep their observedArea at POINT(5 52) all the same. FROST
+2.8 sets a Datastream's observedArea (OBSERVED_AREA) and LAST_FOI_ID only in
+its insert trigger on OBSERVATIONS, and only when the new Observation's
+FeatureOfInterest differs from LAST_FOI_ID; it ignores observedArea in a PATCH.
+Moving the FeatureOfInterest fires no trigger, and the Observations after it
+reuse the same FeatureOfInterest, so the API cannot fix it. ``--print-sql``
+prints SQL that recomputes both columns of every Luchtmeetnet Datastream from
+the FeaturesOfInterest of its Observations, as that trigger would have left
+them had every FeatureOfInterest been at its current place from the start: the
+convex hull of their geometries, and the FeatureOfInterest of the last
+Observation inserted (highest id). Datastreams already matching are not
+written, so re-running it changes nothing. ``--print-sql`` contacts neither
+FROST nor Luchtmeetnet; the SQL is run by hand with psql against the FROST
+database, after ``--apply --allow-observations``, never by this script. It
+ends in ROLLBACK, a preview that lists what would change; with ``--apply`` it
+ends in COMMIT. The dry run reports the Luchtmeetnet Datastreams whose
+observedArea still has a corner at the placeholder.
 
 Things are matched on ``properties.station_number`` (set by the connector on
 every Luchtmeetnet Thing) and, failing that, on the station name from the
 Luchtmeetnet station list. Only geometries still at the placeholder are
 touched, so re-running is safe; after ``--apply``, run the dry run again: it
-should find nothing left to move.
+should find nothing left to move and exit 0, Observations or not.
 
 SensorThings v1.1 and v2.0 endpoints both work (FROST serves both from one
 database). Query options follow the target's declared ``version``; ids and
@@ -49,15 +68,29 @@ output unbuffered:
     docker compose exec -T connector python -u - < scripts/repair_luchtmeetnet_locations.py
     docker compose exec -T connector python -u - --apply < scripts/repair_luchtmeetnet_locations.py
 
+The observedArea SQL is only needed after a repair with
+``--allow-observations``. Print it where the connector's environment is (the
+entity name prefix comes from SENSORTHINGS_ENTITY_NAME_PREFIX, else pass
+``--prefix``), read it, then run the preview and, if it lists what you expect,
+the committing version with psql on the FROST database host:
+
+    # where the connector runs, in its compose directory:
+    docker compose exec -T connector python -u - --print-sql < scripts/repair_luchtmeetnet_locations.py > lmn_observed_area_preview.sql
+    docker compose exec -T connector python -u - --print-sql --apply < scripts/repair_luchtmeetnet_locations.py > lmn_observed_area.sql
+    # on the FROST host, in FROST's compose directory (database service and credentials as deployed there):
+    docker compose exec -T <database service> psql -U <user> -d <database> < lmn_observed_area_preview.sql
+    docker compose exec -T <database service> psql -U <user> -d <database> < lmn_observed_area.sql
+
 Exit status (the first that applies, in this order):
-    4  Luchtmeetnet Observations already exist and --allow-observations was not
-       given; nothing was written
+    4  Luchtmeetnet Observations already exist, there is something to move and
+       --allow-observations was not given; nothing was written
     1  a FROST request failed (reading the Things, or a PATCH)
     2  stations were not checked because the Luchtmeetnet API failed (HTTP 429
        after retries, 5xx, timeout, unreadable body): re-run in a few minutes
     3  placeholder geometries were left because Luchtmeetnet has no usable
        coordinates for the station or does not know it: re-running won't help
-    0  otherwise
+    0  otherwise, also when Datastreams only have their observedArea left at
+       the placeholder (see --print-sql); --print-sql always exits 0
 
 The FROST target and its credentials come from the connector's environment
 variables only (SENSORTHINGS_BASE_URL / SENSORTHINGS_BASE_URLS and
@@ -201,6 +234,8 @@ class RepairPlan:
     frost_errors: list[str] = field(default_factory=list)
     observed_things: int = 0
     observed_datastreams: int = 0
+    # Datastreams whose observedArea has a corner at the placeholder
+    stale_observed_areas: list[str] = field(default_factory=list)
 
     def count(self, entity_set: str) -> int:
         return sum(1 for patch in self.patches if patch.entity_set == entity_set)
@@ -244,6 +279,34 @@ def is_placeholder(point: Point | None) -> bool:
     )
 
 
+def geometry_positions(value: Any) -> Iterator[Point]:
+    """Every ``(lon, lat)`` position of a GeoJSON geometry of any type (or a Feature)."""
+    if not isinstance(value, dict):
+        return
+    if value.get("type") == "Feature":
+        yield from geometry_positions(value.get("geometry"))
+    elif value.get("type") == "GeometryCollection":
+        for geometry in _dicts(value.get("geometries")):
+            yield from geometry_positions(geometry)
+    else:
+        yield from _positions(value.get("coordinates"))
+
+
+def _positions(coordinates: Any) -> Iterator[Point]:
+    if not isinstance(coordinates, list | tuple) or not coordinates:
+        return
+    if all(isinstance(c, int | float) and not isinstance(c, bool) for c in coordinates[:2]) and len(coordinates) >= 2:
+        yield float(coordinates[0]), float(coordinates[1])
+        return
+    for item in coordinates:
+        yield from _positions(item)
+
+
+def touches_placeholder(geometry: Any) -> bool:
+    """Whether any position of a GeoJSON geometry (an observedArea's corners) is the placeholder."""
+    return any(is_placeholder(position) for position in geometry_positions(geometry))
+
+
 def station_detail_point(body: Any) -> Point | Unresolved:
     """``(lon, lat)`` from a ``GET /stations/{number}`` response, or why there is none.
 
@@ -274,10 +337,11 @@ def thing_prefix(entity_prefix: str) -> str:
 
 
 def thing_expand(fields: FrostODataFields) -> str:
-    """``$expand`` for the Things query: Locations, and one Observation with its FoI per Datastream."""
+    """``$expand`` for the Things query: Locations, and per Datastream its observedArea and
+    one Observation with its FoI."""
     key = fields.id
     return (
-        f"Locations,Datastreams($select={key};$expand=Observations($top=1;$select={key};"
+        f"Locations,Datastreams($select={key},observedArea;$expand=Observations($top=1;$select={key};"
         f"$expand=FeatureOfInterest($select={key},feature)))"
     )
 
@@ -339,6 +403,11 @@ def build_plan(
         if observed:
             plan.observed_things += 1
             plan.observed_datastreams += len(observed)
+        plan.stale_observed_areas.extend(
+            f"Datastream {entity_id(ds, fields)} of {thing_name!r}"
+            for ds in _dicts(thing.get("Datastreams"))
+            if touches_placeholder(ds.get("observedArea"))
+        )
 
         locations = _dicts(thing.get("Locations"))
         if not locations:
@@ -399,6 +468,100 @@ def patch_body(patch: PlannedPatch) -> dict[str, Any]:
     if patch.entity_set == FEATURES_OF_INTEREST:
         return {"encodingType": _GEOJSON, "feature": point}
     return {"encodingType": _GEOJSON, "location": point}
+
+
+def _sql_literal(text: str) -> str:
+    return "'" + text.replace("'", "''") + "'"
+
+
+def observed_area_sql(entity_prefix: str, *, commit: bool) -> str:
+    """psql script recomputing OBSERVED_AREA and LAST_FOI_ID of the Luchtmeetnet Datastreams.
+
+    Matches FROST 2.8's insert trigger on OBSERVATIONS (datastreams_update_insert),
+    which on every Observation whose FEATURE_ID differs from the Datastream's
+    LAST_FOI_ID sets LAST_FOI_ID to it and OBSERVED_AREA to
+    ``ST_ConvexHull(ST_Collect(OBSERVED_AREA, <the FoI's GEOM>))``. Run by hand
+    only; ends in COMMIT when *commit*, else in ROLLBACK.
+    """
+    if any(char in entity_prefix for char in "\r\n\0"):
+        raise SystemExit("The entity name prefix contains a line break or NUL; refusing to print SQL for it.")
+    things = thing_prefix(entity_prefix)
+    end = "COMMIT" if commit else "ROLLBACK"
+    differs = (
+        'd."OBSERVED_AREA" IS DISTINCT FROM r.observed_area OR d."LAST_FOI_ID" IS DISTINCT FROM r.last_foi_id'
+    )
+    return f"""-- Recompute OBSERVED_AREA (observedArea) and LAST_FOI_ID of the Luchtmeetnet Datastreams,
+-- those of the Things whose name starts with {_sql_literal(things)}, from the FeaturesOfInterest of
+-- their Observations, as FROST 2.8's insert trigger on OBSERVATIONS (datastreams_update_insert)
+-- would have left them had every FeatureOfInterest been at its current place from the start:
+-- the convex hull of the GEOM of the distinct FeaturesOfInterest of a Datastream's Observations,
+-- and the FEATURE_ID of its last inserted Observation (highest ID). NULL for both when it has no
+-- Observations. Only rows that differ are written; re-running changes nothing.
+--
+-- Printed by scripts/repair_luchtmeetnet_locations.py --print-sql{" --apply" if commit else ""}; ends in {end}.
+-- Run it by hand with psql against the FROST database, after --apply --allow-observations.
+\\set ON_ERROR_STOP on
+BEGIN;
+SET LOCAL lock_timeout = '10s';
+SET LOCAL statement_timeout = '50s';
+
+CREATE TEMP TABLE lmn_datastreams ON COMMIT DROP AS
+SELECT d."ID" AS datastream_id, t."NAME" AS thing_name
+  FROM "DATASTREAMS" d
+  JOIN "THINGS" t ON t."ID" = d."THING_ID"
+ WHERE starts_with(t."NAME", {_sql_literal(things)});
+ANALYZE lmn_datastreams;
+\\echo 'Luchtmeetnet Datastreams, locked until the end of this transaction (an Observation inserted meanwhile waits for it):'
+SELECT count(*) AS datastreams
+  FROM (SELECT 1 FROM "DATASTREAMS" d JOIN lmn_datastreams l ON l.datastream_id = d."ID" FOR UPDATE OF d) locked;
+
+-- One Datastream at a time through the OBSERVATIONS index on DATASTREAM_ID: OFFSET 0 keeps the
+-- planner from turning the lateral subquery into a join that could scan every Observation.
+CREATE TEMP TABLE lmn_observations ON COMMIT DROP AS
+SELECT l.datastream_id, o."ID" AS observation_id, o."FEATURE_ID" AS feature_id
+  FROM lmn_datastreams l
+ CROSS JOIN LATERAL (
+       SELECT "ID", "FEATURE_ID" FROM "OBSERVATIONS" WHERE "DATASTREAM_ID" = l.datastream_id OFFSET 0
+ ) o;
+
+CREATE TEMP TABLE lmn_recomputed ON COMMIT DROP AS
+SELECT l.datastream_id, l.thing_name, area.observed_area, last.last_foi_id
+  FROM lmn_datastreams l
+  LEFT JOIN (
+        SELECT fo.datastream_id, ST_ConvexHull(ST_Collect(f."GEOM")) AS observed_area
+          FROM (SELECT DISTINCT datastream_id, feature_id FROM lmn_observations) fo
+          JOIN "FEATURES" f ON f."ID" = fo.feature_id
+         GROUP BY fo.datastream_id
+       ) area ON area.datastream_id = l.datastream_id
+  LEFT JOIN (
+        SELECT DISTINCT ON (datastream_id) datastream_id, feature_id AS last_foi_id
+          FROM lmn_observations
+         ORDER BY datastream_id, observation_id DESC
+       ) last ON last.datastream_id = l.datastream_id;
+
+\\echo 'Datastreams to update (now -> recomputed):'
+SELECT r.datastream_id, r.thing_name,
+       coalesce(ST_AsText(d."OBSERVED_AREA"), 'NULL') AS observed_area_now,
+       coalesce(ST_AsText(r.observed_area), 'NULL') AS observed_area_recomputed,
+       d."LAST_FOI_ID" AS last_foi_id_now, r.last_foi_id AS last_foi_id_recomputed
+  FROM lmn_recomputed r
+  JOIN "DATASTREAMS" d ON d."ID" = r.datastream_id
+ WHERE {differs}
+ ORDER BY r.datastream_id;
+
+UPDATE "DATASTREAMS" d
+   SET "OBSERVED_AREA" = r.observed_area, "LAST_FOI_ID" = r.last_foi_id
+  FROM lmn_recomputed r
+ WHERE d."ID" = r.datastream_id
+   AND ({differs});
+
+\\echo 'Datastreams still differing (0 expected):'
+SELECT count(*) AS still_differing
+  FROM lmn_recomputed r
+  JOIN "DATASTREAMS" d ON d."ID" = r.datastream_id
+ WHERE {differs};
+{end};
+"""
 
 
 def exit_status(plan: RepairPlan, frost_failures: int) -> int:
@@ -676,6 +839,13 @@ def print_summary(plan: RepairPlan) -> None:
 
 
 def print_observation_warning(plan: RepairPlan, allow_observations: bool) -> None:
+    if not plan.patches:
+        print(
+            f"\n{plan.observed_datastreams} Luchtmeetnet Datastreams on {plan.observed_things} Things have "
+            "Observations; nothing is left to move (the FeatureOfInterest of one Observation per Datastream "
+            "was checked)."
+        )
+        return
     bar = "!" * 79
     print(
         f"\n{bar}\n"
@@ -690,6 +860,19 @@ def print_observation_warning(plan: RepairPlan, allow_observations: bool) -> Non
     else:
         print("!! --apply is refused. Check those Observations, then re-run with --allow-observations.")
     print(bar)
+
+
+def print_observed_area_notice(plan: RepairPlan) -> None:
+    if not plan.stale_observed_areas:
+        return
+    shown = ", ".join(plan.stale_observed_areas[:5]) + (", ..." if len(plan.stale_observed_areas) > 5 else "")
+    print(
+        f"\n{len(plan.stale_observed_areas)} Luchtmeetnet Datastreams have an observedArea with a corner at "
+        f"{format_point(PLACEHOLDER_POINT)}: {shown}.\n"
+        "FROST updates observedArea only when an Observation with another FeatureOfInterest is inserted, and\n"
+        "ignores it in a PATCH. Once their FeaturesOfInterest are moved, recompute it with the SQL that\n"
+        "--print-sql prints, run by hand with psql against the FROST database (see the docstring)."
+    )
 
 
 def run(
@@ -717,9 +900,10 @@ def run(
     print_summary(plan)
     if plan.observed_datastreams:
         print_observation_warning(plan, allow_observations)
-        if not allow_observations:
+        if plan.patches and not allow_observations:
             print("Nothing was written.")
             return EXIT_OBSERVATIONS_EXIST
+    print_observed_area_notice(plan)
 
     if not apply:
         print("Dry run: nothing was written." + (" Re-run with --apply to PATCH them." if plan.patches else ""))
@@ -741,7 +925,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--target-url", help="one of the configured FROST targets (default: the primary target)")
     parser.add_argument("--api-url", default=settings.luchtmeetnet_api_url, help="Luchtmeetnet open API base URL")
     parser.add_argument("--prefix", default=settings.entity_name_prefix, help="entity name prefix (default from env)")
+    parser.add_argument(
+        "--print-sql",
+        action="store_true",
+        help="only print the psql script that recomputes the Luchtmeetnet Datastreams' observedArea and "
+        "LAST_FOI_ID, to run by hand (ends in ROLLBACK; in COMMIT with --apply); contacts nothing",
+    )
     args = parser.parse_args(argv)
+
+    if args.print_sql:
+        sys.stdout.write(observed_area_sql(args.prefix, commit=args.apply))
+        return EXIT_OK
 
     target = select_target(settings.frost_targets, args.target_url)
     fields = odata_fields_for(target.version)

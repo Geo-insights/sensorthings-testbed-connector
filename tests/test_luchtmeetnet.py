@@ -26,7 +26,10 @@ Covers:
 - scripts/repair_luchtmeetnet_locations.py plans and applies Location and
   generated FeatureOfInterest PATCHes (dry run by default) on SensorThings
   v1.1 and v2.0, tells Luchtmeetnet API failures apart from missing
-  coordinates, and refuses --apply once Observations exist
+  coordinates, refuses --apply once Observations exist while there is
+  something to move (exit 0 when nothing is), reports observedAreas left at
+  the placeholder, and --print-sql prints the observedArea SQL contacting
+  nothing
 """
 from __future__ import annotations
 
@@ -1755,6 +1758,71 @@ class TestRepairLuchtmeetnetLocations:
         assert http.patches == []
         assert "Nothing was written." in capsys.readouterr().out
 
+    def test_check_after_a_repair_with_observations_exits_0(self, capsys):
+        """After --apply --allow-observations nothing is left to move: no refusal, exit 0."""
+        things = [
+            _frost_thing(
+                195, "NL49565", "Oude Meer-Aalsmeerderdijk", location_id=108, coordinates=[4.77082, 52.28013],
+                datastreams=[(7, None), (8, (80, 31, [4.77082, 52.28013]))],
+            ),
+            _frost_thing(199, "NL50002", "Geleen-Vouershof", location_id=111, coordinates=[5.81071, 50.96309]),
+        ]
+        http = _FakeFrostHTTP(things)
+        assert _run_repair(http, apply=False) == repair.EXIT_OK
+        out = capsys.readouterr().out
+        assert "--apply is refused" not in out
+        assert "1 Luchtmeetnet Datastreams on 1 Things have Observations; nothing is left to move" in out
+
+        assert _run_repair(http, apply=True) == repair.EXIT_OK
+        assert http.patches == []
+
+    def test_observations_and_nothing_movable_give_the_status_of_what_is_left(self, capsys):
+        """Stations left at the placeholder for an API failure: exit 2 (re-run), not the refusal."""
+        things = [
+            _frost_thing(195, "NL49565", "Oude Meer-Aalsmeerderdijk", location_id=108, datastreams=[(8, (80, 31, _PLACEHOLDER))])
+        ]
+        get = _api_get_from(_DETAILS, failures={"NL49565": repair.SERVER_ERROR})
+        assert _run_repair(_FakeFrostHTTP(things), apply=True, get=get) == repair.EXIT_API_FAILED
+        assert "--apply is refused" not in capsys.readouterr().out
+
+    def test_observed_areas_at_the_placeholder_are_reported(self, capsys):
+        station = [4.77082, 52.28013]
+        thing = _frost_thing(
+            195, "NL49565", "Oude Meer-Aalsmeerderdijk", location_id=108, coordinates=station,
+            datastreams=[(7, (70, 31, station)), (8, (80, 31, station)), (9, (90, 31, station))],
+        )
+        thing["Datastreams"][0]["observedArea"] = {"type": "Point", "coordinates": _PLACEHOLDER}
+        # Two FeaturesOfInterest, one of them at the placeholder: their convex hull.
+        thing["Datastreams"][1]["observedArea"] = {"type": "LineString", "coordinates": [_PLACEHOLDER, station]}
+        thing["Datastreams"][2]["observedArea"] = {"type": "Point", "coordinates": station}
+        http = _FakeFrostHTTP([thing])
+
+        assert _run_repair(http, apply=False) == repair.EXIT_OK  # nothing the API can move
+        out = capsys.readouterr().out
+        assert (
+            "2 Luchtmeetnet Datastreams have an observedArea with a corner at POINT(5 52): "
+            "Datastream 7 of 'GEO_Luchtmeetnet Oude Meer-Aalsmeerderdijk', "
+            "Datastream 8 of 'GEO_Luchtmeetnet Oude Meer-Aalsmeerderdijk'."
+        ) in out
+        assert "--print-sql" in out
+
+    @pytest.mark.parametrize(
+        ("geometry", "touches"),
+        [
+            ({"type": "Point", "coordinates": [5.0, 52.0]}, True),
+            ({"type": "Point", "coordinates": [5, 52]}, True),
+            ({"type": "Polygon", "coordinates": [[[4.0, 51.0], [5.0, 52.0], [4.5, 52.5], [4.0, 51.0]]]}, True),
+            ({"type": "MultiPoint", "coordinates": [[4.3, 52.0], [5.0, 52.0]]}, True),
+            ({"type": "GeometryCollection", "geometries": [{"type": "Point", "coordinates": [5.0, 52.0]}]}, True),
+            ({"type": "Point", "coordinates": [4.77082, 52.28013]}, False),
+            ({"type": "Polygon", "coordinates": [[[4.0, 51.0], [6.0, 51.0], [5.0, 53.0], [4.0, 51.0]]]}, False),
+            (None, False),
+            ({"type": "Point", "coordinates": [True, 52.0]}, False),
+        ],
+    )
+    def test_touches_placeholder(self, geometry, touches):
+        assert repair.touches_placeholder(geometry) is touches
+
     def test_allow_observations_also_moves_the_generated_feature_of_interest(self):
         things = [
             _frost_thing(
@@ -1795,7 +1863,7 @@ class TestRepairLuchtmeetnetLocations:
 
         key = "id" if v2 else "@iot.id"
         assert http.gets[0]["$expand"] == (
-            f"Locations,Datastreams($select={key};$expand=Observations($top=1;$select={key};"
+            f"Locations,Datastreams($select={key},observedArea;$expand=Observations($top=1;$select={key};"
             f"$expand=FeatureOfInterest($select={key},feature)))"
         )
 
@@ -1859,6 +1927,10 @@ class TestRepairApiGet:
             repair.api_get("https://lmn.test", "/stations/NL1", http_get=http_get, sleep=lambda _s: None)
         assert exc_info.value.category == category
         assert len(http_get.urls) == 1
+
+
+def _fail_if_called(*_args: Any, **_kwargs: Any) -> Any:
+    raise AssertionError("must not be called")
 
 
 class _ClientRecorder:
@@ -1932,6 +2004,29 @@ class TestRepairMain:
         (call,) = recorded
         assert call["fields"] == _V1
         assert "note:" not in capsys.readouterr().out
+
+    def test_print_sql_contacts_nothing_and_ends_in_rollback_unless_apply(self, monkeypatch, recorded, capsys):
+        self._configure(monkeypatch)  # no FROST target: anything that needed one would exit
+        monkeypatch.setattr(repair, "api_get", _fail_if_called)
+
+        assert repair.main(["--print-sql"]) == repair.EXIT_OK
+        sql = capsys.readouterr().out
+        assert """WHERE starts_with(t."NAME", 'GEO_Luchtmeetnet ');""" in sql
+        assert re.findall(r"^(COMMIT|ROLLBACK);$", sql, re.MULTILINE) == ["ROLLBACK"]
+        assert sql.startswith("-- Recompute OBSERVED_AREA")
+        assert "\\set ON_ERROR_STOP on\nBEGIN;\n" in sql
+
+        assert repair.main(["--print-sql", "--apply", "--prefix", "IT'X_"]) == repair.EXIT_OK
+        sql = capsys.readouterr().out
+        assert """WHERE starts_with(t."NAME", 'IT''X_Luchtmeetnet ');""" in sql
+        assert re.findall(r"^(COMMIT|ROLLBACK);$", sql, re.MULTILINE) == ["COMMIT"]
+        assert _ClientRecorder.instances == []
+        assert recorded == []
+
+    def test_print_sql_refuses_a_prefix_with_a_line_break(self, monkeypatch, recorded):
+        self._configure(monkeypatch)
+        with pytest.raises(SystemExit, match="line break"):
+            repair.main(["--print-sql", "--prefix", "GEO_\nDROP TABLE x; --"])
 
     def test_unconfigured_target_url_is_refused(self, monkeypatch, recorded):
         self._configure(monkeypatch, FrostTarget(url="https://frost.example/FROST-Server/v2.0", version="v2.0"))
