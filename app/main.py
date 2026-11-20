@@ -32,12 +32,14 @@ _kafka_skip_to_latest = threading.Event()
 def _consume_and_push_once(consumer, max_messages: int = 500, timeout: float = 5.0) -> dict:
     """Consume one batch from an already-connected persistent consumer, push to
     FROST, and commit. Blocking; call via run_in_threadpool."""
+    from app.pipeline.kafka_tgv import tgv_primary
     from app.sources.tgv_kafka_mapping import avro_batch_to_sensor_readings
 
     records = consumer.consume_batch(max_messages=max_messages, timeout=timeout)
     if not records:
         return {"pulled": 0}
-    readings = avro_batch_to_sensor_readings(records)
+    # Registers the TGV entity sets on the primary FROST target first, and raises (batch not committed) until one is.
+    readings = tgv_primary.prepare_push(avro_batch_to_sensor_readings(records))
     if settings.frost_async_push_enabled:
         # Decoupled path: hand the readings to the background FROST worker and
         # return immediately so the consume loop can pull the next batch. Kafka
