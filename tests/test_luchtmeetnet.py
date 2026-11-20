@@ -12,6 +12,8 @@ Covers:
 - entity sets carry one Datastream per canonical component, and registering
   them where the Thing already exists adds the missing Datastreams
 - readings for registered components are pushable into the right Datastream
+- scripts/repair_luchtmeetnet_locations.py plans and applies Location and
+  generated FeatureOfInterest PATCHes (dry run by default)
 """
 from __future__ import annotations
 
@@ -27,7 +29,9 @@ from urllib.parse import urlsplit
 
 import httpx
 import pytest
+import requests
 
+from app.frost.target import FrostTarget
 from app.services import api_client as api_client_module
 from app.services import luchtmeetnet_source as lmn_source_module
 from app.services.api_client import AsyncAPIClient
@@ -42,6 +46,7 @@ from app.sources.luchtmeetnet import (
     parse_station_detail,
 )
 from app.sta.canonical import CanonicalDatastream
+from scripts import repair_luchtmeetnet_locations as repair
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1023,3 +1028,185 @@ class TestReadingsArePushable:
             ds = datastreams[obs["Datastream"]["@iot.id"]]
             assert ds["properties"]["sensor_id"] == obs["parameters"]["sensor_id"]
             assert ds["properties"]["observed_property"] == obs["parameters"]["observed_property"]
+
+
+# ---------------------------------------------------------------------------
+# scripts/repair_luchtmeetnet_locations.py
+# ---------------------------------------------------------------------------
+
+
+def _frost_thing(
+    thing_id: int,
+    number: str,
+    name: str,
+    *,
+    location_id: int,
+    coordinates: list[float] | None = None,
+    with_station_number: bool = True,
+    feature: tuple[int, list[float]] | None = None,
+) -> dict[str, Any]:
+    """A Thing as returned with the script's ``$expand``; *feature* adds an Observation's FoI."""
+    datastreams: list[dict[str, Any]] = []
+    if feature is not None:
+        feature_id, feature_coordinates = feature
+        foi = {
+            "@iot.id": feature_id,
+            "name": f"GEO_Luchtmeetnet {name} location",
+            "encodingType": "application/geo+json",
+            "feature": {"type": "Point", "coordinates": feature_coordinates},
+        }
+        datastreams = [{"@iot.id": 7, "Observations": [{"@iot.id": 70, "FeatureOfInterest": foi}]}]
+    return {
+        "@iot.id": thing_id,
+        "name": f"GEO_Luchtmeetnet {name}",
+        "properties": {"station_number": number, "source": "luchtmeetnet"} if with_station_number else {},
+        "Locations": [
+            {
+                "@iot.id": location_id,
+                "name": f"GEO_Luchtmeetnet {name} location",
+                "encodingType": "application/geo+json",
+                "location": {"type": "Point", "coordinates": coordinates or _PLACEHOLDER},
+            }
+        ],
+        "Datastreams": datastreams,
+    }
+
+
+class _FakeFrostHTTP:
+    """FrostHTTPClient stand-in for the repair script: paged Things, recorded PATCHes."""
+
+    def __init__(self, things: list[dict[str, Any]], patch_status: int = 200) -> None:
+        self.things = things
+        self.patch_status = patch_status
+        self.gets: list[dict[str, str]] = []
+        self.patches: list[tuple[str, dict[str, Any]]] = []
+
+    def endpoint(self, path: str) -> str:
+        return f"{_FROST_BASE}{path}"
+
+    def get(self, url: str, params: dict[str, str] | None = None) -> _FakeFrostResponse:
+        params = dict(params or {})
+        self.gets.append(params)
+        top, skip = int(params["$top"]), int(params["$skip"])
+        body: dict[str, Any] = {"value": self.things[skip : skip + top]}
+        if skip + top < len(self.things):
+            body["@iot.nextLink"] = f"{url}?$top={top}&$skip={skip + top}"
+        return _FakeFrostResponse(200, body)
+
+    def patch(self, url: str, payload: dict[str, Any]) -> _FakeFrostResponse:
+        self.patches.append((url, payload))
+        return _FakeFrostResponse(self.patch_status)
+
+
+def _api_get_from(details: dict[str, dict[str, Any]]) -> Any:
+    def _get(path: str, params: dict[str, str] | None) -> Any:
+        if path == "/stations":
+            return {"pagination": {"last_page": 1}, "data": _STATIONS}
+        number = path.rsplit("/", 1)[-1]
+        if number not in details:
+            raise requests.HTTPError(f"404 for {path}")
+        return {"data": details[number]}
+
+    return _get
+
+
+def _repair_things() -> list[dict[str, Any]]:
+    return [
+        _frost_thing(195, "NL49565", "Oude Meer-Aalsmeerderdijk", location_id=108),
+        # No station_number in properties: matched through the station list by name.
+        _frost_thing(197, "NL10450", "Den Haag-Neherkade", location_id=110, with_station_number=False),
+        # Already at its real position: left alone.
+        _frost_thing(199, "NL50002", "Geleen-Vouershof", location_id=111, coordinates=[5.81071, 50.96309]),
+    ]
+
+
+def _run_repair(http: _FakeFrostHTTP, details: dict[str, dict[str, Any]], *, apply: bool) -> int:
+    return repair.run(
+        http,
+        _api_get_from(details),
+        things_path="/Things",
+        locations_path="/Locations",
+        entity_prefix="GEO_",
+        apply=apply,
+    )
+
+
+class TestRepairLuchtmeetnetLocations:
+    def test_dry_run_prints_the_plan_and_writes_nothing(self, capsys):
+        http = _FakeFrostHTTP(_repair_things())
+        assert _run_repair(http, _DETAILS, apply=False) == 0
+
+        assert http.patches == []
+        assert http.gets[0]["$filter"] == "startswith(name,'GEO_Luchtmeetnet ')"
+        out = capsys.readouterr().out
+        assert re.search(r"NL49565 +195 +Locations\(108\) +POINT\(5 52\) +-> POINT\(4\.77082 52\.28013\)", out)
+        assert re.search(r"NL10450 +197 +Locations\(110\) +POINT\(5 52\) +-> POINT\(4\.318551 52\.062537\)", out)
+        assert "NL50002" not in out  # nothing to do for it
+        assert "2 Locations and 0 FeaturesOfInterest" in out
+        assert "Dry run" in out
+
+    def test_apply_patches_only_placeholder_locations(self):
+        http = _FakeFrostHTTP(_repair_things())
+        assert _run_repair(http, _DETAILS, apply=True) == 0
+
+        assert http.patches == [
+            (
+                f"{_FROST_BASE}/Locations(108)",
+                {"encodingType": "application/geo+json", "location": {"type": "Point", "coordinates": [4.77082, 52.28013]}},
+            ),
+            (
+                f"{_FROST_BASE}/Locations(110)",
+                {"encodingType": "application/geo+json", "location": {"type": "Point", "coordinates": [4.318551, 52.062537]}},
+            ),
+        ]
+
+    def test_failed_patch_gives_a_non_zero_exit(self):
+        http = _FakeFrostHTTP(_repair_things(), patch_status=401)
+        assert _run_repair(http, _DETAILS, apply=True) == 1
+
+    def test_station_without_upstream_coordinates_is_skipped(self, capsys):
+        details = {**_DETAILS, "NL49565": {"components": ["NO2"], "geometry": None}}
+        http = _FakeFrostHTTP(_repair_things())
+        _run_repair(http, details, apply=True)
+
+        assert [url for url, _ in http.patches] == [f"{_FROST_BASE}/Locations(110)"]
+        assert "skipped: NL49565" in capsys.readouterr().out
+
+    def test_things_are_read_page_by_page(self, monkeypatch):
+        monkeypatch.setattr(repair, "_PAGE_SIZE", 1)
+        http = _FakeFrostHTTP(_repair_things())
+        _run_repair(http, _DETAILS, apply=False)
+
+        assert [p["$skip"] for p in http.gets] == ["0", "1", "2"]
+
+    def test_generated_feature_of_interest_at_the_placeholder_is_patched_too(self):
+        """FROST keeps reusing a FoI generated before the repair, even after its Location moved."""
+        things = [
+            # Location already repaired by an earlier run, FoI still at the placeholder.
+            _frost_thing(
+                195, "NL49565", "Oude Meer-Aalsmeerderdijk", location_id=108,
+                coordinates=[4.77082, 52.28013], feature=(31, _PLACEHOLDER),
+            ),
+            # Observations exist, but their FoI was generated from a correct Location.
+            _frost_thing(
+                199, "NL50002", "Geleen-Vouershof", location_id=111,
+                coordinates=[5.81071, 50.96309], feature=(32, [5.81071, 50.96309]),
+            ),
+        ]
+        http = _FakeFrostHTTP(things)
+        assert _run_repair(http, _DETAILS, apply=True) == 0
+
+        assert http.patches == [
+            (
+                f"{_FROST_BASE}/FeaturesOfInterest(31)",
+                {"encodingType": "application/geo+json", "feature": {"type": "Point", "coordinates": [4.77082, 52.28013]}},
+            ),
+        ]
+        assert "Datastreams($top=1;$expand=Observations($top=1;$expand=FeatureOfInterest))" in http.gets[0]["$expand"]
+
+    def test_target_selection_never_sends_credentials_to_an_unconfigured_url(self):
+        targets = [FrostTarget(url="https://frost.example/FROST-Server/v1.1", auth_username="w", auth_password="p")]
+        assert repair.select_target(targets, None) is targets[0]
+        assert repair.select_target(targets, "https://frost.example/FROST-Server/v1.1/") is targets[0]
+        with pytest.raises(SystemExit):
+            repair.select_target(targets, "https://elsewhere.example/v1.1")
