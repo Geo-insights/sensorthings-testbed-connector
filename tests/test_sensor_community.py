@@ -4,6 +4,7 @@ Covers:
 - parse_sensor_data() with PM sensor (SDS011) produces PM10 and PM2.5 readings
 - parse_sensor_data() with noise sensor (DNMS) produces NOISE_LAEQ/LAMIN/LAMAX
 - parse_sensor_data() with temperature/humidity sensor (BME280) produces correct readings
+- Pressure is converted from Pa (as Sensor.Community reports it) to canonical hPa
 - build_entity_set() produces a valid entity set
 - Unknown value_types are silently skipped
 - SensorCommunityPollingSource is a RestPollingSource subclass
@@ -11,12 +12,21 @@ Covers:
 
 from __future__ import annotations
 
+import logging
+from decimal import Decimal
 from typing import Any
 
 import pytest
 
 from app.services.rest_polling_source import RestPollingSource
-from app.sources.sensor_community import build_entity_set, parse_sensor_data
+from app.sources.sensor_community import (
+    PA_BAND,
+    UNIT_SCALES,
+    build_entity_set,
+    parse_sensor_data,
+    to_canonical_unit,
+)
+from app.sta.canonical import CanonicalDatastream, resolve
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -53,7 +63,7 @@ def _dnms_entry(location_id: int = 456) -> dict[str, Any]:
 
 
 def _bme280_entry(location_id: int = 456) -> dict[str, Any]:
-    """BME280 temperature/humidity/pressure sensor entry."""
+    """BME280 temperature/humidity/pressure sensor entry; the API reports pressure in Pa."""
     return {
         "id": 123458,
         "sensor": {"id": 791, "sensor_type": {"name": "BME280"}},
@@ -61,10 +71,27 @@ def _bme280_entry(location_id: int = 456) -> dict[str, Any]:
         "sensordatavalues": [
             {"value_type": "temperature", "value": "18.5"},
             {"value_type": "humidity", "value": "72.3"},
-            {"value_type": "pressure", "value": "1013.25"},
+            {"value_type": "pressure", "value": "100391.86"},
         ],
         "timestamp": "2026-10-07 12:00:00",
     }
+
+
+def _entry(value_type: str, value: Any) -> dict[str, Any]:
+    """A single-value entry, for unit-conversion tests."""
+    return {
+        "id": 1,
+        "sensor": {"id": 2, "sensor_type": {"name": "BME280"}},
+        "location": {"id": 100, "latitude": "52.0", "longitude": "4.0"},
+        "sensordatavalues": [{"value_type": value_type, "value": value}],
+        "timestamp": "2026-11-20 10:00:00",
+    }
+
+
+def _value(value_type: str, value: Any) -> float:
+    readings = parse_sensor_data([_entry(value_type, value)])
+    assert len(readings) == 1
+    return readings[0].value
 
 
 # ---------------------------------------------------------------------------
@@ -185,8 +212,135 @@ def test_parse_bme280_pressure_value_and_unit() -> None:
     readings = parse_sensor_data([_bme280_entry()])
     by_prop = {r.observed_property: r for r in readings}
     pres = by_prop["pressure"]
-    assert pres.value == pytest.approx(1013.25)
+    assert pres.value == pytest.approx(1003.9186)  # 100391.86 Pa
     assert pres.unit == "hPa"
+    assert pres.observed_property_name == "Air pressure"
+
+
+# ---------------------------------------------------------------------------
+# parse_sensor_data — pressure unit conversion (Pa -> canonical hPa)
+# ---------------------------------------------------------------------------
+
+# Every value_type in the live NL feed (data.sensor.community, 2026-11-20), with the
+# unit Sensor.Community reports it in (airrohr firmware / data API).
+_SC_UNITS = {
+    "P0": "ug/m3", "P1": "ug/m3", "P2": "ug/m3", "P4": "ug/m3",
+    "N05": "#/cm3", "N1": "#/cm3", "N25": "#/cm3", "N4": "#/cm3", "N10": "#/cm3",
+    "TS": "um",
+    "temperature": "°C", "humidity": "%",
+    "pressure": "Pa", "pressure_at_sealevel": "Pa",
+    "noise_LAeq": "dB(A)", "noise_LA_min": "dB(A)", "noise_LA_max": "dB(A)",
+    "co2_ppm": "ppm",
+    "counts_per_minute": "1/min", "hv_pulses": "1", "counts": "1", "sample_time_ms": "ms",
+}  # fmt: skip
+
+
+def test_pressure_pa_converted_to_hpa() -> None:
+    readings = parse_sensor_data([_entry("pressure", "100391.86")])
+    assert len(readings) == 1
+    assert readings[0].observed_property == "pressure"
+    assert readings[0].unit == "hPa"
+    assert repr(readings[0].value) == "1003.9186"
+
+
+def test_pressure_conversion_is_exact_decimal() -> None:
+    """Plain float division would give 999.5435000000001, which FROST would store verbatim."""
+    assert 99954.35 / 100 != 999.5435
+    assert repr(_value("pressure", "99954.35")) == "999.5435"
+    assert repr(_value("pressure", "100199.0")) == "1001.99"
+
+
+def test_pressure_json_number_converted() -> None:
+    assert _value("pressure", 101325) == 1013.25
+
+
+@pytest.mark.parametrize("raw", ["1013.25", "1001.1", "1002.97998046875", "870.0", "1085"])
+def test_pressure_already_in_hpa_left_unchanged(raw: str) -> None:
+    """Some stations (other firmware) already report hPa: they must not be divided again."""
+    assert _value("pressure", raw) == float(raw)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("2000", 2000.0),  # band is open: the bound itself is not plainly Pa
+        ("2000.01", 20.0001),
+        ("62417.13", 624.1713),  # implausible for NL, but plainly Pa
+        ("199999.99", 1999.9999),
+        ("200000", 200000.0),  # implausible in either unit: left as is
+        ("217706", 217706.0),
+        ("-21526.13", -21526.13),  # broken sensor: left as is
+        ("0", 0.0),
+    ],
+)
+def test_pressure_band_edges(raw: str, expected: float) -> None:
+    assert _value("pressure", raw) == expected
+
+
+def test_pressure_value_type_matched_case_insensitively() -> None:
+    assert _value("Pressure", "100391.86") == pytest.approx(1003.9186)
+
+
+def test_pressure_outside_band_logged_at_debug(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.DEBUG, logger="app.sources.sensor_community"):
+        assert _value("pressure", "1013.25") == 1013.25
+    assert any("not scaled" in r.getMessage() and r.levelno == logging.DEBUG for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    ("value_type", "raw"),
+    [
+        ("P1", "2500.0"),  # above the Pa threshold, but scaling is per value_type
+        ("P2", "2100.5"),
+        ("temperature", "18.5"),
+        ("humidity", "72.3"),
+        ("noise_LAeq", "52.4"),
+    ],
+)
+def test_other_value_types_not_scaled(value_type: str, raw: str) -> None:
+    assert _value(value_type, raw) == float(raw)
+
+
+@pytest.mark.parametrize("raw", ["not_a_number", "", "nan", "NaN", "inf", "-inf", "Infinity"])
+def test_pressure_non_numeric_and_non_finite_still_skipped(raw: str) -> None:
+    assert parse_sensor_data([_entry("pressure", raw)]) == []
+
+
+@pytest.mark.parametrize("raw", [-21526.13, 0.0, 1013.25, 2000.0, 2000.01, 100391.86, 199999.99, 200000.0, 217706.0])
+def test_pressure_conversion_is_idempotent(raw: float) -> None:
+    once = to_canonical_unit("pressure", raw)
+    assert to_canonical_unit("pressure", once) == once
+
+
+def test_every_scaled_value_lands_below_its_band() -> None:
+    """What makes the conversion idempotent; the FROST backfill relies on it too."""
+    for scale in UNIT_SCALES.values():
+        low, high = scale.band
+        assert Decimal(repr(high)) * scale.factor <= Decimal(repr(low))
+
+
+def test_live_value_types_reach_frost_in_canonical_units() -> None:
+    """Each value_type that resolves is either reported in the canonical unit or scaled.
+
+    Guards against a new alias mapping a value_type onto a canonical datastream
+    with a different unit, e.g. "pressure_at_sealevel" (Pa) onto hPa, unscaled.
+    """
+    for value_type, sc_unit in _SC_UNITS.items():
+        canonical = resolve(value_type)
+        if canonical is None:
+            continue  # the mapper skips it
+        scale = UNIT_SCALES.get(value_type.lower())
+        if scale is None:
+            assert sc_unit == canonical.meta.unit, value_type
+        else:
+            assert scale.source_unit == sc_unit, value_type
+
+
+def test_only_pressure_is_scaled() -> None:
+    assert set(UNIT_SCALES) == {"pressure"}
+    assert resolve("pressure") is CanonicalDatastream.PRESSURE
+    assert CanonicalDatastream.PRESSURE.meta.unit == "hPa"
+    assert UNIT_SCALES["pressure"].band == PA_BAND
 
 
 # ---------------------------------------------------------------------------
