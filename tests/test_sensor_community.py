@@ -8,12 +8,17 @@ Covers:
 - build_entity_set() produces a valid entity set
 - Unknown value_types are silently skipped
 - SensorCommunityPollingSource is a RestPollingSource subclass
+- scripts/fix_sc_pressure_units.py, the FROST backfill for the Pa history
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
+import re
+from dataclasses import replace
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -27,6 +32,7 @@ from app.sources.sensor_community import (
     to_canonical_unit,
 )
 from app.sta.canonical import CanonicalDatastream, resolve
+from scripts import fix_sc_pressure_units as backfill
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -526,3 +532,281 @@ def test_sensor_community_source_entity_sets_empty_initially() -> None:
 
     source = SensorCommunityPollingSource()
     assert source.entity_sets() == []
+
+
+# ---------------------------------------------------------------------------
+# scripts/fix_sc_pressure_units.py — FROST backfill of the Pa history
+# ---------------------------------------------------------------------------
+
+_WRITE_SQL = re.compile(r"\b(UPDATE|INSERT|DELETE|TRUNCATE|ALTER|DROP|CREATE|GRANT)\b", re.IGNORECASE)
+
+
+def _stats(ds_id: int = 16, **overrides: Any) -> backfill.Stats:
+    fields: dict[str, Any] = {
+        "datastream_id": ds_id,
+        "rows": 3952,
+        "to_convert": 3950,
+        "misrouted": 0,
+        "below_band": 1,
+        "above_band": 1,
+        "in_band_misrouted": 0,
+        "text_mismatch": 0,
+        "min_value": 97832.84,
+        "max_value": 102025.16,
+        "min_id": 496,
+        "max_id": 21_251_328,
+    }
+    fields.update(overrides)
+    return backfill.Stats(**fields)
+
+
+class _FakeFrost:
+    """Answers the script's SQL the way psql on the FROST database would, by statement tag."""
+
+    def __init__(self, stats: list[backfill.Stats], unit: str = "hPa", convert: bool = True) -> None:
+        self.stats = {s.datastream_id: s for s in stats}
+        self.unit = unit
+        self.convert = convert
+        self.sessions: list[str] = []
+
+    def __call__(self, sql: str) -> list[str]:
+        self.sessions.append(sql)
+        out: list[str] = []
+        if "SELECT 'ds'" in sql:
+            out += [f"ds|{i}|{self.unit}|GEO_SensorCommunity {i} sensor - Air pressure" for i in self.stats]
+        for ds_id in re.findall(r"SELECT 'stat', (\d+),", sql):
+            s = self.stats[int(ds_id)]
+            fields = [s.datastream_id, s.rows, s.to_convert, s.misrouted, s.below_band, s.above_band,
+                      s.in_band_misrouted, s.text_mismatch, s.min_value, s.max_value, s.min_id, s.max_id]
+            out.append("stat|" + "|".join("" if f is None else str(f) for f in fields))
+        out += ["sample|21251328|16|2026-11-20 10:39:11+00|100199|100199.0|1001.99|1001.99"] * sql.count(
+            "SELECT 'sample'"
+        )
+        for ds_id, lo, hi in re.findall(r"SELECT 'updated', (\d+), (\d+), (\d+)", sql):
+            s = self.stats[int(ds_id)]
+            n = min(s.to_convert, int(hi) - int(lo) + 1)  # pretend the batch's rows sit at its start
+            ids = " ".join(str(int(lo) + k) for k in range(n))
+            out.append(f"updated|{ds_id}|{lo}|{hi}|{n}|{ids}")
+            if self.convert:
+                left = s.to_convert - n
+                self.stats[s.datastream_id] = replace(s, to_convert=left, below_band=s.below_band + n)
+                if not left:
+                    self.stats[s.datastream_id] = replace(
+                        self.stats[s.datastream_id], min_value=None, max_value=None, min_id=None, max_id=None
+                    )
+        return out
+
+    def writes(self) -> list[str]:
+        return [sql for sql in self.sessions if _WRITE_SQL.search(sql)]
+
+
+def test_backfill_band_is_the_mapper_band() -> None:
+    assert (backfill.LOW, backfill.HIGH) == PA_BAND
+    assert backfill.IN_BAND == '"RESULT_TYPE" = 0 AND "RESULT_NUMBER" > 2000.0 AND "RESULT_NUMBER" < 200000.0'
+
+
+def test_backfill_selects_sensor_community_air_pressure_datastreams() -> None:
+    sql = backfill.datastreams_sql()
+    assert """t."NAME" LIKE 'GEO\\_SensorCommunity %'""" in sql
+    assert """t."PROPERTIES"->>'source' = 'sensor_community'""" in sql
+    assert """op."NAME" = 'Air pressure'""" in sql
+
+
+def test_backfill_update_statement() -> None:
+    sql = backfill.update_sql(16, 496, 21_251_328)
+    assert 'UPDATE "OBSERVATIONS"' in sql
+    assert '"DATASTREAM_ID" = 16 AND "ID" BETWEEN 496 AND 21251328' in sql
+    assert backfill.IN_BAND in sql
+    assert '"RESULT_NUMBER" = trim_scale("RESULT_NUMBER"::numeric * 0.01)::double precision' in sql
+    assert '"RESULT_STRING" = trim_scale("RESULT_NUMBER"::numeric * 0.01)::text' in sql
+
+
+def test_backfill_never_converts_rows_tagged_as_another_property() -> None:
+    """The pressure datastreams also hold misrouted PM10/PM2.5/humidity readings."""
+    assert backfill.IS_PRESSURE == """coalesce("PARAMETERS"->>'observed_property', 'pressure') = 'pressure'"""
+    assert backfill.IS_PRESSURE in backfill.update_sql(16, 1, 2)
+    assert backfill.IS_PRESSURE in backfill.sample_sql(16, '"ID"', 1)
+
+
+def test_backfill_read_statements_do_not_write() -> None:
+    assert "TRANSACTION READ ONLY" in backfill.READ_ONLY_SESSION
+    for sql in (
+        backfill.READ_ONLY_SESSION,
+        backfill.datastreams_sql(),
+        backfill.stats_sql(16),
+        backfill.sample_sql(16, '"ID" DESC', 3),
+    ):
+        assert not _WRITE_SQL.search(sql), sql
+
+
+def test_backfill_display_conversion_matches_mapper() -> None:
+    assert backfill.to_hpa(100391.86) == Decimal("1003.9186")
+    assert float(backfill.to_hpa(99954.35)) == to_canonical_unit("pressure", 99954.35)
+
+
+@pytest.mark.parametrize(
+    ("to_convert", "min_id", "max_id", "batch_rows", "expected"),
+    [
+        (0, None, None, 5000, []),
+        (1, 7, 7, 5000, [(7, 7)]),
+        (3950, 496, 21_251_328, 5000, [(496, 21_251_328)]),
+        (12_000, 0, 2999, 5000, [(0, 999), (1000, 1999), (2000, 2999)]),
+        (10, 5, 6, 1, [(5, 5), (6, 6)]),  # never more batches than IDs
+    ],
+)
+def test_backfill_plan_batches(
+    to_convert: int, min_id: int | None, max_id: int | None, batch_rows: int, expected: list[tuple[int, int]]
+) -> None:
+    stats = _stats(to_convert=to_convert, min_id=min_id, max_id=max_id)
+    assert backfill.plan_batches(stats, batch_rows) == expected
+
+
+def test_backfill_batches_cover_the_id_range_without_gaps() -> None:
+    from itertools import pairwise
+
+    batches = backfill.plan_batches(_stats(to_convert=123_457), batch_rows=5000)
+    assert len(batches) == 25
+    assert batches[0][0] == 496
+    assert batches[-1][1] == 21_251_328
+    assert all(prev[1] + 1 == nxt[0] for prev, nxt in pairwise(batches))
+
+
+def test_backfill_parse_stats_handles_nulls() -> None:
+    (stats,) = backfill.parse_stats(["stat|16|0|0|0|0|0|0|0||||"])
+    assert stats.rows == 0
+    assert stats.min_value is None
+    assert stats.max_id is None
+    assert backfill.plan_batches(stats, 5000) == []
+
+
+def test_backfill_parse_datastreams_keeps_pipes_in_names() -> None:
+    (ds,) = backfill.parse_datastreams(["ds|16|hPa|GEO_SensorCommunity 1 | odd name"])
+    assert ds == backfill.Datastream(16, "hPa", "GEO_SensorCommunity 1 | odd name")
+
+
+def test_backfill_psql_over_ssh_handles_no_credentials() -> None:
+    argv = backfill.psql_argv(ssh="root@frost.example", ssh_key="~/.ssh/key")
+    assert argv[:4] == ["ssh", "-o", "BatchMode=yes", "-i"]
+    assert not argv[4].startswith("~")
+    assert argv[5] == "root@frost.example"
+    remote = argv[6]
+    assert remote.startswith("cd /opt/frost && docker compose exec -T frost-db sh -c 'psql ")
+    # Single-quoted on the host: the container's own shell expands its environment.
+    assert remote.endswith(' -U "$POSTGRES_USER" -d "$POSTGRES_DB"\'')
+    assert "ON_ERROR_STOP=1" in remote
+    assert "PASSWORD" not in " ".join(argv).upper()
+
+
+def test_backfill_psql_in_local_container() -> None:
+    argv = backfill.psql_argv(container="frost-db-test")
+    assert argv[:6] == ["docker", "exec", "-i", "frost-db-test", "sh", "-c"]
+
+
+def test_backfill_requires_a_target() -> None:
+    with pytest.raises(SystemExit):
+        backfill.parse_args([])
+
+
+def test_backfill_apply_requires_an_ids_file() -> None:
+    with pytest.raises(SystemExit):
+        backfill.parse_args(["--container", "frost-db-test", "--apply"])
+
+
+def test_backfill_parse_updated_checks_the_reported_ids() -> None:
+    assert backfill.parse_updated(["updated|16|1|9|2|3 7"]) == [(16, [3, 7])]
+    assert backfill.parse_updated(["updated|16|1|9|0|"]) == [(16, [])]
+    with pytest.raises(ValueError, match="2 rows updated but 1 IDs"):
+        backfill.parse_updated(["updated|16|1|9|2|3"])
+    with pytest.raises(ValueError, match=r"outside 1\.\.9"):
+        backfill.parse_updated(["updated|16|1|9|2|3 70"])
+
+
+def test_backfill_dry_run_writes_nothing(capsys: pytest.CaptureFixture[str]) -> None:
+    hpa_only = _stats(28, to_convert=0, below_band=3952, above_band=0, min_value=None, max_value=None,
+                      min_id=None, max_id=None)
+    frost = _FakeFrost([_stats(16), hpa_only])
+    assert backfill.run(backfill.parse_args(["--container", "frost-db-test"]), frost) == 0
+    assert frost.writes() == []
+    assert all(sql.startswith(backfill.READ_ONLY_SESSION) for sql in frost.sessions)
+    out = capsys.readouterr().out
+    assert "DRY RUN" in out
+    assert re.search(r"pressure readings to convert \(Pa band\)\s+3,950\n", out)
+    assert "97832.84 .. 102025.16 Pa -> 978.3284 .. 1020.2516 hPa" in out
+    assert "100199 ('100199.0') -> 1001.99 ('1001.99')" in out
+    assert "Plan: 1 UPDATE statements over 1 datastreams" in out
+    assert "Dry run: nothing was written" in out
+
+
+def _apply_args(tmp_path: Path, *extra: str) -> argparse.Namespace:
+    ids_file = str(tmp_path / "ids.csv")
+    return backfill.parse_args(["--container", "frost-db-test", "--apply", "--ids-file", ids_file, *extra])
+
+
+def test_backfill_apply_converts_in_batches_and_verifies(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    frost = _FakeFrost([_stats(16), _stats(28, rows=12_002, to_convert=12_000, min_id=0, max_id=29_999)])
+    assert backfill.run(_apply_args(tmp_path), frost) == 0
+    (write,) = frost.writes()
+    assert "READ ONLY" not in write
+    assert write.count('UPDATE "OBSERVATIONS"') == 4  # 1 batch for datastream 16, 3 for 28
+    out = capsys.readouterr().out
+    assert "Converted 15,950 observations (planned 15,950)" in out
+    assert "Verification: no rows left in the Pa band." in out
+    raw = (tmp_path / "ids.csv").read_bytes()
+    assert b"\r" not in raw  # LF on every platform: the file is loaded on the FROST host
+    lines = raw.decode("utf-8").splitlines()
+    assert lines[0] == "datastream_id,observation_id"
+    assert len(lines) == 1 + 15_950
+    assert lines[1] == "16,496"
+
+
+def test_backfill_ids_file_is_appended_across_runs(tmp_path: Path) -> None:
+    assert backfill.run(_apply_args(tmp_path, "--datastream", "16"), _FakeFrost([_stats(16), _stats(28)])) == 0
+    assert backfill.run(_apply_args(tmp_path, "--datastream", "28"), _FakeFrost([_stats(16), _stats(28)])) == 0
+    lines = (tmp_path / "ids.csv").read_text(encoding="utf-8").splitlines()
+    assert lines.count("datastream_id,observation_id") == 1
+    assert {line.split(",")[0] for line in lines[1:]} == {"16", "28"}
+
+
+def test_backfill_apply_reports_rows_left_in_band(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    frost = _FakeFrost([_stats(16)], convert=False)  # e.g. Pa rows still arriving
+    assert backfill.run(_apply_args(tmp_path), frost) == 1
+    assert "3,950 pressure readings still in the Pa band" in capsys.readouterr().out
+
+
+def test_backfill_canary_touches_only_the_given_datastream(tmp_path: Path) -> None:
+    frost = _FakeFrost([_stats(16), _stats(28)])
+    assert backfill.run(_apply_args(tmp_path, "--datastream", "28"), frost) == 0
+    (write,) = frost.writes()
+    assert '"DATASTREAM_ID" = 28 ' in write
+    assert '"DATASTREAM_ID" = 16 ' not in write
+
+
+def test_backfill_rejects_datastreams_outside_the_selection(tmp_path: Path) -> None:
+    frost = _FakeFrost([_stats(16)])
+    assert backfill.run(_apply_args(tmp_path, "--datastream", "999"), frost) == 1
+    assert len(frost.sessions) == 1
+    assert frost.writes() == []
+
+
+def test_backfill_skips_datastreams_not_labelled_hpa(tmp_path: Path) -> None:
+    frost = _FakeFrost([_stats(16)], unit="Pa")
+    assert backfill.run(_apply_args(tmp_path), frost) == 0
+    assert frost.writes() == []
+
+
+def test_backfill_apply_error_records_progress_and_stops(tmp_path: Path) -> None:
+    frost = _FakeFrost([_stats(16)])
+
+    def failing(sql: str) -> list[str]:
+        if "SELECT 'updated'" in sql:
+            # One statement reported in full, then the session died mid-line.
+            partial = ["updated|16|496|9000|3|496 497 498", "updated|16|9001|12000|2|9001 90"]
+            raise backfill.PsqlError("psql exited with 3: statement timeout", partial)
+        return frost(sql)
+
+    with pytest.raises(backfill.PsqlError, match="rows converted before the error: 3; re-running is safe"):
+        backfill.run(_apply_args(tmp_path), failing)
+    lines = (tmp_path / "ids.csv").read_text(encoding="utf-8").splitlines()
+    assert lines[1:] == ["16,496", "16,497", "16,498"]
