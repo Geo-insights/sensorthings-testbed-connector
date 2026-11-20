@@ -18,15 +18,19 @@ Covers:
   them where the Thing already exists adds the missing Datastreams
 - readings for registered components are pushable into the right Datastream
 - scripts/repair_luchtmeetnet_locations.py plans and applies Location and
-  generated FeatureOfInterest PATCHes (dry run by default)
+  generated FeatureOfInterest PATCHes (dry run by default) on SensorThings
+  v1.1 and v2.0, tells Luchtmeetnet API failures apart from missing
+  coordinates, and refuses --apply once Observations exist
 """
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import itertools
 import json
 import logging
 import re
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, ClassVar
@@ -36,6 +40,7 @@ import httpx
 import pytest
 import requests
 
+from app.frost.odata_fields import odata_fields_for
 from app.frost.target import FrostTarget
 from app.services import api_client as api_client_module
 from app.services import luchtmeetnet_source as lmn_source_module
@@ -1202,6 +1207,10 @@ class TestReadingsArePushable:
 # scripts/repair_luchtmeetnet_locations.py
 # ---------------------------------------------------------------------------
 
+_V1 = odata_fields_for("v1.1")
+_V2 = odata_fields_for("v2.0")
+_STA_VERSIONS = pytest.mark.parametrize("v2", [False, True], ids=["v1.1", "v2.0"])
+
 
 def _frost_thing(
     thing_id: int,
@@ -1211,40 +1220,45 @@ def _frost_thing(
     location_id: int,
     coordinates: list[float] | None = None,
     with_station_number: bool = True,
-    feature: tuple[int, list[float]] | None = None,
+    datastreams: Sequence[tuple[int, tuple[int, int, list[float]] | None]] = (),
+    v2: bool = False,
 ) -> dict[str, Any]:
-    """A Thing as returned with the script's ``$expand``; *feature* adds an Observation's FoI."""
-    datastreams: list[dict[str, Any]] = []
-    if feature is not None:
-        feature_id, feature_coordinates = feature
-        foi = {
-            "@iot.id": feature_id,
-            "name": f"GEO_Luchtmeetnet {name} location",
-            "encodingType": "application/geo+json",
-            "feature": {"type": "Point", "coordinates": feature_coordinates},
-        }
-        datastreams = [{"@iot.id": 7, "Observations": [{"@iot.id": 70, "FeatureOfInterest": foi}]}]
+    """A Thing as the script's ``$expand`` returns it, in the v1.1 or v2.0 shape.
+
+    *datastreams* holds ``(datastream id, observation)`` pairs; *observation* is
+    ``None`` (no Observations yet) or ``(observation id, FoI id, FoI coordinates)``.
+    """
+    key = "id" if v2 else "@iot.id"
+    expanded: list[dict[str, Any]] = []
+    for datastream_id, observation in datastreams:
+        observations: list[dict[str, Any]] = []
+        if observation is not None:
+            observation_id, feature_id, feature_coordinates = observation
+            feature = {key: feature_id, "feature": {"type": "Point", "coordinates": feature_coordinates}}
+            observations = [{key: observation_id, "FeatureOfInterest": feature}]
+        expanded.append({key: datastream_id, "Observations": observations})
     return {
-        "@iot.id": thing_id,
+        key: thing_id,
         "name": f"GEO_Luchtmeetnet {name}",
         "properties": {"station_number": number, "source": "luchtmeetnet"} if with_station_number else {},
         "Locations": [
             {
-                "@iot.id": location_id,
+                key: location_id,
                 "name": f"GEO_Luchtmeetnet {name} location",
                 "encodingType": "application/geo+json",
                 "location": {"type": "Point", "coordinates": coordinates or _PLACEHOLDER},
             }
         ],
-        "Datastreams": datastreams,
+        "Datastreams": expanded,
     }
 
 
 class _FakeFrostHTTP:
-    """FrostHTTPClient stand-in for the repair script: paged Things, recorded PATCHes."""
+    """FrostHTTPClient stand-in for the repair script: paged Things (v1.1 or v2.0 shape), recorded PATCHes."""
 
-    def __init__(self, things: list[dict[str, Any]], patch_status: int = 200) -> None:
+    def __init__(self, things: list[dict[str, Any]], *, v2: bool = False, patch_status: int = 200) -> None:
         self.things = things
+        self.v2 = v2
         self.patch_status = patch_status
         self.gets: list[dict[str, str]] = []
         self.patches: list[tuple[str, dict[str, Any]]] = []
@@ -1258,7 +1272,7 @@ class _FakeFrostHTTP:
         top, skip = int(params["$top"]), int(params["$skip"])
         body: dict[str, Any] = {"value": self.things[skip : skip + top]}
         if skip + top < len(self.things):
-            body["@iot.nextLink"] = f"{url}?$top={top}&$skip={skip + top}"
+            body["@nextLink" if self.v2 else "@iot.nextLink"] = f"{url}?$top={top}&$skip={skip + top}"
         return _FakeFrostResponse(200, body)
 
     def patch(self, url: str, payload: dict[str, Any]) -> _FakeFrostResponse:
@@ -1266,46 +1280,104 @@ class _FakeFrostHTTP:
         return _FakeFrostResponse(self.patch_status)
 
 
-def _api_get_from(details: dict[str, dict[str, Any]]) -> Any:
+def _api_get_from(
+    details: dict[str, dict[str, Any]],
+    *,
+    failures: dict[str, str] | None = None,
+    calls: list[str] | None = None,
+) -> Any:
+    """Luchtmeetnet getter as main() builds it: parsed bodies, or LuchtmeetnetError after retries."""
+
     def _get(path: str, params: dict[str, str] | None) -> Any:
+        if calls is not None:
+            calls.append(path)
         if path == "/stations":
             return {"pagination": {"last_page": 1}, "data": _STATIONS}
         number = path.rsplit("/", 1)[-1]
+        if number in (failures or {}):
+            raise repair.LuchtmeetnetError((failures or {})[number], "simulated")
         if number not in details:
-            raise requests.HTTPError(f"404 for {path}")
+            raise repair.LuchtmeetnetError(repair.NOT_FOUND, "HTTP 404")
         return {"data": details[number]}
 
     return _get
 
 
-def _repair_things() -> list[dict[str, Any]]:
+def _repair_things(*, v2: bool = False) -> list[dict[str, Any]]:
     return [
-        _frost_thing(195, "NL49565", "Oude Meer-Aalsmeerderdijk", location_id=108),
+        _frost_thing(195, "NL49565", "Oude Meer-Aalsmeerderdijk", location_id=108, v2=v2),
         # No station_number in properties: matched through the station list by name.
-        _frost_thing(197, "NL10450", "Den Haag-Neherkade", location_id=110, with_station_number=False),
+        _frost_thing(197, "NL10450", "Den Haag-Neherkade", location_id=110, with_station_number=False, v2=v2),
         # Already at its real position: left alone.
-        _frost_thing(199, "NL50002", "Geleen-Vouershof", location_id=111, coordinates=[5.81071, 50.96309]),
+        _frost_thing(199, "NL50002", "Geleen-Vouershof", location_id=111, coordinates=[5.81071, 50.96309], v2=v2),
     ]
 
 
-def _run_repair(http: _FakeFrostHTTP, details: dict[str, dict[str, Any]], *, apply: bool) -> int:
+def _run_repair(
+    http: _FakeFrostHTTP,
+    details: dict[str, dict[str, Any]] | None = None,
+    *,
+    apply: bool,
+    fields: Any = _V1,
+    get: Any = None,
+    allow_observations: bool = False,
+) -> int:
     return repair.run(
         http,
-        _api_get_from(details),
+        get or _api_get_from(_DETAILS if details is None else details),
+        fields=fields,
         things_path="/Things",
         locations_path="/Locations",
         entity_prefix="GEO_",
         apply=apply,
+        allow_observations=allow_observations,
     )
 
 
+def _location_patch(location_id: int, lon: float, lat: float) -> tuple[str, dict[str, Any]]:
+    point = {"type": "Point", "coordinates": [lon, lat]}
+    return f"{_FROST_BASE}/Locations({location_id})", {"encodingType": "application/geo+json", "location": point}
+
+
+class _ApiResponse:
+    """``requests.Response`` stand-in for api_get."""
+
+    def __init__(self, status_code: int, body: Any = None, headers: dict[str, str] | None = None) -> None:
+        self.status_code = status_code
+        self.headers = headers or {}
+        self._body = body
+
+    def json(self) -> Any:
+        if isinstance(self._body, Exception):
+            raise self._body
+        return self._body
+
+
+class _ScriptedHTTPGet:
+    """Answers consecutive api_get requests with scripted responses or exceptions."""
+
+    def __init__(self, *outcomes: Any) -> None:
+        self.outcomes = list(outcomes)
+        self.urls: list[str] = []
+
+    def __call__(self, url: str, **kwargs: Any) -> Any:
+        self.urls.append(url)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
 class TestRepairLuchtmeetnetLocations:
-    def test_dry_run_prints_the_plan_and_writes_nothing(self, capsys):
-        http = _FakeFrostHTTP(_repair_things())
-        assert _run_repair(http, _DETAILS, apply=False) == 0
+    @_STA_VERSIONS
+    def test_dry_run_prints_the_plan_and_writes_nothing(self, capsys, v2):
+        fields = _V2 if v2 else _V1
+        http = _FakeFrostHTTP(_repair_things(v2=v2), v2=v2)
+        assert _run_repair(http, apply=False, fields=fields) == repair.EXIT_OK
 
         assert http.patches == []
         assert http.gets[0]["$filter"] == "startswith(name,'GEO_Luchtmeetnet ')"
+        assert http.gets[0]["$orderby"] == ("id asc" if v2 else "@iot.id asc")
         out = capsys.readouterr().out
         assert re.search(r"NL49565 +195 +Locations\(108\) +POINT\(5 52\) +-> POINT\(4\.77082 52\.28013\)", out)
         assert re.search(r"NL10450 +197 +Locations\(110\) +POINT\(5 52\) +-> POINT\(4\.318551 52\.062537\)", out)
@@ -1313,64 +1385,170 @@ class TestRepairLuchtmeetnetLocations:
         assert "2 Locations and 0 FeaturesOfInterest" in out
         assert "Dry run" in out
 
-    def test_apply_patches_only_placeholder_locations(self):
-        http = _FakeFrostHTTP(_repair_things())
-        assert _run_repair(http, _DETAILS, apply=True) == 0
+    @_STA_VERSIONS
+    def test_apply_patches_only_placeholder_locations(self, v2):
+        http = _FakeFrostHTTP(_repair_things(v2=v2), v2=v2)
+        assert _run_repair(http, apply=True, fields=_V2 if v2 else _V1) == repair.EXIT_OK
 
-        assert http.patches == [
-            (
-                f"{_FROST_BASE}/Locations(108)",
-                {"encodingType": "application/geo+json", "location": {"type": "Point", "coordinates": [4.77082, 52.28013]}},
-            ),
-            (
-                f"{_FROST_BASE}/Locations(110)",
-                {"encodingType": "application/geo+json", "location": {"type": "Point", "coordinates": [4.318551, 52.062537]}},
-            ),
-        ]
+        assert http.patches == [_location_patch(108, 4.77082, 52.28013), _location_patch(110, 4.318551, 52.062537)]
 
-    def test_failed_patch_gives_a_non_zero_exit(self):
-        http = _FakeFrostHTTP(_repair_things(), patch_status=401)
-        assert _run_repair(http, _DETAILS, apply=True) == 1
-
-    def test_station_without_upstream_coordinates_is_skipped(self, capsys):
-        details = {**_DETAILS, "NL49565": {"components": ["NO2"], "geometry": None}}
-        http = _FakeFrostHTTP(_repair_things())
-        _run_repair(http, details, apply=True)
-
-        assert [url for url, _ in http.patches] == [f"{_FROST_BASE}/Locations(110)"]
-        assert "skipped: NL49565" in capsys.readouterr().out
-
-    def test_things_are_read_page_by_page(self, monkeypatch):
+    def test_v2_responses_are_read_when_the_target_is_declared_v1_1(self, monkeypatch):
+        """Production: the connector's default version (v1.1) on a FROST /v2.0 URL, which answers with id/@nextLink."""
         monkeypatch.setattr(repair, "_PAGE_SIZE", 1)
-        http = _FakeFrostHTTP(_repair_things())
-        _run_repair(http, _DETAILS, apply=False)
+        http = _FakeFrostHTTP(_repair_things(v2=True), v2=True)
+        assert _run_repair(http, apply=True, fields=_V1) == repair.EXIT_OK
+
+        assert [p["$skip"] for p in http.gets] == ["0", "1", "2"]
+        assert http.patches == [_location_patch(108, 4.77082, 52.28013), _location_patch(110, 4.318551, 52.062537)]
+
+    @_STA_VERSIONS
+    def test_things_are_read_page_by_page(self, monkeypatch, v2):
+        monkeypatch.setattr(repair, "_PAGE_SIZE", 1)
+        http = _FakeFrostHTTP(_repair_things(v2=v2), v2=v2)
+        _run_repair(http, apply=False, fields=_V2 if v2 else _V1)
 
         assert [p["$skip"] for p in http.gets] == ["0", "1", "2"]
 
-    def test_generated_feature_of_interest_at_the_placeholder_is_patched_too(self):
-        """FROST keeps reusing a FoI generated before the repair, even after its Location moved."""
+    def test_failed_patch_gives_exit_1(self):
+        http = _FakeFrostHTTP(_repair_things(), patch_status=401)
+        assert _run_repair(http, apply=True) == repair.EXIT_FROST_FAILED
+
+    def test_station_without_upstream_coordinates_is_left_with_exit_3(self, capsys):
+        details = {**_DETAILS, "NL49565": {"components": ["NO2"], "geometry": None}}
+        http = _FakeFrostHTTP(_repair_things())
+        assert _run_repair(http, details, apply=True) == repair.EXIT_LEFT_AT_PLACEHOLDER
+
+        assert [url for url, _ in http.patches] == [f"{_FROST_BASE}/Locations(110)"]
+        out = capsys.readouterr().out
+        assert re.search(r"left at the placeholder: NL49565 .*no usable coordinates", out)
+        assert "[no_coordinates: re-running will not help]" in out
+
+    def test_station_unknown_to_luchtmeetnet_is_left_with_exit_3(self, capsys):
+        details = {k: v for k, v in _DETAILS.items() if k != "NL49565"}  # detail endpoint answers 404
+        http = _FakeFrostHTTP(_repair_things())
+        assert _run_repair(http, details, apply=True) == repair.EXIT_LEFT_AT_PLACEHOLDER
+        assert "unknown to the Luchtmeetnet detail endpoint (HTTP 404)" in capsys.readouterr().out
+
+    def test_rate_limit_is_reported_apart_from_missing_coordinates_and_stops_requests(self, capsys):
+        stations = [f"NL0000{i}" for i in range(1, 5)]
+        things = [_frost_thing(300 + i, n, f"Station {i}", location_id=400 + i) for i, n in enumerate(stations)]
+        details = {n: _detail(5.1 + i / 10, 52.1, ["NO2"]) for i, n in enumerate(stations)}
+        details["NL00004"] = {"components": ["NO2"], "geometry": None}
+        calls: list[str] = []
+        get = _api_get_from(details, failures={"NL00002": repair.RATE_LIMITED}, calls=calls)
+
+        assert _run_repair(_FakeFrostHTTP(things), apply=False, get=get) == repair.EXIT_API_FAILED
+        assert calls == ["/stations/NL00001", "/stations/NL00002"]  # nothing more after the persistent 429
+        out = capsys.readouterr().out
+        assert re.search(r"left at the placeholder: NL00002 .*rate limit \(HTTP 429\)", out)
+        assert re.search(r"left at the placeholder: NL00003 .*not requested", out)
+        assert re.search(r"left at the placeholder: NL00004 .*not requested", out)  # unknown yet, not 'no coordinates'
+        assert "no usable coordinates" not in out
+        assert "[rate_limited: re-run in a few minutes]" in out
+
+        http = _FakeFrostHTTP(things)
+        get = _api_get_from(details, failures={"NL00002": repair.RATE_LIMITED})
+        assert _run_repair(http, apply=True, get=get) == repair.EXIT_API_FAILED
+        assert [url for url, _ in http.patches] == [f"{_FROST_BASE}/Locations(400)"]  # resolved before the 429
+
+    def test_consecutive_api_failures_stop_further_requests(self, capsys):
+        stations = [f"NL0000{i}" for i in range(1, 6)]
+        things = [_frost_thing(300 + i, n, f"Station {i}", location_id=400 + i) for i, n in enumerate(stations)]
+        details = {n: _detail(5.1, 52.1, ["NO2"]) for n in stations}
+        failures = {
+            "NL00001": repair.SERVER_ERROR,
+            "NL00002": repair.UNREACHABLE,
+            "NL00003": repair.BAD_RESPONSE,
+        }
+        calls: list[str] = []
+        get = _api_get_from(details, failures=failures, calls=calls)
+
+        assert _run_repair(_FakeFrostHTTP(things), apply=False, get=get) == repair.EXIT_API_FAILED
+        assert calls == ["/stations/NL00001", "/stations/NL00002", "/stations/NL00003"]
+        assert "after 3 stations in a row failed" in capsys.readouterr().out
+
+    def test_detail_body_without_a_station_record_is_an_api_failure(self, capsys):
+        def get(path: str, params: dict[str, str] | None) -> Any:
+            return {"message": "Service temporarily unavailable"}
+
+        http = _FakeFrostHTTP(_repair_things()[:1])
+        assert _run_repair(http, apply=True, get=get) == repair.EXIT_API_FAILED
+        assert http.patches == []
+        assert "no usable coordinates" not in capsys.readouterr().out
+
+    def test_failing_station_list_leaves_unnumbered_things_unresolved(self, capsys):
+        def get(path: str, params: dict[str, str] | None) -> Any:
+            if path == "/stations":
+                raise repair.LuchtmeetnetError(repair.RATE_LIMITED, "HTTP 429")
+            return {"data": _DETAILS[path.rsplit("/", 1)[-1]]}
+
+        http = _FakeFrostHTTP(_repair_things())
+        assert _run_repair(http, apply=True, get=get) == repair.EXIT_API_FAILED
+        assert [url for url, _ in http.patches] == [f"{_FROST_BASE}/Locations(108)"]  # numbered Thing still fixed
+        assert re.search(r"left at the placeholder: - Thing 197 .*station list: HTTP 429", capsys.readouterr().out)
+
+    def test_existing_observations_refuse_apply(self, capsys):
         things = [
-            # Location already repaired by an earlier run, FoI still at the placeholder.
             _frost_thing(
                 195, "NL49565", "Oude Meer-Aalsmeerderdijk", location_id=108,
-                coordinates=[4.77082, 52.28013], feature=(31, _PLACEHOLDER),
+                # The first Datastream has no Observation yet; a later one does.
+                datastreams=[(7, None), (8, (80, 31, _PLACEHOLDER))],
+            ),
+            _frost_thing(199, "NL50002", "Geleen-Vouershof", location_id=111, coordinates=[5.81071, 50.96309]),
+        ]
+        http = _FakeFrostHTTP(things)
+        assert _run_repair(http, apply=False) == repair.EXIT_OBSERVATIONS_EXIST
+        out = capsys.readouterr().out
+        assert "1 Luchtmeetnet Datastreams on 1 Things already have Observations" in out
+        assert "--apply is refused" in out
+
+        assert _run_repair(http, apply=True) == repair.EXIT_OBSERVATIONS_EXIST
+        assert http.patches == []
+        assert "Nothing was written." in capsys.readouterr().out
+
+    def test_allow_observations_also_moves_the_generated_feature_of_interest(self):
+        things = [
+            _frost_thing(
+                195, "NL49565", "Oude Meer-Aalsmeerderdijk", location_id=108,
+                datastreams=[(7, None), (8, (80, 31, _PLACEHOLDER)), (9, (90, 31, _PLACEHOLDER))],
+            ),
+            # Location repaired by an earlier run, FoI still at the placeholder.
+            _frost_thing(
+                197, "NL10450", "Den Haag-Neherkade", location_id=110, coordinates=[4.318551, 52.062537],
+                datastreams=[(10, (100, 32, _PLACEHOLDER))],
             ),
             # Observations exist, but their FoI was generated from a correct Location.
             _frost_thing(
-                199, "NL50002", "Geleen-Vouershof", location_id=111,
-                coordinates=[5.81071, 50.96309], feature=(32, [5.81071, 50.96309]),
+                199, "NL50002", "Geleen-Vouershof", location_id=111, coordinates=[5.81071, 50.96309],
+                datastreams=[(11, (110, 33, [5.81071, 50.96309]))],
             ),
         ]
         http = _FakeFrostHTTP(things)
-        assert _run_repair(http, _DETAILS, apply=True) == 0
+        assert _run_repair(http, apply=True, allow_observations=True) == repair.EXIT_OK
 
+        feature = {"type": "Point", "coordinates": [4.77082, 52.28013]}
         assert http.patches == [
+            _location_patch(108, 4.77082, 52.28013),
+            (f"{_FROST_BASE}/FeaturesOfInterest(31)", {"encodingType": "application/geo+json", "feature": feature}),
             (
-                f"{_FROST_BASE}/FeaturesOfInterest(31)",
-                {"encodingType": "application/geo+json", "feature": {"type": "Point", "coordinates": [4.77082, 52.28013]}},
+                f"{_FROST_BASE}/FeaturesOfInterest(32)",
+                {
+                    "encodingType": "application/geo+json",
+                    "feature": {"type": "Point", "coordinates": [4.318551, 52.062537]},
+                },
             ),
         ]
-        assert "Datastreams($top=1;$expand=Observations($top=1;$expand=FeatureOfInterest))" in http.gets[0]["$expand"]
+
+    @_STA_VERSIONS
+    def test_one_observation_of_every_datastream_is_checked(self, v2):
+        http = _FakeFrostHTTP(_repair_things(v2=v2), v2=v2)
+        _run_repair(http, apply=False, fields=_V2 if v2 else _V1)
+
+        key = "id" if v2 else "@iot.id"
+        assert http.gets[0]["$expand"] == (
+            f"Locations,Datastreams($select={key};$expand=Observations($top=1;$select={key};"
+            f"$expand=FeatureOfInterest($select={key},feature)))"
+        )
 
     def test_target_selection_never_sends_credentials_to_an_unconfigured_url(self):
         targets = [FrostTarget(url="https://frost.example/FROST-Server/v1.1", auth_username="w", auth_password="p")]
@@ -1378,3 +1556,138 @@ class TestRepairLuchtmeetnetLocations:
         assert repair.select_target(targets, "https://frost.example/FROST-Server/v1.1/") is targets[0]
         with pytest.raises(SystemExit):
             repair.select_target(targets, "https://elsewhere.example/v1.1")
+
+
+class TestRepairApiGet:
+    def test_429_is_retried_after_retry_after(self):
+        http_get = _ScriptedHTTPGet(_ApiResponse(429, headers={"Retry-After": "7"}), _ApiResponse(200, {"data": 1}))
+        sleeps: list[float] = []
+        assert repair.api_get("https://lmn.test", "/stations/NL1", http_get=http_get, sleep=sleeps.append) == {"data": 1}
+        assert sleeps == [7.0]
+        assert http_get.urls == ["https://lmn.test/stations/NL1"] * 2
+
+    def test_persistent_429_backs_off_then_gives_up(self):
+        http_get = _ScriptedHTTPGet(*[_ApiResponse(429) for _ in range(4)])
+        sleeps: list[float] = []
+        with pytest.raises(repair.LuchtmeetnetError) as exc_info:
+            repair.api_get("https://lmn.test", "/stations/NL1", http_get=http_get, sleep=sleeps.append)
+        assert exc_info.value.category == repair.RATE_LIMITED
+        assert sleeps == [15.0, 30.0, 60.0]
+        assert len(http_get.urls) == 4
+
+    def test_server_errors_timeouts_and_unreadable_bodies_are_retried(self):
+        http_get = _ScriptedHTTPGet(
+            _ApiResponse(503),
+            requests.Timeout("read timed out"),
+            _ApiResponse(200, ValueError("not JSON")),
+            _ApiResponse(200, {"data": {"geometry": None}}),
+        )
+        sleeps: list[float] = []
+        body = repair.api_get("https://lmn.test", "/stations/NL1", http_get=http_get, sleep=sleeps.append)
+        assert body == {"data": {"geometry": None}}
+        assert sleeps == [2.0, 5.0, 10.0]
+
+    @pytest.mark.parametrize(
+        ("outcome", "category"),
+        [
+            (_ApiResponse(500), repair.SERVER_ERROR),
+            (requests.ConnectionError("refused"), repair.UNREACHABLE),
+            (_ApiResponse(200, ValueError("not JSON")), repair.BAD_RESPONSE),
+        ],
+        ids=["5xx", "connection", "not-json"],
+    )
+    def test_transient_failures_give_up_after_four_attempts(self, outcome, category):
+        http_get = _ScriptedHTTPGet(*[outcome] * 4)
+        with pytest.raises(repair.LuchtmeetnetError) as exc_info:
+            repair.api_get("https://lmn.test", "/stations/NL1", http_get=http_get, sleep=lambda _s: None)
+        assert exc_info.value.category == category
+        assert len(http_get.urls) == 4
+
+    @pytest.mark.parametrize(("status", "category"), [(404, repair.NOT_FOUND), (403, repair.CLIENT_ERROR)])
+    def test_other_client_errors_are_not_retried(self, status, category):
+        http_get = _ScriptedHTTPGet(_ApiResponse(status))
+        with pytest.raises(repair.LuchtmeetnetError) as exc_info:
+            repair.api_get("https://lmn.test", "/stations/NL1", http_get=http_get, sleep=lambda _s: None)
+        assert exc_info.value.category == category
+        assert len(http_get.urls) == 1
+
+
+class _ClientRecorder:
+    """Stands in for FrostHTTPClient in main(): records how the client was built."""
+
+    instances: ClassVar[list[_ClientRecorder]] = []
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+        _ClientRecorder.instances.append(self)
+
+
+class TestRepairMain:
+    @pytest.fixture
+    def recorded(self, monkeypatch):
+        _ClientRecorder.instances = []
+        calls: list[dict[str, Any]] = []
+
+        def _run(http: Any, get: Any, **kwargs: Any) -> int:
+            calls.append({"http": http, "get": get, **kwargs})
+            return 0
+
+        monkeypatch.setattr(repair, "FrostHTTPClient", _ClientRecorder)
+        monkeypatch.setattr(repair, "run", _run)
+        return calls
+
+    @staticmethod
+    def _configure(monkeypatch: Any, *targets: FrostTarget) -> None:
+        monkeypatch.setattr(
+            repair, "settings", dataclasses.replace(repair.settings, frost_targets=targets, entity_name_prefix="GEO_")
+        )
+
+    def test_v2_target_is_repaired_with_its_own_credentials(self, monkeypatch, recorded, capsys):
+        target = FrostTarget(
+            url="https://frost.example/FROST-Server/v2.0",
+            version="v2.0",
+            auth_username="writer-user",
+            auth_password="s3cret-pw",
+        )
+        self._configure(monkeypatch, target)
+
+        assert repair.main([]) == 0
+
+        (client,) = _ClientRecorder.instances
+        assert client.kwargs["base_urls"] == ["https://frost.example/FROST-Server/v2.0"]
+        assert (client.kwargs["auth_username"], client.kwargs["auth_password"]) == ("writer-user", "s3cret-pw")
+        (call,) = recorded
+        assert call["fields"] == _V2
+        assert (call["apply"], call["allow_observations"], call["entity_prefix"]) == (False, False, "GEO_")
+        out = capsys.readouterr().out
+        assert "declared SensorThings v2.0" in out
+        assert "credentials from environment: yes" in out
+        assert "writer-user" not in out
+        assert "s3cret-pw" not in out
+
+    def test_v2_url_declared_v1_1_is_read_tolerantly(self, monkeypatch, recorded, capsys):
+        self._configure(monkeypatch, FrostTarget(url="https://frost.example/FROST-Server/v2.0", label="frost-local"))
+
+        repair.main(["--apply", "--allow-observations"])
+
+        (call,) = recorded
+        assert call["fields"] == _V1
+        assert (call["apply"], call["allow_observations"]) == (True, True)
+        assert "the URL is a v2.0 endpoint; ids and next links are read in both conventions" in capsys.readouterr().out
+
+    def test_v1_1_target_keeps_working(self, monkeypatch, recorded, capsys):
+        self._configure(monkeypatch, FrostTarget(url="https://frost.example/FROST-Server/v1.1"))
+
+        repair.main([])
+
+        (call,) = recorded
+        assert call["fields"] == _V1
+        assert "note:" not in capsys.readouterr().out
+
+    def test_unconfigured_target_url_is_refused(self, monkeypatch, recorded):
+        self._configure(monkeypatch, FrostTarget(url="https://frost.example/FROST-Server/v2.0", version="v2.0"))
+
+        with pytest.raises(SystemExit, match="not a configured FROST target"):
+            repair.main(["--target-url", "https://frost.example/FROST-Server/v1.1"])
+        assert _ClientRecorder.instances == []
+        assert recorded == []
