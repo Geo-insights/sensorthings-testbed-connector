@@ -24,6 +24,7 @@ Same as main Geo Insights project:
 - `app/sources/` — Source-specific parsers, normalizers, and entity builders
 - `data/` — Persistent entity caches (`registered_entities.json`, `entities_{target}.json`)
 - `scripts/` — Utility scripts (catchup, discovery, demo reset)
+- `deploy/` — Hetzner deployment of the connector; `deploy/frost/` — what FROST's database needs that FROST-Server does not create (index `OBS_DS_PHENTIME`), and when to put it back
 
 ### Data sources (10)
 | Source | Type | Module | Poll interval |

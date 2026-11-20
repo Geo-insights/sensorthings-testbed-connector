@@ -26,6 +26,7 @@ docker compose up -d
 | `setup-server.sh` | Initial server provisioning |
 | `connector.env` | Connector env vars (not committed) |
 | `monitoring.env` | Monitoring env vars (not committed) |
+| `frost/` | FROST's database (other server): the index `OBS_DS_PHENTIME`, see below |
 
 ## Manual Deploy
 
@@ -49,5 +50,14 @@ ssh geo@<IP> "cd /opt/geo-insights && docker compose logs -f connector --tail 50
 # Resource usage
 ssh geo@<IP> "docker stats --no-stream"
 ```
+
+## FROST server
+
+FROST (`frost.geo-insights.nl`) and the MCP server run on a second VPS, 49.12.222.122, from
+`/opt/frost`, whose compose file is not in this directory. FROST-Server does not create the
+index `OBS_DS_PHENTIME` that the connector's restart seeding and the platform's latest values
+rely on: after FROST's database is rebuilt, restored or upgraded, check it and build it with
+[`frost/`](frost/README.md).
+
 # webhook test 2026-10-07T19:47:54Z
 # webhook test 2
