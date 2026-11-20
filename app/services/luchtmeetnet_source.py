@@ -31,23 +31,31 @@ _STATION_LIST_MAX_PAGES = 20
 # The API sits behind a rate limit (HTTP 429 after a few hundred requests in a
 # few minutes), so discovery stays gentle.
 _DETAIL_CONCURRENCY = 4
-# While some station details are still missing (rate limit, network), readings
-# are held back for at most this many cycles: the ingest loop registers entity
-# sets once, on the first cycle that returns readings, so releasing readings
-# early would leave the missing stations without Datastreams until a restart.
-# Nothing is lost meanwhile: the look-back reaches back to an hour before the
-# process started for the first three cycles.
+# Until station discovery is complete (station list read to its last page,
+# every listed station resolved or skipped), readings are held back for at
+# most this many cycles, so that the ingest loop's first registration of the
+# entity sets covers every station: a guard for stations whose Datastreams are
+# not registered yet. Holding back delays readings but does not drop them: the
+# first cycle that fetches measurements reads back to where the first
+# held-back cycle's window would have started (bounded by
+# _MAX_CATCH_UP_LOOKBACK).
 _MAX_HOLD_BACK_CYCLES = 2
-# Measurement look-back per poll cycle. Hourly values appear some time after
-# the hour (many not yet at :17), so a one-hour window polled early in the hour
-# misses most of them for good; three hours lets the next cycle pick them up.
-# The overlap is harmless: the ingest loop skips readings at or before its
-# high-water mark per sensor+property.
+# Measurement look-back per poll cycle, the first cycle after a restart
+# included. Hourly values appear some time after the hour (many not yet at
+# :17), so a one-hour window polled early in the hour misses most of them for
+# good; three hours lets the next cycle pick them up, and after a restart it
+# fills the gap left since the previous process's last cycle. The overlap is
+# harmless: the ingest loop drops readings at or before its high-water mark per
+# sensor+property, and after a restart it seeds those marks from FROST for
+# every Datastream of the source.
 _MEASUREMENT_LOOKBACK = timedelta(hours=3)
-# ...but never further back than this before the process started. After a
-# restart the ingest loop seeds its high-water marks from FROST for only part
-# of the Datastreams, so re-reading older hours could push them twice.
-_STARTUP_LOOKBACK = timedelta(hours=1)
+# Bound on the catch-up window after cycles that fetched no measurements
+# (discovery not ready). GET /measurements returns at most 1000 values per
+# request without paging (a 7-day window returned exactly 1000, last_page=1);
+# 24 h is well below that for a station with every component. Hold-backs
+# longer than 24 h minus the look-back (a poll interval above about 10 h) lose
+# the hours before the window.
+_MAX_CATCH_UP_LOOKBACK = timedelta(hours=24)
 
 
 class LuchtmeetnetPollingSource(RestPollingSource):
@@ -56,12 +64,14 @@ class LuchtmeetnetPollingSource(RestPollingSource):
     Discovery has two steps. The paged ``GET /stations`` list only carries each
     station's number and name, so its coordinates and measured components come
     from ``GET /stations/{number}``, fetched with bounded concurrency through
-    :class:`AsyncAPIClient` (which retries). Details are cached for the life of
-    the process: later cycles only fetch stations that are still missing, so a
-    failed detail fetch is retried on the next cycle (readings are held back
-    meanwhile, see ``_MAX_HOLD_BACK_CYCLES``). A station whose detail record
-    has no usable coordinates, or that the detail endpoint does not know, is
-    skipped with a warning; it is never registered at a made-up location.
+    :class:`AsyncAPIClient` (which retries). The list is read again every cycle
+    until one read has reached its last page; a failed request or an empty or
+    malformed page does not count as the end of the list. Details are cached for
+    the life of the process: later cycles only fetch stations that are still
+    missing, so a failed detail fetch is retried on the next cycle (readings are
+    held back meanwhile, see ``_MAX_HOLD_BACK_CYCLES``). A station whose detail
+    record has no usable coordinates, or that the detail endpoint does not know,
+    is skipped with a warning; it is never registered at a made-up location.
 
     Each cycle then fetches the recent hourly measurements per station (see
     ``_MEASUREMENT_LOOKBACK``) and keeps only readings for the station's
@@ -83,9 +93,11 @@ class LuchtmeetnetPollingSource(RestPollingSource):
         # Stations skipped for the life of the process: no usable coordinates in
         # their detail record, or unknown to the detail endpoint (404)
         self._skipped_stations: set[str] = set()
-        self._started_at = datetime.now(UTC)
         self._held_back_cycles = 0
         self._readings_released = False
+        # Start of the window the first cycle without a measurement fetch would
+        # have read; the next fetch reads back to it (see _MAX_HOLD_BACK_CYCLES).
+        self._unfetched_since: datetime | None = None
 
     def is_enabled(self) -> bool:
         return settings.luchtmeetnet_enabled
@@ -132,27 +144,34 @@ class LuchtmeetnetPollingSource(RestPollingSource):
 
         await self._discover_stations(client)
 
+        end = datetime.now(UTC)
         if not self._discovered_stations:
             logger.warning("Luchtmeetnet: no stations discovered — skipping measurement fetch")
+            self._note_unfetched(end)
             return []
 
         if not self._readings_released:
             if self._discovery_incomplete() and self._held_back_cycles < _MAX_HOLD_BACK_CYCLES:
                 self._held_back_cycles += 1
                 logger.warning(
-                    "Luchtmeetnet: station discovery incomplete (%d of %d stations resolved); holding "
-                    "readings back so the first registration covers every station (cycle %d of at most %d)",
+                    "Luchtmeetnet: station discovery incomplete (%d of %d listed stations resolved, list %s); "
+                    "holding readings back so the first registration covers every station (cycle %d of at most %d)",
                     len(self._discovered_stations),
                     len(self._station_names),
+                    "complete" if self._station_list_complete else "incomplete",
                     self._held_back_cycles,
                     _MAX_HOLD_BACK_CYCLES,
                 )
+                self._note_unfetched(end)
                 return []
             self._readings_released = True
 
         all_readings: list[SensorReading] = []
-        end = datetime.now(UTC)
-        start = max(end - _MEASUREMENT_LOOKBACK, self._started_at - _STARTUP_LOOKBACK)
+        start = end - _MEASUREMENT_LOOKBACK
+        if self._unfetched_since is not None:
+            # Catch up on what the cycles without a measurement fetch would have read.
+            start = max(min(start, self._unfetched_since), end - _MAX_CATCH_UP_LOOKBACK)
+            self._unfetched_since = None
         start_str = start.strftime("%Y-%m-%dT%H:%M:%S+00:00")
         end_str = end.strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
@@ -250,11 +269,20 @@ class LuchtmeetnetPollingSource(RestPollingSource):
     def _discovery_incomplete(self) -> bool:
         return not self._station_list_complete or bool(self._pending_stations())
 
+    def _note_unfetched(self, now: datetime) -> None:
+        """Remember where the window of a cycle that fetched no measurements would have started."""
+        if self._unfetched_since is None:
+            self._unfetched_since = now - _MEASUREMENT_LOOKBACK
+
     async def _fetch_station_list(self, client: AsyncAPIClient) -> None:
         """Read the paged ``GET /stations`` list into ``_station_names``.
 
-        Stops at the first failed page and leaves the list marked incomplete,
-        so the next cycle reads it again; stations already read are kept.
+        The list counts as complete only once a read has reached
+        ``pagination.last_page``, every page on the way returning stations. A
+        failed request, or a 200 page without stations or without
+        ``pagination.last_page`` (an empty or malformed body), is a failed read:
+        the list stays incomplete and the next cycle reads it again. Stations
+        already read are kept.
         """
         logger.info("Luchtmeetnet: discovering stations from %s/stations", self._base_url)
         page = 1
@@ -265,20 +293,17 @@ class LuchtmeetnetPollingSource(RestPollingSource):
                 logger.exception("Luchtmeetnet: failed to fetch station list (page %d)", page)
                 return
 
-            stations = _list_items(resp)
-            for station in stations:
-                if not isinstance(station, dict):
-                    continue
-                number = str(station.get("number") or "").strip()
-                if not number:
-                    continue
-                # Same normalisation as before the detail fetch existed: Thing,
-                # Location and Sensor names derive from it and must not change.
-                name = str(station.get("location") or number).strip() or number
-                self._station_names[number] = name
-
+            names = _station_names_of(resp)
             last_page = _last_page(resp)
-            if not stations or last_page is None or page >= last_page:
+            if not names or last_page is None:
+                logger.warning(
+                    "Luchtmeetnet: station list page %d came back without %s — reading the list again next cycle",
+                    page,
+                    "stations" if not names else "pagination.last_page",
+                )
+                return
+            self._station_names.update(names)
+            if page >= last_page:
                 break
             page += 1
         else:
@@ -360,6 +385,21 @@ def _list_items(resp: Any) -> list[Any]:
         if isinstance(items, list):
             return items
     return []
+
+
+def _station_names_of(resp: Any) -> dict[str, str]:
+    """``{station number: name}`` for the usable items of a ``GET /stations`` page."""
+    names: dict[str, str] = {}
+    for station in _list_items(resp):
+        if not isinstance(station, dict):
+            continue
+        number = str(station.get("number") or "").strip()
+        if not number:
+            continue
+        # Same normalisation as before the detail fetch existed: Thing,
+        # Location and Sensor names derive from it and must not change.
+        names[number] = str(station.get("location") or number).strip() or number
+    return names
 
 
 def _last_page(resp: Any) -> int | None:
