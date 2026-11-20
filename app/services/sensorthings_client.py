@@ -4,10 +4,11 @@ import json
 import logging
 import os
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import requests
 
@@ -163,6 +164,59 @@ def _coerce_iot_id(value: Any) -> Any:
     return value
 
 
+class _DatastreamRoute(NamedTuple):
+    """What a datastream on the primary target observes, read from its properties."""
+
+    sensor_id: str  # properties.sensor_id; "" when absent
+    properties: frozenset[str]  # _property_token of properties.observed_property and .streamKey
+
+
+def _canonical_key(name: Any) -> str:
+    """The canonical key an observed-property name resolves to, or ""."""
+    canonical = resolve(str(name or "").strip())
+    return canonical.value if canonical is not None else ""
+
+
+def _property_token(name: Any) -> str:
+    """Comparison token for an observed-property name.
+
+    The canonical key when the name resolves, so "pm25" and "pm2_5" compare
+    equal; otherwise the trimmed lower-case name; "" for an empty name.
+    """
+    raw = str(name or "").strip()
+    if not raw:
+        return ""
+    return _canonical_key(raw) or raw.lower()
+
+
+def _route_for(properties: Any) -> _DatastreamRoute:
+    props = properties if isinstance(properties, dict) else {}
+    tokens = {_property_token(props.get("observed_property")), _property_token(props.get("streamKey"))}
+    tokens.discard("")
+    return _DatastreamRoute(str(props.get("sensor_id") or "").strip(), frozenset(tokens))
+
+
+def _reading_property_tokens(reading: SensorReading) -> frozenset[str]:
+    tokens = {_property_token(reading.observed_property), _property_token(reading.stream_key)}
+    tokens.discard("")
+    return frozenset(tokens)
+
+
+def _key_fits_route(key: str, route: _DatastreamRoute) -> bool:
+    """Whether a "sensor_id::observed_property" key may map to this datastream.
+
+    Bare keys (a sensor id or a stream key) name no property here; the push
+    path checks them against the reading instead.
+    """
+    sensor_id, sep, observed_property = key.rpartition("::")
+    if not sep:
+        return True
+    if route.sensor_id and route.sensor_id != sensor_id:
+        return False
+    token = _property_token(observed_property)
+    return not (route.properties and token and token not in route.properties)
+
+
 # Per-target circuit breaker shared by push + replay paths.
 observation_breaker = CircuitBreaker(
     failure_threshold=settings.frost_cb_failure_threshold,
@@ -196,6 +250,14 @@ class SensorThingsClient:
         self._registered_entities = self._cache.all()
         self._datastream_ids: dict[str, str] = dict(settings.datastream_ids)
         self._datastream_ids.update(self._cache.collection("datastreams"))
+        # Datastream id -> what it observes on the primary target (sensor_id and
+        # observed-property tokens from its properties), filled by
+        # warm_datastream_cache(). The push path uses it to refuse a cached
+        # mapping that points at a datastream of another property or sensor.
+        self._datastream_routes: dict[str, _DatastreamRoute] = {}
+        self._rejected_routes_logged: set[tuple[str, str, str]] = set()
+        # (base_url, "sensor_id::observed_property") already reported as unresolved.
+        self._unresolved_reported: set[tuple[str, str]] = set()
         self._live_datastream_lookup_cache: dict[str, str] = {}
         # Sensors we recently failed to resolve live, keyed by their most
         # specific lookup key -> monotonic expiry. Prevents a per-push storm of
@@ -2303,7 +2365,7 @@ class SensorThingsClient:
             )
         return sent, results
 
-    def warm_datastream_cache(self, max_datastreams: int = 10000) -> int:
+    def warm_datastream_cache(self, max_datastreams: int = 100_000) -> int:
         """Pre-populate the datastream-id cache from the primary FROST target.
 
         The push and monitoring-forward paths resolve datastream ids from
@@ -2313,7 +2375,19 @@ class SensorThingsClient:
         logs and returns 0 on any failure, never raises.
 
         Also purges stale cached entries whose IDs don't exist on the current
-        server (e.g. carried over from a previously-configured FROST target).
+        server (e.g. carried over from a previously-configured FROST target),
+        and ``sensor_id::observed_property`` entries whose ID does exist but
+        names a datastream of another sensor or property: FROST numbers each
+        server's datastreams from 1, so ids carried over from a previous target
+        collide with unrelated datastreams on the new one. Records what every
+        listed datastream observes, so push_observations can refuse a mapping
+        that would cross properties or sensors.
+
+        The listing is ordered by id. Unordered, FROST returns datastreams in
+        storage order, which its observation triggers keep changing (every
+        insert updates the datastream row), so ``$skip`` pages can overlap or
+        miss datastreams, and "the first datastream listed" is arbitrary.
+        Ordered, FROST pages by id (``$skipFilter``) instead.
         """
         base_url = self._primary_base_url()
         if not base_url:
@@ -2327,6 +2401,7 @@ class SensorThingsClient:
         url: str | None = endpoint
         page_params: dict[str, str] | None = {
             "$select": f"{fields.id},name,properties",
+            "$orderby": "id",
             "$top": str(min(max_datastreams, 1000)),
         }
         values: list[dict[str, Any]] = []
@@ -2352,48 +2427,156 @@ class SensorThingsClient:
             logger.debug("Datastream cache warm-up fetch failed", exc_info=True)
             return 0
 
-        # Purge stale cached entries whose IDs don't exist on the server.
-        purged = 0
-        if server_ids:
-            stale_keys = [
-                key for key, ds_id in self._datastream_ids.items()
-                if str(ds_id) not in server_ids
-            ]
-            for key in stale_keys:
-                del self._datastream_ids[key]
-                self._cache.drop("datastreams", key)
-                purged += 1
-            if purged:
-                logger.warning(
-                    "Datastream cache purged %d stale id(s) not found on %s",
-                    purged, base_url,
-                )
+        # The loop also stops at max_datastreams. The listing is then partial:
+        # an id missing from it proves nothing, and uniqueness can't be judged.
+        complete = not url
+        if not complete:
+            logger.warning(
+                "Datastream cache warm-up stopped at %d datastreams on %s: not purging "
+                "missing ids, no sensor-id or stream-key fallback entries",
+                len(server_ids), base_url,
+            )
 
-        # Add newly discovered entries.
-        warmed = 0
+        listed: list[tuple[str, dict[str, Any]]] = []
         for ds in values:
             ds_id = ds.get(fields.id) or ds.get("@iot.id") or ds.get("id")
             if not ds_id:
                 continue
-            props = ds.get("properties") or {}
+            props = ds.get("properties")
+            listed.append((str(ds_id), props if isinstance(props, dict) else {}))
+        routes = {ds_id: _route_for(props) for ds_id, props in listed}
+        self._datastream_routes = routes
+
+        # Purge cached entries whose id is not on the server, or names a
+        # datastream of another sensor or observed property. A complete but
+        # empty listing purges everything: a server without datastreams (e.g. a
+        # fresh primary) can't hold any cached id, and keeping them would route
+        # readings into whatever datastream later gets that id.
+        stale: list[str] = []
+        mismatched: list[str] = []
+        for key, cached_id in list(self._datastream_ids.items()):
+            ds_key = str(cached_id)
+            if complete and ds_key not in server_ids:
+                stale.append(key)
+                continue
+            route = routes.get(ds_key)
+            if route is not None and not _key_fits_route(key, route):
+                mismatched.append(key)
+        if stale or mismatched:
+            examples = [f"{key} -> {self._datastream_ids[key]}" for key in mismatched[:10]]
+            cached = self._cache.collection("datastreams")
+            for key in stale + mismatched:
+                del self._datastream_ids[key]
+                cached.pop(key, None)
+            self._persist_registered_entities()  # once, not per dropped key
+            if stale:
+                logger.warning(
+                    "Datastream cache purged %d stale id(s) not found on %s",
+                    len(stale), base_url,
+                )
+            if mismatched:
+                logger.warning(
+                    "Datastream cache purged %d mapping(s) to a datastream of another sensor or "
+                    "observed property on %s (e.g. %s)",
+                    len(mismatched), base_url, ", ".join(examples),
+                )
+
+        # Add the server's datastreams. Full keys under the raw property names
+        # and their canonical keys, so a reading of "pm2_5" also finds a
+        # datastream registered as "pm25". Bare keys (a sensor id, a stream key)
+        # are fallbacks for readings without a full-key match: add one only when
+        # it names exactly one datastream on the server, since the first of
+        # several would hand a reading another sensor's or property's datastream.
+        sensor_counts = Counter(route.sensor_id for route in routes.values() if route.sensor_id)
+        stream_counts: Counter[str] = Counter()
+        for _ds_id, props in listed:
+            stream_counts[str(props.get("streamKey") or props.get("observed_property") or "").strip()] += 1
+        warmed = 0
+        for ds_id, props in listed:
             sensor_id = str(props.get("sensor_id") or "").strip()
             observed_property = str(props.get("observed_property") or props.get("streamKey") or "").strip()
             stream_key = str(props.get("streamKey") or props.get("observed_property") or "").strip()
-            keys = [
-                self._datastream_key(sensor_id, observed_property) if sensor_id and observed_property else "",
-                stream_key,
-                sensor_id,
-            ]
+            keys: list[str] = []
+            if sensor_id:
+                for name in (observed_property, stream_key, _canonical_key(observed_property), _canonical_key(stream_key)):
+                    if name:
+                        keys.append(self._datastream_key(sensor_id, name))
+            if complete and stream_key and stream_counts[stream_key] == 1:
+                keys.append(stream_key)
+            if complete and sensor_id and sensor_counts[sensor_id] == 1:
+                keys.append(sensor_id)
             for key in keys:
-                if key and key not in self._datastream_ids:
-                    self._datastream_ids[key] = str(ds_id)
+                if key not in self._datastream_ids:
+                    self._datastream_ids[key] = ds_id
                     warmed += 1
-        if warmed or purged:
+        if warmed or stale or mismatched:
             logger.info(
-                "Datastream cache warm-up: %d added, %d purged (%d server ids from %s)",
-                warmed, purged, len(server_ids), base_url,
+                "Datastream cache warm-up: %d added, %d stale and %d mismatched purged (%d server ids from %s)",
+                warmed, len(stale), len(mismatched), len(server_ids), base_url,
             )
         return warmed
+
+    def _resolve_cached_datastream_id(
+        self, datastream_ids: dict[str, str], reading: SensorReading,
+    ) -> tuple[str | None, list[str]]:
+        """Resolve a reading's datastream on the primary target from the id map.
+
+        Tries the ``sensor_id::observed_property`` key, then the reading's
+        stream key, then its bare sensor id, and returns the first datastream
+        the reading may go to, plus why the others were refused. A datastream
+        whose properties (as listed at warm-up) name another observed property
+        or sensor is always refused, so a fallback can never put a reading into
+        another property's datastream. Without listed properties the full key
+        and the stream key are trusted (both name the property), and the bare
+        sensor id only when the sensor has exactly one known datastream.
+        """
+        lookups = [(self._datastream_key(reading.sensor_id, reading.observed_property), "key")]
+        stream_key = (reading.stream_key or "").strip()
+        if stream_key:
+            lookups.append((stream_key, "stream_key"))
+        if reading.sensor_id:
+            lookups.append((reading.sensor_id, "sensor_id"))
+
+        refused: list[str] = []
+        for key, kind in lookups:
+            candidate = datastream_ids.get(key)
+            if not candidate:
+                continue
+            ds_id = str(candidate)
+            reason = self._route_refusal(ds_id, reading, kind, datastream_ids)
+            if reason is None:
+                return ds_id, refused
+            refused.append(reason)
+            log_key = (key, ds_id, reading.observed_property)
+            if log_key not in self._rejected_routes_logged:
+                self._rejected_routes_logged.add(log_key)
+                logger.warning(
+                    "Not routing %s %s via %r: %s",
+                    reading.sensor_id, reading.observed_property, key, reason,
+                )
+        return None, refused
+
+    def _route_refusal(
+        self, ds_id: str, reading: SensorReading, kind: str, datastream_ids: dict[str, str],
+    ) -> str | None:
+        """Why ``reading`` may not go to datastream ``ds_id``; None when it may."""
+        route = self._datastream_routes.get(ds_id)
+        if route is not None and route.sensor_id and route.sensor_id != reading.sensor_id:
+            return f"datastream {ds_id} belongs to sensor {route.sensor_id}"
+        if route is not None and route.properties:
+            if _reading_property_tokens(reading) & route.properties:
+                return None
+            return f"datastream {ds_id} observes {', '.join(sorted(route.properties))}"
+        if kind != "sensor_id":
+            return None
+        # Bare sensor id, datastream property unknown: only a sensor's sole datastream.
+        prefix = f"{reading.sensor_id}::"
+        known = {str(value) for key, value in datastream_ids.items() if key.startswith(prefix)}
+        known.update(other for other, r in self._datastream_routes.items() if r.sensor_id == reading.sensor_id)
+        known.add(ds_id)
+        if len(known) == 1:
+            return None
+        return f"sensor {reading.sensor_id} has {len(known)} datastreams and datastream {ds_id}'s observed property is unknown"
 
     def push_observations(
         self,
@@ -2431,24 +2614,33 @@ class SensorThingsClient:
             # touches caches). Skip live HTTP lookups while the breaker is open.
             tasks: list[tuple[str, dict[str, Any], str, str]] = []  # (endpoint, payload, ds_id, sensor_id)
             unresolved: list[dict[str, Any]] = []
+            refused_mappings = 0
             is_primary = not stack or stack.base_url == (self._primary_base_url() or "")
             for reading in readings:
                 datastream_id = None
+                refused: list[str] = []
                 if stack and not is_primary:
                     ds_key = self._datastream_key(reading.sensor_id, reading.observed_property)
                     datastream_id = stack.cache.get("datastreams", ds_key)
                 if not datastream_id and is_primary:
-                    datastream_id = (
-                        datastream_ids.get(self._datastream_key(reading.sensor_id, reading.observed_property))
-                        or datastream_ids.get(getattr(reading, "stream_key", "") or "")
-                        or datastream_ids.get(reading.sensor_id)
-                    )
+                    # Only a datastream of the reading's own observed property:
+                    # a mapping to another property's datastream is refused, and
+                    # the reading falls through to the (property-specific) live
+                    # lookup or stays unresolved.
+                    datastream_id, refused = self._resolve_cached_datastream_id(datastream_ids, reading)
+                    refused_mappings += len(refused)
                 if not datastream_id and not breaker_open:
                     datastream_id = self._resolve_datastream_id_live(base_url, reading)
                 if not datastream_id:
-                    unresolved.append(
-                        {"sensor_id": reading.sensor_id, "ok": False, "message": "No datastream mapping available for this sensor; dynamic lookup also failed."}
-                    )
+                    entry: dict[str, Any] = {
+                        "sensor_id": reading.sensor_id,
+                        "observed_property": reading.observed_property,
+                        "ok": False,
+                        "message": "No datastream mapping available for this sensor; dynamic lookup also failed.",
+                    }
+                    if refused:
+                        entry["refused"] = refused
+                    unresolved.append(entry)
                     continue
 
                 payload = {
@@ -2470,6 +2662,22 @@ class SensorThingsClient:
                 if is_v2:
                     payload = adapt_observation_payload(payload)
                 tasks.append((endpoint, payload, datastream_id, reading.sensor_id))
+
+            if unresolved:
+                # Warn the first time a sensor::property goes unresolved on a
+                # target (silent drops have hidden stale datastreams before);
+                # repeats of known keys only at debug level.
+                keys = sorted({f"{u['sensor_id']}::{u['observed_property']}" for u in unresolved})
+                new_keys = [key for key in keys if (base_url, key) not in self._unresolved_reported]
+                self._unresolved_reported.update((base_url, key) for key in new_keys)
+                logger.log(
+                    logging.WARNING if new_keys else logging.DEBUG,
+                    "%s push to %s: %d of %d readings have no datastream of their own observed property "
+                    "and are not pushed (%d mapping(s) to another property's or sensor's datastream "
+                    "refused); %d new: %s",
+                    source, base_url, len(unresolved), len(readings), refused_mappings, len(new_keys),
+                    ", ".join(new_keys[:10]) + (" ..." if len(new_keys) > 10 else ""),
+                )
 
             # Circuit open: dead-letter everything in one pass (no HTTP, one log line).
             if breaker_open:
