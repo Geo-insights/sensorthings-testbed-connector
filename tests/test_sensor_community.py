@@ -4,7 +4,8 @@ Covers:
 - parse_sensor_data() with PM sensor (SDS011) produces PM10 and PM2.5 readings
 - parse_sensor_data() with noise sensor (DNMS) produces NOISE_LAEQ/LAMIN/LAMAX
 - parse_sensor_data() with temperature/humidity sensor (BME280) produces correct readings
-- Pressure is converted from Pa (as Sensor.Community reports it) to canonical hPa
+- Pressure is converted from Pa (as Sensor.Community reports it) to canonical hPa,
+  for every value_type that resolves to an hPa datastream
 - build_entity_set() produces a valid entity set
 - Unknown value_types are silently skipped
 - SensorCommunityPollingSource is a RestPollingSource subclass
@@ -240,6 +241,21 @@ _SC_UNITS = {
     "counts_per_minute": "1/min", "hv_pulses": "1", "counts": "1", "sample_time_ms": "ms",
 }  # fmt: skip
 
+# What each of them resolves to today. noise_LA_min/noise_LA_max resolve to nothing (the
+# aliases are spelled noise_lamin/noise_lamax), so the mapper drops them: adding aliases
+# would register LAmin/LAmax datastreams for every DNMS station, a product decision.
+_CD = CanonicalDatastream
+_SC_CANONICAL: dict[str, CanonicalDatastream | None] = {
+    "P0": None, "P1": _CD.PM10, "P2": _CD.PM2_5, "P4": None,
+    "N05": None, "N1": None, "N25": None, "N4": None, "N10": None,
+    "TS": None,
+    "temperature": _CD.TEMPERATURE, "humidity": _CD.HUMIDITY,
+    "pressure": _CD.PRESSURE, "pressure_at_sealevel": None,
+    "noise_LAeq": _CD.NOISE_LAEQ, "noise_LA_min": None, "noise_LA_max": None,
+    "co2_ppm": None,
+    "counts_per_minute": None, "hv_pulses": None, "counts": None, "sample_time_ms": None,
+}  # fmt: skip
+
 
 def test_pressure_pa_converted_to_hpa() -> None:
     readings = parse_sensor_data([_entry("pressure", "100391.86")])
@@ -283,8 +299,15 @@ def test_pressure_band_edges(raw: str, expected: float) -> None:
     assert _value("pressure", raw) == expected
 
 
-def test_pressure_value_type_matched_case_insensitively() -> None:
-    assert _value("Pressure", "100391.86") == pytest.approx(1003.9186)
+@pytest.mark.parametrize(
+    "value_type",
+    ["pressure", "Pressure", " PRESSURE ", "air_pressure", "airpressure", "Air Pressure", "air-pressure", "AIR_PRESSURE"],
+)
+def test_every_spelling_of_an_hpa_datastream_is_converted(value_type: str) -> None:
+    """The scale follows the datastream resolve() picks, not the raw value_type."""
+    assert resolve(value_type) in (CanonicalDatastream.PRESSURE, CanonicalDatastream.AIR_PRESSURE)
+    assert repr(_value(value_type, "100391.86")) == "1003.9186"
+    assert _value(value_type, "1013.25") == 1013.25  # already hPa
 
 
 def test_pressure_outside_band_logged_at_debug(caplog: pytest.LogCaptureFixture) -> None:
@@ -314,8 +337,8 @@ def test_pressure_non_numeric_and_non_finite_still_skipped(raw: str) -> None:
 
 @pytest.mark.parametrize("raw", [-21526.13, 0.0, 1013.25, 2000.0, 2000.01, 100391.86, 199999.99, 200000.0, 217706.0])
 def test_pressure_conversion_is_idempotent(raw: float) -> None:
-    once = to_canonical_unit("pressure", raw)
-    assert to_canonical_unit("pressure", once) == once
+    once = to_canonical_unit(CanonicalDatastream.PRESSURE, raw)
+    assert to_canonical_unit(CanonicalDatastream.PRESSURE, once) == once
 
 
 def test_every_scaled_value_lands_below_its_band() -> None:
@@ -329,24 +352,26 @@ def test_live_value_types_reach_frost_in_canonical_units() -> None:
     """Each value_type that resolves is either reported in the canonical unit or scaled.
 
     Guards against a new alias mapping a value_type onto a canonical datastream
-    with a different unit, e.g. "pressure_at_sealevel" (Pa) onto hPa, unscaled.
+    with a different unit, e.g. "pressure_at_sealevel" (Pa) onto hPa, unscaled:
+    any change in what a live value_type resolves to fails the first assert.
     """
+    assert {value_type: resolve(value_type) for value_type in _SC_UNITS} == _SC_CANONICAL
     for value_type, sc_unit in _SC_UNITS.items():
         canonical = resolve(value_type)
         if canonical is None:
             continue  # the mapper skips it
-        scale = UNIT_SCALES.get(value_type.lower())
+        scale = UNIT_SCALES.get(canonical)
         if scale is None:
             assert sc_unit == canonical.meta.unit, value_type
         else:
             assert scale.source_unit == sc_unit, value_type
 
 
-def test_only_pressure_is_scaled() -> None:
-    assert set(UNIT_SCALES) == {"pressure"}
-    assert resolve("pressure") is CanonicalDatastream.PRESSURE
-    assert CanonicalDatastream.PRESSURE.meta.unit == "hPa"
-    assert UNIT_SCALES["pressure"].band == PA_BAND
+def test_every_hpa_datastream_is_scaled_from_pa() -> None:
+    hpa = {member for member in CanonicalDatastream if member.meta.unit == "hPa"}
+    assert hpa == {CanonicalDatastream.PRESSURE, CanonicalDatastream.AIR_PRESSURE}
+    assert set(UNIT_SCALES) == hpa
+    assert all(scale.source_unit == "Pa" and scale.band == PA_BAND for scale in UNIT_SCALES.values())
 
 
 # ---------------------------------------------------------------------------
@@ -641,7 +666,7 @@ def test_backfill_read_statements_do_not_write() -> None:
 
 def test_backfill_display_conversion_matches_mapper() -> None:
     assert backfill.to_hpa(100391.86) == Decimal("1003.9186")
-    assert float(backfill.to_hpa(99954.35)) == to_canonical_unit("pressure", 99954.35)
+    assert float(backfill.to_hpa(99954.35)) == to_canonical_unit(CanonicalDatastream.PRESSURE, 99954.35)
 
 
 @pytest.mark.parametrize(

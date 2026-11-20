@@ -22,7 +22,7 @@ from decimal import Decimal
 from typing import Any, NamedTuple
 
 from app.models import SensorReading
-from app.sta.canonical import resolve
+from app.sta.canonical import CanonicalDatastream, resolve
 
 logger = logging.getLogger(__name__)
 
@@ -44,38 +44,41 @@ class UnitScale(NamedTuple):
 PA_BAND: tuple[float, float] = (2_000.0, 200_000.0)
 PA_TO_HPA = Decimal("0.01")
 
-# Sensor.Community value_types whose unit differs from the canonical datastream
-# they resolve to. canonical.py owns units and canonical always wins (see
-# CLAUDE.md), so the value is converted here, at the source boundary. Keyed by
-# lower-cased value_type.
+# Canonical datastreams whose unit differs from the one Sensor.Community reports
+# for the value_types that resolve to them. canonical.py owns units and canonical
+# always wins (see CLAUDE.md), so the value is converted here, at the source
+# boundary. Keyed by the canonical member resolve() returns, not by the raw
+# value_type, so every alias of such a datastream ("pressure", "Air Pressure",
+# "air_pressure", ...) is converted alike.
 #
-# pressure: the airrohr firmware (github.com/opendata-stuttgart/sensors-software,
+# Pressure: the airrohr firmware (github.com/opendata-stuttgart/sensors-software,
 # airrohr-firmware/airrohr-firmware.ino) sends the BMP180/BMP280/BME280 reading
 # as returned by readPressure(), in pascal (``BME280_pressure``), and divides by
 # 100 only for its own hPa display. The data API serves it as value_type
-# "pressure", e.g. "100391.86"; canonical Air pressure is hPa. A few stations on
-# other firmware already report hPa (e.g. "1001.1"): the band leaves those as is.
+# "pressure", e.g. "100391.86"; canonical Air pressure is hPa. Every hPa
+# datastream is therefore scaled from Pa. A few stations on other firmware
+# already report hPa (e.g. "1001.1"): the band leaves those as is.
 # "pressure_at_sealevel" is in Pa as well but resolves to no canonical
 # datastream, so it is skipped before it gets here.
-UNIT_SCALES: dict[str, UnitScale] = {
-    "pressure": UnitScale(PA_TO_HPA, "Pa", PA_BAND),
+UNIT_SCALES: dict[CanonicalDatastream, UnitScale] = {
+    member: UnitScale(PA_TO_HPA, "Pa", PA_BAND) for member in CanonicalDatastream if member.meta.unit == "hPa"
 }
 
 
-def to_canonical_unit(value_type: str, value: float, location_id: object = None) -> float:
+def to_canonical_unit(canonical: CanonicalDatastream, value: float, location_id: object = None) -> float:
     """Convert a raw Sensor.Community value to the unit of its canonical datastream.
 
-    Values of value_types without an entry in ``UNIT_SCALES`` are returned
+    Values for datastreams without an entry in ``UNIT_SCALES`` are returned
     unchanged, as are values outside the entry's band (logged at debug).
     """
-    scale = UNIT_SCALES.get(value_type.strip().lower())
+    scale = UNIT_SCALES.get(canonical)
     if scale is None:
         return value
     low, high = scale.band
     if not low < value < high:
         logger.debug(
             "sensor_community: %s=%r at location %s is outside the %s band (%s, %s) — not scaled",
-            value_type,
+            canonical.value,
             value,
             location_id,
             scale.source_unit,
@@ -224,7 +227,7 @@ def parse_sensor_data(sensor_entries: list[dict[str, Any]]) -> list[SensorReadin
             if not math.isfinite(value):
                 continue
 
-            value = to_canonical_unit(value_type, value, location_id)
+            value = to_canonical_unit(canonical, value, location_id)
 
             meta = canonical.meta
             readings.append(
