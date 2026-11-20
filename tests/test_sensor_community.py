@@ -1346,6 +1346,53 @@ def test_backfill_check_dlq_without_pa_readings_returns_0(tmp_path: Path, capsys
     assert "None: this queue cannot bring Pa readings back" in capsys.readouterr().out
 
 
+def test_backfill_and_dlq_check_read_what_the_connector_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The backfill selects on PARAMETERS->>'observed_property'; --check-dlq reads the dead-letter
+    entries SensorThingsClient writes. Both as the client builds them, not as a test assumes."""
+    from dataclasses import replace as with_overrides
+
+    import requests
+
+    from app.config import settings
+    from app.services import sensorthings_client as client_module
+
+    dlq = tmp_path / "failed_observations.jsonl"
+    monkeypatch.setattr(
+        client_module,
+        "settings",
+        with_overrides(
+            settings,
+            sensorthings_base_url="https://sc-backfill-test.invalid/v1.1",
+            frost_targets=(),
+            datastream_ids={},
+            registered_entities_path=str(tmp_path / "registered_entities.json"),
+            failed_observations_path=str(dlq),
+            frost_batch_push_enabled=False,
+        ),
+    )
+    client = client_module.SensorThingsClient()
+    posted: list[dict[str, Any]] = []
+
+    def unreachable(endpoint: str, payload: dict[str, Any], datastream_id: str, base_url: str | None = None) -> None:
+        posted.append(payload)
+        raise requests.ConnectionError("FROST unreachable")  # so the client dead-letters it
+
+    monkeypatch.setattr(client, "_resolve_datastream_id_live", lambda base_url, reading: "16")
+    monkeypatch.setattr(client, "_post_observation", unreachable)
+
+    (fixed,) = parse_sensor_data([_entry("pressure", "100391.86")])
+    pre_fix = fixed.model_copy(update={"value": 100391.86})  # what the mapper sent before the fix
+    client.push_observations([fixed, pre_fix])
+
+    assert sorted(p["result"] for p in posted) == [1003.9186, 100391.86]
+    assert all(p["parameters"]["observed_property"] == "pressure" for p in posted)
+    assert """"PARAMETERS"->>'observed_property'""" in backfill.IS_PRESSURE
+    assert len(dlq.read_text(encoding="utf-8").splitlines()) == 2
+    assert backfill.check_dlq(dlq, datetime.now(UTC)) == 1  # only the pre-fix one is in the Pa band
+
+
 def test_backfill_main_checks_a_dlq_copy_without_a_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "dlq.jsonl"
     path.write_text(_dlq_entry(100391.86) + "\n", encoding="utf-8")
