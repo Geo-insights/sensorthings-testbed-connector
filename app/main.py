@@ -3,6 +3,7 @@ import logging
 import threading
 import time
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -499,6 +500,124 @@ def _seed_timestamps_from_frost(
     return timestamps
 
 
+# -- Entity set registration ----------------------------------------------------
+# A polling loop registers the entity sets its source reports before it pushes
+# their readings: at startup the sets known then, and in every cycle with
+# readings the sets discovered since, plus those whose registration failed.
+_REGISTRATION_FAILURES_BEFORE_DEFERRING = 3
+
+
+def _entity_set_datastream_keys(entity_set: dict[str, Any]) -> frozenset[str]:
+    """``sensor_id::observed_property`` of every Datastream an entity set defines."""
+    return frozenset(
+        f"{sensor.get('sensor_id')}::{observed_property}"
+        for sensor in entity_set.get("sensors") or []
+        if isinstance(sensor, dict)
+        for observed_property in sensor.get("observed_properties") or []
+    )
+
+
+def _registration_complete(result: Any) -> bool:
+    """Whether ``client.register_entity_set`` registered a whole set on the primary target.
+
+    The client reports a failed Thing as ``primary_ok`` false and a failed
+    Location, Sensor or Datastream as a missing id; it skips observed
+    properties that are not canonical, which therefore do not count. Without a
+    FROST target it only previews, and there is nothing to register.
+    """
+    if not isinstance(result, dict):
+        return False
+    if result.get("mode") == "preview":
+        return True
+    if result.get("mode") != "live" or not result.get("primary_ok"):
+        return False
+    ids = [result.get("thing_id"), result.get("location_id")]
+    ids += list((result.get("sensor_ids") or {}).values())
+    ids += list((result.get("datastream_ids") or {}).values())
+    return all(ids)
+
+
+@dataclass
+class _EntitySetRegistry:
+    """The entity sets a polling loop registered on the primary FROST target.
+
+    ``registered`` maps a set's ``site_key`` to the datastream keys its
+    registrations covered, so a set that gains a sensor or an observed property
+    counts as new again. ``failures`` counts failed registrations per
+    ``site_key``.
+    """
+
+    registered: dict[str, frozenset[str]] = field(default_factory=dict)
+    failures: dict[str, int] = field(default_factory=dict)
+
+    def is_registered(self, entity_set: dict[str, Any]) -> bool:
+        covered = self.registered.get(str(entity_set.get("site_key")))
+        return covered is not None and _entity_set_datastream_keys(entity_set) <= covered
+
+    def pending(self, entity_sets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """The sets not registered yet; those that failed before go last, so a
+        set that keeps failing cannot hold up new ones."""
+        return sorted(
+            (entity_set for entity_set in entity_sets if not self.is_registered(entity_set)),
+            key=lambda entity_set: self.failures.get(str(entity_set.get("site_key")), 0),
+        )
+
+    def record(self, entity_set: dict[str, Any], complete: bool) -> None:
+        site_key = str(entity_set.get("site_key"))
+        if complete:
+            covered = self.registered.get(site_key, frozenset())
+            self.registered[site_key] = covered | _entity_set_datastream_keys(entity_set)
+            self.failures.pop(site_key, None)
+        else:
+            self.failures[site_key] = self.failures.get(site_key, 0) + 1
+
+
+async def _register_new_entity_sets(source: Any, registry: _EntitySetRegistry) -> int:
+    """Register the source's entity sets that ``registry`` does not have yet.
+
+    Returns how many stay unregistered: those whose registration failed, and,
+    after ``_REGISTRATION_FAILURES_BEFORE_DEFERRING`` failures in a row (the
+    target is probably down), the rest. The next call tries them again.
+    """
+    pending = registry.pending(source.entity_sets())
+    if not pending:
+        return 0
+    logger.info("%s: registering %d new entity sets in FROST", source.source_name, len(pending))
+    failed: list[str] = []
+    failures_in_a_row = deferred = 0
+    for index, entity_set in enumerate(pending):
+        if failures_in_a_row >= _REGISTRATION_FAILURES_BEFORE_DEFERRING:
+            deferred = len(pending) - index
+            break
+        try:
+            result = await run_in_threadpool(client.register_entity_set, entity_set)
+        except Exception:
+            logger.warning(
+                "%s: registering entity set %s raised", source.source_name, entity_set.get("site_key"), exc_info=True
+            )
+            result = None
+        complete = _registration_complete(result)
+        registry.record(entity_set, complete)
+        if complete:
+            failures_in_a_row = 0
+        else:
+            failures_in_a_row += 1
+            failed.append(str(entity_set.get("site_key")))
+    if failed or deferred:
+        logger.warning(
+            "%s: %d of %d new entity sets not registered (%d failed%s); retrying next cycle: %s",
+            source.source_name,
+            len(failed) + deferred,
+            len(pending),
+            len(failed),
+            f", {deferred} deferred after {failures_in_a_row} failures in a row" if deferred else "",
+            ", ".join(failed[:5]) + (", ..." if len(failed) > 5 else ""),
+        )
+    else:
+        logger.info("%s: registered %d new entity sets", source.source_name, len(pending))
+    return len(failed) + deferred
+
+
 def _polling_stale_threshold(poll_seconds: int) -> int:
     """Seconds of no data after which a polling source is considered stalled."""
     return poll_seconds + max(0, settings.freshness_grace_seconds)
@@ -517,20 +636,14 @@ async def _polling_ingest_loop(source):
     # Eager registration: register entities before the first data fetch so we
     # don't lose readings if the first fetch succeeds but registration would
     # have been the next step.
-    entities_registered = False
-    entity_sets = source.entity_sets()
-    if entity_sets:
+    registry = _EntitySetRegistry()
+    if source.entity_sets():
         for attempt in range(1, 4):
-            try:
-                logger.info("%s: eagerly registering %d entity sets in FROST (attempt %d)", source.source_name, len(entity_sets), attempt)
-                for entity_set in entity_sets:
-                    await run_in_threadpool(client.register_entity_set, entity_set)
-                entities_registered = True
+            logger.info("%s: eagerly registering entity sets in FROST (attempt %d)", source.source_name, attempt)
+            if not await _register_new_entity_sets(source, registry):
                 break
-            except Exception:
-                logger.exception("%s: eager registration attempt %d failed", source.source_name, attempt)
-                if attempt < 3:
-                    await asyncio.sleep(10)
+            if attempt < 3:
+                await asyncio.sleep(10)
     else:
         logger.info("%s: no static entity sets; will register on first data fetch", source.source_name)
 
@@ -543,32 +656,29 @@ async def _polling_ingest_loop(source):
         try:
             readings = await source.fetch_readings()
             if readings:
-                # If eager registration failed, retry on data arrival
-                if not entities_registered:
-                    entity_sets = source.entity_sets()
-                    if entity_sets:
-                        try:
-                            logger.info("%s: retrying registration of %d entity sets", source.source_name, len(entity_sets))
-                            for entity_set in entity_sets:
-                                await run_in_threadpool(client.register_entity_set, entity_set)
-                            entities_registered = True
-                            if not last_timestamps:
-                                last_timestamps = await run_in_threadpool(
-                                    _seed_timestamps_from_frost, source.source_name
-                                )
-                        except Exception:
-                            logger.exception("%s: registration retry failed; pushing with cached IDs", source.source_name)
+                # Register the entity sets discovered since the last cycle, and
+                # retry those that failed, before pushing their readings.
+                registered_before = bool(registry.registered)
+                await _register_new_entity_sets(source, registry)
+                if registry.registered and not registered_before and not last_timestamps:
+                    # Nothing was seeded at startup; seed now that the entities exist.
+                    last_timestamps = await run_in_threadpool(
+                        _seed_timestamps_from_frost, source.source_name
+                    )
 
                 # Only push if entities are registered or we have cached IDs
                 # from a previous run. Pushing before registration generates
                 # thousands of DLQ entries on first boot for no reason.
-                if not entities_registered and not last_timestamps:
+                if not registry.registered and not last_timestamps:
                     logger.info(
                         "%s: skipping push (%d readings) — entities not yet registered",
                         source.source_name, len(readings),
                     )
-                    continue
-                new_readings = _dedup_readings(readings, last_timestamps)
+                    new_readings = []
+                else:
+                    new_readings = _dedup_readings(readings, last_timestamps)
+                    if not new_readings:
+                        logger.debug("%s: all %d readings already pushed, skipping", source.source_name, len(readings))
                 if new_readings:
                     _push_source = source.source_name.lower()
                     def _do_push(nr: list = new_readings, ps: str = _push_source) -> dict:
@@ -585,8 +695,6 @@ async def _polling_ingest_loop(source):
                         len(new_readings),
                         result.get("total_sent", 0),
                     )
-                else:
-                    logger.debug("%s: all %d readings already pushed, skipping", source.source_name, len(readings))
         except Exception as exc:
             logger.exception("%s polling cycle failed", source.source_name)
             from app.services.health_monitor import health_monitor
