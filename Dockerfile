@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app/ app/
 COPY scripts/ scripts/
 COPY config/ config/
+COPY entity_configs/ entity_configs/
 RUN mkdir -p data/sensor_images
 
 EXPOSE 8010

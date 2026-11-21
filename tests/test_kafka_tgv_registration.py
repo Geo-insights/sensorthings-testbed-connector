@@ -628,6 +628,37 @@ def test_readings_no_tgv_entity_set_defines_are_dropped_with_an_alert(caplog, mo
     assert "tgv-somewhere::temperature" in alerts[0][2]
 
 
+def test_without_any_tgv_entity_set_the_batch_is_held_not_dropped(monkeypatch) -> None:
+    """An empty entity_configs/ (missing from the image) must not drop the readings and commit the offsets."""
+    alerts: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "app.services.alerting.send_alert", lambda event, message, **kw: alerts.append((event, kw["level"]))
+    )
+    frost = _ScriptedFrost()
+    registration = TGVPrimaryRegistration([], client=frost)  # type: ignore[arg-type]
+    readings = _readings(_record())
+
+    for _ in range(2):
+        with pytest.raises(TGVRegistrationPending) as held:
+            registration.prepare_push(readings)
+        assert "no TGV entity set loaded" in str(held.value)
+    assert alerts == [("kafka.tgv_registration", "critical")]  # once per hold
+    assert frost.registrations == []
+    assert registration.prepare_push([]) == []  # an empty batch has nothing to hold
+
+
+def test_the_image_ships_every_directory_the_app_reads_configs_from() -> None:
+    """The Dockerfile copies entity_configs/ (TGV entity sets) and config/; without them TGV holds every batch."""
+    repo = Path(__file__).resolve().parents[1]
+    copies = {
+        line.split()[1].rstrip("/")
+        for line in (repo / "Dockerfile").read_text(encoding="utf-8").splitlines()
+        if line.startswith("COPY ")
+    }
+    assert {"app", "scripts", "config", "entity_configs"} <= copies
+    assert any((repo / "entity_configs").glob("tgv_*.yaml"))
+
+
 def test_a_new_primary_target_gets_the_entity_sets_registered_again() -> None:
     frost = _ScriptedFrost()
     registration = TGVPrimaryRegistration(client=frost)  # type: ignore[arg-type]
