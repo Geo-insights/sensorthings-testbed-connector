@@ -893,6 +893,8 @@ async def ohnics_push() -> dict:
     if not settings.ohnics_enabled:
         raise HTTPException(status_code=503, detail="Ohnics source is disabled. Set OHNICS_ENABLED=true.")
 
+    from starlette.concurrency import run_in_threadpool
+
     from app.main import _dedup_readings, _seed_timestamps_from_frost
     from app.services.ohnics_source import OhnicsPollingSource
 
@@ -901,20 +903,22 @@ async def ohnics_push() -> dict:
     if not readings:
         return {"source": "ohnics", "readings": 0, "pushed": 0, "message": "No readings fetched."}
 
-    # Register entity sets for discovered sensors before pushing
+    # Register entity sets for discovered sensors before pushing. The FROST
+    # calls below block (the seed for up to two minutes), so they run in the
+    # threadpool instead of on the event loop that serves every other request.
     entity_sets = source.entity_sets()
     reg_results = []
     for entity_set in entity_sets:
-        reg_results.append(client.register_entity_set(entity_set))
+        reg_results.append(await run_in_threadpool(client.register_entity_set, entity_set))
 
     # Dedup against what's already in FROST
-    last_timestamps = _seed_timestamps_from_frost("Ohnics")
+    last_timestamps = await run_in_threadpool(_seed_timestamps_from_frost, "Ohnics")
     new_readings = _dedup_readings(readings, last_timestamps)
 
     if not new_readings:
         return {"source": "ohnics", "readings": len(readings), "new": 0, "pushed": 0, "message": "All readings already in FROST."}
 
-    result = client.push_observations(new_readings)
+    result = await run_in_threadpool(client.push_observations, new_readings)
     return {
         "source": "ohnics",
         "readings": len(readings),

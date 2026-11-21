@@ -19,6 +19,7 @@ from app.logging_config import setup_logging
 from app.routes.connector import router as connector_router
 from app.routes.health import router as health_router
 from app.services.sensorthings_client import client
+from app.sta.canonical import resolve as resolve_canonical
 
 setup_logging(debug=settings.debug)
 logger = logging.getLogger("connector.events")
@@ -277,17 +278,54 @@ def _is_kafka_auth_error(exc: BaseException) -> bool:
     )
 
 
+def _mark_key(sensor_id: Any, observed_property: Any) -> str | None:
+    """High-water mark key ``sensor_id::observed_property``, or None without both.
+
+    The observed property is canonical (``app.sta.canonical.resolve``), so the
+    Ohnics Datastreams registered as "pm25" share a key with their "pm2_5"
+    readings. A name that is not canonical stays as it is.
+    """
+    if sensor_id is None or observed_property is None:
+        return None
+    sensor = str(sensor_id)
+    name = str(observed_property).strip()
+    if not sensor.strip() or not name:
+        return None
+    canonical = resolve_canonical(name)
+    return f"{sensor}::{canonical.value if canonical is not None else name}"
+
+
+def _reading_key(reading: Any) -> str:
+    """The high-water mark key of a reading."""
+    return _mark_key(reading.sensor_id, reading.observed_property) or f"{reading.sensor_id}::{reading.observed_property}"
+
+
 def _dedup_readings(
     readings: list,
     last_timestamps: dict[str, datetime],
 ) -> list:
-    """Filter out readings whose timestamp is <= the last-pushed value."""
+    """The readings not pushed yet: newer than their key's high-water mark, each once.
+
+    A reading at or before the mark of its ``_reading_key`` was pushed before.
+    Within the batch a repeat of an earlier reading (same key, timestamp, value
+    and sensor name) is dropped as well: the Sensor.Community API sometimes
+    lists a sensor twice for one timestamp. Readings of one key and timestamp
+    with different values, or from sensors of another type (the SC sensor name
+    carries it), all stay, since co-located sensors of one location share a
+    sensor_id.
+    """
     new = []
+    seen: set[tuple[str, datetime, Any, Any]] = set()
     for r in readings:
-        key = f"{r.sensor_id}::{r.observed_property}"
+        key = _reading_key(r)
         last_ts = last_timestamps.get(key)
-        if last_ts is None or r.timestamp > last_ts:
-            new.append(r)
+        if last_ts is not None and r.timestamp <= last_ts:
+            continue
+        identity = (key, r.timestamp, getattr(r, "value", None), getattr(r, "sensor_name", None))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        new.append(r)
     return new
 
 
@@ -295,10 +333,68 @@ def _update_timestamps(
     readings: list,
     last_timestamps: dict[str, datetime],
 ) -> None:
-    """Record the latest pushed timestamp per sensor+property."""
+    """Advance each key's high-water mark to the newest timestamp pushed for it.
+
+    Sources list readings in any order (Sensor.Community newest first), so a
+    mark is the latest timestamp of its key, not the last one listed.
+    """
     for r in readings:
-        key = f"{r.sensor_id}::{r.observed_property}"
-        last_timestamps[key] = r.timestamp
+        key = _reading_key(r)
+        last_ts = last_timestamps.get(key)
+        if last_ts is None or r.timestamp > last_ts:
+            last_timestamps[key] = r.timestamp
+
+
+# push_observations reports each reading it found no datastream for as a result
+# entry with this message (the routing follow-up adds "unresolved": True). Such
+# a reading is neither sent nor dead-lettered.
+_NO_DATASTREAM_MESSAGE = "No datastream mapping"
+
+
+def _is_unresolved(entry: Any) -> bool:
+    """Whether a ``push_observations`` result entry is a reading without a datastream."""
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("unresolved") is True:
+        return True
+    return entry.get("ok") is False and str(entry.get("message") or "").startswith(_NO_DATASTREAM_MESSAGE)
+
+
+def _primary_push_results(result: Any) -> list[Any] | None:
+    """The entries of a ``push_observations`` result for the primary FROST target.
+
+    None when it has none, as in preview mode. A multi-target result lists each
+    target's entries; should the primary not be among them, all of them count.
+    """
+    if not isinstance(result, dict):
+        return None
+    targets = result.get("targets")
+    if isinstance(targets, list):
+        listed = [target for target in targets if isinstance(target, dict)]
+        primary = (client._primary_base_url() or "").rstrip("/")
+        chosen = [t for t in listed if str(t.get("base_url") or "").rstrip("/") == primary] or listed
+        return [entry for target in chosen for entry in target.get("results") or []]
+    results = result.get("results")
+    return list(results) if isinstance(results, list) else None
+
+
+def _readings_to_mark(readings: list, result: Any) -> list:
+    """The pushed readings whose keys' high-water marks may advance.
+
+    Not those of a key that got no datastream on the primary target, as when
+    its entity set's registration failed or was deferred: they were not sent and
+    are not in the DLQ, so their marks stay, and a later cycle pushes them if
+    the source serves them again (inside its look-back window). A reading whose
+    POST failed is in the DLQ, which replays it, so its mark advances.
+    """
+    unresolved = {
+        key
+        for entry in _primary_push_results(result) or []
+        if _is_unresolved(entry) and (key := _mark_key(entry.get("sensor_id"), entry.get("observed_property")))
+    }
+    if not unresolved:
+        return readings
+    return [r for r in readings if _reading_key(r) not in unresolved]
 
 
 # -- Restart seeding ------------------------------------------------------------
@@ -309,11 +405,15 @@ def _update_timestamps(
 _SEED_PAGE_SIZE = 500
 _SEED_TIME_BUDGET_SECONDS = 120.0
 _SEED_REQUEST_TIMEOUT_SECONDS = 30.0
-# Each Datastream's newest Observation, expanded into the page. FROST answers it
-# with one index probe per Datastream where OBSERVATIONS is indexed on
-# (DATASTREAM_ID, PHENOMENON_TIME_START), as on frost.geo-insights.nl; without
-# that index it reads all of each Datastream's Observations.
-_SEED_NEWEST_OBSERVATION = "Observations($select=phenomenonTime;$orderby=phenomenonTime desc;$top=1)"
+# A page that fails is asked once more with this fraction of its rows.
+_SEED_RETRY_PAGE_DIVISOR = 5
+# Each Datastream's newest Observation with its parameters, expanded into the
+# page: push_observations writes the sensor_id and observed_property of the
+# reading into every Observation's parameters. FROST answers it with one index
+# probe per Datastream where OBSERVATIONS is indexed on (DATASTREAM_ID,
+# PHENOMENON_TIME_START), as on frost.geo-insights.nl; without that index it
+# reads all of each Datastream's Observations.
+_SEED_NEWEST_OBSERVATION = "Observations($select=phenomenonTime,parameters;$orderby=phenomenonTime desc;$top=1)"
 
 
 def _odata_string(value: str) -> str:
@@ -355,12 +455,20 @@ def _phenomenon_time_end(raw: Any) -> datetime | None:
     return ts if ts.tzinfo is not None else ts.replace(tzinfo=UTC)
 
 
-def _newest_observation_time(datastream: dict[str, Any]) -> datetime | None:
-    """phenomenonTime of the newest Observation expanded into a Datastream row."""
-    observations = datastream.get("Observations")
+def _newest_observation(datastream: Any) -> dict[str, Any] | None:
+    """The newest Observation expanded into a Datastream row, or None."""
+    observations = datastream.get("Observations") if isinstance(datastream, dict) else None
     if isinstance(observations, list) and observations and isinstance(observations[0], dict):
-        return _phenomenon_time_end(observations[0].get("phenomenonTime"))
+        return observations[0]
     return None
+
+
+def _label_key(entity: dict[str, Any], attribute: str) -> str | None:
+    """``_mark_key`` of the sensor_id and observed_property in an entity's ``attribute`` object."""
+    labels = entity.get(attribute)
+    if not isinstance(labels, dict):
+        return None
+    return _mark_key(labels.get("sensor_id"), labels.get("observed_property"))
 
 
 def _entity_id(row: dict[str, Any], fields: FrostODataFields) -> Any:
@@ -384,21 +492,29 @@ def _seed_timestamps_from_frost(
     time_budget_seconds: float = _SEED_TIME_BUDGET_SECONDS,
     request_timeout_seconds: float = _SEED_REQUEST_TIMEOUT_SECONDS,
 ) -> dict[str, datetime]:
-    """Newest phenomenonTime in FROST per ``sensor_id::observed_property`` of a source.
+    """Newest phenomenonTime in FROST per ``sensor_id::observed_property`` of a source's readings.
 
     Seeds a polling loop's high-water marks after a restart. Pages through all
     of the source's Datastreams on the primary target (``_seed_filter``) in id
     order, ``page_size`` per request, continuing after the last id while the
-    server reports a next page; works against SensorThings v1.1 and v2.0. Each
-    Datastream counts with the later of its newest Observation, expanded into
-    the page, and its own phenomenonTime. FROST's triggers keep the latter, but
-    it lags when Observations of one Datastream are inserted concurrently. When
-    a page with the expansion fails, it is asked again without it, and the rest
-    of the sweep relies on the Datastreams' phenomenonTime alone.
+    server reports a next page; works against SensorThings v1.1 and v2.0.
 
-    Best effort and bounded: stops when ``time_budget_seconds`` are used up or a
-    page fails, keeps what it has and never raises. A partial seed only means
-    that readings for the Datastreams it did not reach may be posted again.
+    A mark is keyed on the label push_observations wrote into the newest
+    Observation's parameters (``_mark_key``, observed property canonical): the
+    key of the reading it was. That is not always the Datastream's own key (its
+    properties): Samen Meten keys its Datastreams on the remote Thing's name but
+    its readings on the Thing's id. A newest Observation labelled for another
+    sensor or property (a TGV or misrouted reading, KNMI's old ``knmi-0``
+    label) marks only its own key, never the Datastream's, and an unlabelled one
+    marks nothing: a missing mark re-posts what the source serves again, a wrong
+    one drops readings FROST does not hold. That is also why the Datastream's
+    own phenomenonTime is not used: FROST keeps it over all rows in the
+    Datastream, foreign ones included, and it does not say whose row is newest.
+
+    Best effort and bounded: a page that fails is asked once more with a fifth
+    of its rows; when that fails too, or ``time_budget_seconds`` are used up,
+    the sweep stops, keeps what it has and never raises. A partial seed only
+    means that readings for the Datastreams it did not reach may be posted again.
     """
     base = (client._http.primary_base_url or "").rstrip("/")
     if not base:
@@ -413,10 +529,11 @@ def _seed_timestamps_from_frost(
     deadline = started + time_budget_seconds
     timestamps: dict[str, datetime] = {}
     last_id: Any = None
-    expand = True
-    pages = datastreams = without_key = without_observations = lagging = 0
+    top = max(1, page_size)
+    asking_again = False
+    retries: list[str] = []
+    pages = datastreams = own_key = other_key = unlabelled = without_observations = 0
     stopped: str | None = None
-    not_expanded: str | None = None
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -428,12 +545,11 @@ def _seed_timestamps_from_frost(
             page_filter = f"{source_filter} and {fields.id} gt {literal}"
         params = {
             "$filter": page_filter,
-            "$select": f"{fields.id},properties,phenomenonTime",
+            "$select": f"{fields.id},properties",
             "$orderby": f"{fields.id} asc",
-            "$top": str(page_size),
+            "$top": str(top),
+            "$expand": _SEED_NEWEST_OBSERVATION,
         }
-        if expand:
-            params["$expand"] = _SEED_NEWEST_OBSERVATION
         try:
             response = requests.get(
                 url, params=params, headers=headers, timeout=min(request_timeout_seconds, remaining)
@@ -444,29 +560,32 @@ def _seed_timestamps_from_frost(
             if not isinstance(page, list):
                 raise TypeError("'value' is not a list")
         except Exception as exc:
-            if expand:
-                expand = False
-                not_expanded = f"page {pages + 1} on ({_describe_request_error(exc)})"
+            reason = _describe_request_error(exc)
+            if not asking_again:
+                asking_again = True
+                top = max(1, top // _SEED_RETRY_PAGE_DIVISOR)
+                retries.append(f"page {pages + 1} asked again with {top} rows after {reason}")
                 continue
-            stopped = f"page {pages + 1} failed: {_describe_request_error(exc)}"
+            stopped = f"page {pages + 1} failed: {reason}"
             break
+        asking_again = False
         pages += 1
         for ds in page:
             datastreams += 1
-            props = ds.get("properties") if isinstance(ds, dict) else None
-            if not isinstance(props, dict) or not props.get("sensor_id") or not props.get("observed_property"):
-                without_key += 1
-                continue
-            ds_time = _phenomenon_time_end(ds.get("phenomenonTime"))
-            observation_time = _newest_observation_time(ds)
-            if ds_time is not None and observation_time is not None and observation_time > ds_time:
-                lagging += 1
-            ts = max((t for t in (ds_time, observation_time) if t is not None), default=None)
-            if ts is None:
+            newest = _newest_observation(ds)
+            ts = _phenomenon_time_end(newest.get("phenomenonTime")) if newest is not None else None
+            if newest is None or ts is None:
                 without_observations += 1
                 continue
-            key = f"{props['sensor_id']}::{props['observed_property']}"
-            # Several Datastreams can share a key: keep the newest.
+            key = _label_key(newest, "parameters")
+            if key is None:
+                unlabelled += 1
+                continue
+            if key == _label_key(ds, "properties"):
+                own_key += 1
+            else:
+                other_key += 1
+            # Several Datastreams can hold rows of one key: keep the newest.
             if key not in timestamps or ts > timestamps[key]:
                 timestamps[key] = ts
         if not (body.get(fields.next_link) or body.get("@iot.nextLink") or body.get("@nextLink")):
@@ -478,22 +597,19 @@ def _seed_timestamps_from_frost(
         last_id = next_id
 
     counts = (
-        f"{datastreams} datastreams in {pages} page(s), {without_observations} without observations, "
-        f"{without_key} without sensor_id/observed_property, {lagging} with a phenomenonTime behind "
-        f"their newest Observation, {time.monotonic() - started:.1f}s"
+        f"{datastreams} datastreams in {pages} page(s); newest Observation labelled with the datastream's "
+        f"key: {own_key}, with another key: {other_key}, unlabelled: {unlabelled}, none: {without_observations}; "
+        f"{time.monotonic() - started:.1f}s"
     )
-    if not_expanded:
-        counts += (
-            f"; newest Observations not expanded from {not_expanded}, so those datastreams count "
-            "with their own phenomenonTime, which can lag"
-        )
+    if retries:
+        counts += "; " + "; ".join(retries)
     if stopped:
         logger.warning(
             "Seeded %d timestamps from FROST for %s, incomplete (%s; %s): readings for the "
             "datastreams not reached may be posted again",
             len(timestamps), source_name, stopped, counts,
         )
-    elif not_expanded:
+    elif retries:
         logger.warning("Seeded %d timestamps from FROST for %s (%s)", len(timestamps), source_name, counts)
     else:
         logger.info("Seeded %d timestamps from FROST for %s (%s)", len(timestamps), source_name, counts)
@@ -515,6 +631,24 @@ def _entity_set_datastream_keys(entity_set: dict[str, Any]) -> frozenset[str]:
         if isinstance(sensor, dict)
         for observed_property in sensor.get("observed_properties") or []
     )
+
+
+def _entity_set_name(entity_set: dict[str, Any]) -> str:
+    """An entity set's Thing name, or its site_key when it has none: how logs name a set."""
+    thing = entity_set.get("thing")
+    name = thing.get("name") if isinstance(thing, dict) else None
+    return str(name) if name else str(entity_set.get("site_key"))
+
+
+def _entity_set_identity(entity_set: dict[str, Any]) -> str:
+    """Which entity set this is: its site_key and Thing name.
+
+    Most sources give all of their sets one site_key ("samen_meten",
+    "luchtmeetnet", "nl" for KNMI, "delft" for Ohnics, "bro", "tgv" for
+    Levellog, one per city for Meet je Stad), and the client registers a Thing
+    by its name, so the pair tells the sets apart.
+    """
+    return f"{entity_set.get('site_key')}::{_entity_set_name(entity_set)}"
 
 
 def _registration_complete(result: Any) -> bool:
@@ -541,35 +675,36 @@ def _registration_complete(result: Any) -> bool:
 class _EntitySetRegistry:
     """The entity sets a polling loop registered on the primary FROST target.
 
-    ``registered`` maps a set's ``site_key`` to the datastream keys its
-    registrations covered, so a set that gains a sensor or an observed property
-    counts as new again. ``failures`` counts failed registrations per
-    ``site_key``.
+    Both maps are kept per set (``_entity_set_identity``), not per site_key,
+    which most sources share across all of their sets. ``registered`` maps a set
+    to the datastream keys its registrations covered, so a set that gains a
+    sensor or an observed property counts as new again. ``failures`` counts a
+    set's failed registrations since its last complete one.
     """
 
     registered: dict[str, frozenset[str]] = field(default_factory=dict)
     failures: dict[str, int] = field(default_factory=dict)
 
     def is_registered(self, entity_set: dict[str, Any]) -> bool:
-        covered = self.registered.get(str(entity_set.get("site_key")))
+        covered = self.registered.get(_entity_set_identity(entity_set))
         return covered is not None and _entity_set_datastream_keys(entity_set) <= covered
 
     def pending(self, entity_sets: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """The sets not registered yet; those that failed before go last, so a
-        set that keeps failing cannot hold up new ones."""
+        """The sets not registered yet; those that failed more often go later, so
+        sets that keep failing cannot hold up new ones."""
         return sorted(
             (entity_set for entity_set in entity_sets if not self.is_registered(entity_set)),
-            key=lambda entity_set: self.failures.get(str(entity_set.get("site_key")), 0),
+            key=lambda entity_set: self.failures.get(_entity_set_identity(entity_set), 0),
         )
 
     def record(self, entity_set: dict[str, Any], complete: bool) -> None:
-        site_key = str(entity_set.get("site_key"))
+        identity = _entity_set_identity(entity_set)
         if complete:
-            covered = self.registered.get(site_key, frozenset())
-            self.registered[site_key] = covered | _entity_set_datastream_keys(entity_set)
-            self.failures.pop(site_key, None)
+            covered = self.registered.get(identity, frozenset())
+            self.registered[identity] = covered | _entity_set_datastream_keys(entity_set)
+            self.failures.pop(identity, None)
         else:
-            self.failures[site_key] = self.failures.get(site_key, 0) + 1
+            self.failures[identity] = self.failures.get(identity, 0) + 1
 
 
 async def _register_new_entity_sets(source: Any, registry: _EntitySetRegistry) -> int:
@@ -577,7 +712,14 @@ async def _register_new_entity_sets(source: Any, registry: _EntitySetRegistry) -
 
     Returns how many stay unregistered: those whose registration failed, and,
     after ``_REGISTRATION_FAILURES_BEFORE_DEFERRING`` failures in a row (the
-    target is probably down), the rest. The next call tries them again.
+    target is probably down), the rest. The next call tries them again. Logs
+    name the sets by their Thing names.
+
+    A source's first registration defers as well: it is the longest one (every
+    set of the source after a restart, 1,500+ for Sensor.Community), so against
+    a FROST that hangs it would hold the loop for one request timeout per set.
+    The readings of deferred sets lose nothing by it where the source serves
+    them again: they get no datastream, so their marks stay (``_readings_to_mark``).
     """
     pending = registry.pending(source.entity_sets())
     if not pending:
@@ -593,7 +735,7 @@ async def _register_new_entity_sets(source: Any, registry: _EntitySetRegistry) -
             result = await run_in_threadpool(client.register_entity_set, entity_set)
         except Exception:
             logger.warning(
-                "%s: registering entity set %s raised", source.source_name, entity_set.get("site_key"), exc_info=True
+                "%s: registering entity set %s raised", source.source_name, _entity_set_name(entity_set), exc_info=True
             )
             result = None
         complete = _registration_complete(result)
@@ -602,7 +744,7 @@ async def _register_new_entity_sets(source: Any, registry: _EntitySetRegistry) -
             failures_in_a_row = 0
         else:
             failures_in_a_row += 1
-            failed.append(str(entity_set.get("site_key")))
+            failed.append(_entity_set_name(entity_set))
     if failed or deferred:
         logger.warning(
             "%s: %d of %d new entity sets not registered (%d failed%s); retrying next cycle: %s",
@@ -684,16 +826,23 @@ async def _polling_ingest_loop(source):
                     def _do_push(nr: list = new_readings, ps: str = _push_source) -> dict:
                         return client.push_observations(nr, source=ps)
 
+                    # A push that raises advances no mark (the next cycle
+                    # tries again), and one that leaves readings without a
+                    # datastream on the primary target advances none of theirs.
                     result = await run_in_threadpool(_do_push)
-                    _update_timestamps(new_readings, last_timestamps)
+                    marked = _readings_to_mark(new_readings, result)
+                    _update_timestamps(marked, last_timestamps)
                     from app.services.health_monitor import health_monitor
                     health_monitor.record_source_success(source.source_name.lower())
                     logger.info(
-                        "%s push: readings=%d new=%d pushed=%s",
+                        "%s push: readings=%d new=%d pushed=%s%s",
                         source.source_name,
                         len(readings),
                         len(new_readings),
                         result.get("total_sent", 0),
+                        f" without_datastream={len(new_readings) - len(marked)} (their marks stay)"
+                        if len(marked) < len(new_readings)
+                        else "",
                     )
         except Exception as exc:
             logger.exception("%s polling cycle failed", source.source_name)
