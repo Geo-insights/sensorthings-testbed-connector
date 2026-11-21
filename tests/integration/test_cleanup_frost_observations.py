@@ -36,7 +36,7 @@ DB_USER = DB_NAME = "sensorthings"  # a throwaway database, as in docker-compose
 HTTP = requests.Session()  # keep-alive to FROST
 
 SC, SC_B = "sensor_community-93182", "sensor_community-91154"
-KNMI, KNMI_OTHER = "knmi-06344", "knmi-06260"
+KNMI, KNMI_OTHER, KNMI_OTHER_WIGOS = "knmi-06344", "knmi-06260", "knmi-0-20000-0-06260"
 TGV_OFFICE, TGV_HITTE, LEVELLOG = "tgv-officelab-climate", "tgv-hitteplein-climate-station", "tgv-levellog-abcd1234"
 CLIMATICS = "tgv-weather-climatics-rooftop-station"
 
@@ -45,6 +45,7 @@ THINGS: dict[str, tuple[str, dict[str, str], str, list[str]]] = {
     "sc": ("SensorCommunity 93182", {"source": "sensor_community", "site": "sensor_community_93182"}, SC,
            ["temperature", "humidity", "pressure", "pm10"]),
     "knmi": ("KNMI 06344", {"source": "knmi_weather", "site": "nl"}, KNMI, ["relative_humidity"]),
+    "knmi2": ("KNMI 06260", {"source": "knmi_weather", "site": "nl"}, KNMI_OTHER_WIGOS, ["relative_humidity"]),
     "tgv": ("TGV Office Lab", {"site": "tgv", "campus": "TU Delft", "source": "kafka"}, TGV_OFFICE,
             ["humidity", "temperature"]),
     "levellog": ("Levellog Put 1", {"site": "tgv", "campus": "TU Delft", "source": "levellog"}, LEVELLOG,
@@ -64,7 +65,9 @@ SEED: dict[str, tuple[str, int, str, tuple[str, str, str] | None]] = {
     "tgv_in_sc_hum": ("sc.humidity", 14, "45.2", (TGV_OFFICE, "humidity", "TGV Office Lab")),
     "knmi_hum_1": ("knmi.relative_humidity", 10, "88", (KNMI, "relative_humidity", "KNMI 06344")),
     "tgv_in_knmi": ("knmi.relative_humidity", 12, "77.7", (TGV_HITTE, "relative_humidity", "Hitteplein")),
+    # left alone: 'tgv-' labels that are not TGV Kafka readings: a Levellog sensor, a location other than 'tgv'
     "levellog_in_knmi": ("knmi.relative_humidity", 13, "-1.25", (LEVELLOG, "water_level", "Levellog Put 1")),
+    "tgv_noloc_in_sc": ("sc.humidity", 16, "46.0", (TGV_OFFICE, "humidity", "TGV Office Lab")),
     # left alone: TGV rows of TGV Things, and a TGV-labelled row in a datastream registered for it
     "tgv_own_1": ("tgv.humidity", 10, "45.0", (TGV_OFFICE, "humidity", "TGV Office Lab")),
     "tgv_own_dup_a": ("tgv.humidity", 11, "45.1", (TGV_OFFICE, "humidity", "TGV Office Lab")),
@@ -91,6 +94,12 @@ SEED: dict[str, tuple[str, int, str, tuple[str, str, str] | None]] = {
     "conf7_b": ("sc.pressure", 46, '{"a": 2}', (SC, "pressure", "SensorCommunity 93182")),
     "dup8_a": ("sc.pressure", 47, '{"a": 1}', (SC, "pressure", "SensorCommunity 93182")),
     "dup8_b": ("sc.pressure", 47, '{"a": 1}', (SC, "pressure", "SensorCommunity 93182")),
+    # co-located sensors: one sensor_id, told apart by sensor_name only: a conflict, not a duplicate
+    "coloc_a": ("sc.pressure", 48, "1019.0", (SC, "pressure", "SensorCommunity 93182")),
+    "coloc_b": ("sc.pressure", 48, "1019.0", (SC, "pressure", "SensorCommunity 93182")),
+    # no sensor_name on either side: equal
+    "noname_a": ("sc.pressure", 49, "1020.0", (SC, "pressure", "SensorCommunity 93182")),
+    "noname_b": ("sc.pressure", 49, "1020.0", (SC, "pressure", "SensorCommunity 93182")),
     "knmi_dup_a": ("knmi.relative_humidity", 30, "90", (KNMI, "relative_humidity", "KNMI 06344")),
     "knmi_dup_b": ("knmi.relative_humidity", 30, "90", (KNMI, "relative_humidity", "KNMI 06344")),
     # --misrouted-leftovers: PM10 readings of 93182 in its pressure datastream
@@ -102,10 +111,24 @@ SEED: dict[str, tuple[str, int, str, tuple[str, str, str] | None]] = {
     # --ids-file: KNMI cross-station rows
     "knmi_cross_1": ("knmi.relative_humidity", 20, "70", (KNMI_OTHER, "relative_humidity", "KNMI 06260")),
     "knmi_cross_2": ("knmi.relative_humidity", 21, "71", (KNMI_OTHER, "relative_humidity", "KNMI 06260")),
+    # --require-twin: the copy in the station's own datastream, posted under its WIGOS sensor_id
+    "knmi_cross_1_twin": ("knmi2.relative_humidity", 20, "70", (KNMI_OTHER, "relative_humidity", "KNMI 06260")),
+    "knmi_cross_3": ("knmi.relative_humidity", 22, "72", (KNMI_OTHER, "relative_humidity", "KNMI 06260")),
+    "knmi_cross_3_other": ("knmi2.relative_humidity", 22, "73", (KNMI_OTHER, "relative_humidity", "KNMI 06260")),
 }
 
-TGV_MISPLACED = {"tgv_in_sc_first", "tgv_in_sc_mid", "tgv_in_sc_last", "tgv_in_sc_hum", "tgv_in_knmi", "levellog_in_knmi"}
-DUPLICATES = {"dup1_b", "dup1_c", "dup6_b", "dup8_b", "knmi_dup_b"}
+# PARAMETERS that differ from the defaults _seed derives from the label tuple.
+PARAMS: dict[str, dict[str, Any]] = {
+    "tgv_noloc_in_sc": {"location": "delft"},
+    "coloc_b": {"sensor_name": "SensorCommunity 93182 BME280 sensor"},
+    "noname_a": {"sensor_name": None},
+    "noname_b": {"sensor_name": None},
+    "knmi_cross_1_twin": {"sensor_id": KNMI_OTHER_WIGOS},
+    "knmi_cross_3_other": {"sensor_id": KNMI_OTHER_WIGOS},
+}
+
+TGV_MISPLACED = {"tgv_in_sc_first", "tgv_in_sc_mid", "tgv_in_sc_last", "tgv_in_sc_hum", "tgv_in_knmi"}
+DUPLICATES = {"dup1_b", "dup1_c", "dup6_b", "dup8_b", "noname_b", "knmi_dup_b"}
 LEFTOVERS = {"lo_twin"}
 
 
@@ -192,7 +215,7 @@ def _seed(url: str) -> tuple[dict[str, int], dict[str, int]]:
                 "sensor_id": sensor_id, "sensor_name": f"{thing_name} sensor", "observed_property": prop,
                 "observed_property_name": prop, "unit": "1", "thing_name": thing_name,
                 "location": "tgv" if sensor_id.startswith("tgv-") else sensor_id.rsplit("-", 1)[-1],
-                "device_eui": None, "stream_key": None,
+                "device_eui": None, "stream_key": None, **PARAMS.get(label, {}),
             }
         ids[label] = _post(url, "Observations", json.dumps(body).replace('"__RESULT__"', raw))
     return ids, datastreams
@@ -326,6 +349,7 @@ def test_dry_runs_write_nothing(fresh: Stack, tmp_path: Path, capsys: pytest.Cap
     ids_file.write_text(f"{fresh.ids['knmi_cross_1']}\n", encoding="utf-8")
     archive = tmp_path / "never.jsonl"
     for selection in (["--tgv-misplaced"], ["--duplicates"], ["--misrouted-leftovers"], ["--ids-file", str(ids_file)],
+                      ["--ids-file", str(ids_file), "--require-twin"],
                       ["--tgv-misplaced", "--datastream", str(fresh.datastreams["sc.temperature"])]):
         assert _script(fresh, *selection, "--archive", str(archive)) == 0
         assert "Dry run: nothing was written." in capsys.readouterr().out
@@ -352,13 +376,14 @@ def test_tgv_misplaced_apply_refresh_and_restore(fresh: Stack, tmp_path: Path, c
 
     assert _script(fresh, "--tgv-misplaced") == 0
     out = capsys.readouterr().out
-    assert re.search(r"to delete: 6 in 3 datastreams", out)
+    assert re.search(r"to delete: 5 in 3 datastreams", out)
     assert re.search(r"left alone, in datastreams of TGV Things: 5\n", out)  # 4 TGV rows + the Levellog one
     assert re.search(r"left alone, in a datastream registered for their own sensor_id: 1\n", out)
+    assert re.search(r"left alone, not a TGV Kafka label \(a Levellog sensor, or location not 'tgv'\): 2\n", out)
 
     # Canary: one datastream only.
     assert _script(fresh, "--tgv-misplaced", "--apply", "--archive", str(archive), "--datastream", str(knmi)) == 0
-    assert _labels(fresh, set(seeded) - set(_rows(fresh))) == {"tgv_in_knmi", "levellog_in_knmi"}
+    assert _labels(fresh, set(seeded) - set(_rows(fresh))) == {"tgv_in_knmi"}  # not the Levellog row next to it
     capsys.readouterr()
 
     assert _script(fresh, "--tgv-misplaced", "--apply", "--archive", str(archive), "--batch-rows", "2") == 0
@@ -389,9 +414,9 @@ def test_duplicates_keep_the_lowest_id_and_leave_conflicts(fresh: Stack, tmp_pat
 
     assert _script(fresh, "--duplicates", "--chunk-rows", "5") == 0
     out = capsys.readouterr().out
-    assert re.search(r"exact duplicates to delete: 5 in 2 datastreams", out)
-    # conflicts: 41 (2 rows), 42 (3), 43 (2), 44 (2), 46 (2); the twin at 42 stays as well
-    assert re.search(r"conflicts \(same datastream and phenomenonTime, another value or label\): 5 times, 11 rows", out)
+    assert re.search(r"exact duplicates to delete: 6 in 2 datastreams", out)
+    # conflicts: 41 (2 rows), 42 (3), 43 (2), 44 (2), 46 (2), 48 (2: sensor_name); the twin at 42 stays as well
+    assert re.search(r"conflicts \(same datastream and phenomenonTime, another value or label\): 6 times, 13 rows", out)
     assert re.search(r"exact twins of another row of their group \(left as well\): 1\n", out)
     assert "left alone: 2 datastreams of TGV Things (5 rows)" in out  # with the twins at minute 11
 
@@ -448,6 +473,56 @@ def test_ids_file(fresh: Stack, tmp_path: Path, capsys: pytest.CaptureFixture[st
     assert _labels(fresh, deleted) == {"knmi_cross_1"}
 
     _round_trip(fresh, archive, seeded, {"knmi_cross_1"}, capsys)
+
+
+def test_ids_file_require_twin(fresh: Stack, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    seeded = _rows(fresh)
+    ids, ds = fresh.ids, fresh.datastreams
+    knmi, knmi2 = ds["knmi.relative_humidity"], ds["knmi2.relative_humidity"]
+    ids_file = tmp_path / "knmi_twins.csv"
+    ids_file.write_text(
+        "observation_id,datastream_id\n"
+        f"{ids['knmi_cross_1']},{knmi}\n"  # its copy is in its station's datastream (another sensor_id): deleted
+        f"{ids['knmi_cross_1_twin']},{knmi2}\n"  # that copy: KNMI 06344 is not its Thing nor its label's: stays
+        f"{ids['knmi_cross_3']},{knmi}\n"  # another value at that time in its station's datastream: stays
+        f"{ids['knmi_dup_a']},{knmi}\n"  # listed together, each the other's copy: the lower ID stays
+        f"{ids['knmi_dup_b']},{knmi}\n",
+        encoding="utf-8",
+    )
+    archive = tmp_path / "knmi.jsonl"
+
+    assert _script(fresh, "--ids-file", str(ids_file), "--require-twin") == 0
+    out = capsys.readouterr().out
+    assert "to delete: 2\n" in out
+    assert "left alone, no other row holds the same reading (--require-twin): 3" in out
+
+    assert _script(fresh, "--ids-file", str(ids_file), "--require-twin", "--apply", "--archive", str(archive)) == 0
+    assert "Verification: no rows left in the selection, as of now." in capsys.readouterr().out
+    deleted = set(seeded) - set(_rows(fresh))
+    assert _labels(fresh, deleted) == {"knmi_cross_1", "knmi_dup_b"}
+    assert _archived(archive) == {i: seeded[i] for i in deleted}
+
+    _round_trip(fresh, archive, seeded, {"knmi_cross_1", "knmi_dup_b"}, capsys)
+
+
+def test_require_twin_rechecks_the_copy_in_the_delete(fresh: Stack) -> None:
+    """The copy disappears between the read (and archive) and the DELETE: the listed row stays."""
+    run_sql = cleanup.pressure.psql_runner(cleanup.pressure.psql_argv(container=fresh.db), timeout=120)
+    knmi, obs_id = fresh.datastreams["knmi.relative_humidity"], fresh.ids["knmi_cross_1"]
+    twin = cleanup.twin_sql("o", "GEO_")
+    cands = cleanup.parse_candidates(
+        run_sql(cleanup.READ_ONLY_SESSION + cleanup.ids_read_sql([(obs_id, knmi)], set(), twin)))
+    assert [c.id for c in cands] == [obs_id]
+
+    _psql(fresh.db, f'DELETE FROM "OBSERVATIONS" WHERE "ID" = {fresh.ids["knmi_cross_1_twin"]};\n')
+    lines = run_sql(cleanup.WRITE_SESSION + cleanup.delete_sql(knmi, cands, twin))
+    assert cleanup.parse_counts(lines, "deleted") == [(knmi, 1, 0)]
+    assert obs_id in _rows(fresh)
+
+    _psql(fresh.db, RESET_SQL)  # the copy is back
+    lines = run_sql(cleanup.WRITE_SESSION + cleanup.delete_sql(knmi, cands, twin))
+    assert cleanup.parse_counts(lines, "deleted") == [(knmi, 1, 1)]
+    assert obs_id not in _rows(fresh)
 
 
 class _RowLock:

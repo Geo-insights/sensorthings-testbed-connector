@@ -8,9 +8,13 @@ duplicates are removed the same way.
 Selections (one per run; each is a dry run unless --apply is given)
 -------------------------------------------------------------------
 --tgv-misplaced
-    Rows labelled as TGV (The Green Village, Kafka) readings, PARAMETERS sensor_id
-    LIKE 'tgv-%', in a datastream whose Thing is not a TGV Thing and which was not
-    registered for that sensor_id. Until the routing fix the connector's cache
+    Rows labelled as TGV (The Green Village, Kafka lane) readings, in a datastream
+    whose Thing is not a TGV Thing and which was not registered for that sensor_id.
+    A TGV label: PARAMETERS sensor_id LIKE 'tgv-%' and location 'tgv' (the Kafka
+    lane sets both), but not sensor_id LIKE 'tgv-levellog-%': Levellog readings
+    also carry location 'tgv' and a 'tgv-' sensor_id, and are not TGV Kafka
+    readings. The dry run counts the other 'tgv-' labels it leaves alone. Until
+    the routing fix the connector's cache
     warm-up mapped bare stream keys ("humidity") to the first datastream listed
     with that streamKey, so TGV readings landed in Sensor.Community, KNMI, Ohnics
     and Samen Meten datastreams of the same property.
@@ -18,7 +22,11 @@ Selections (one per run; each is a dry run unless --apply is given)
     Exact duplicates within one datastream: the same DATASTREAM_ID,
     PHENOMENON_TIME_START, PHENOMENON_TIME_END, RESULT_TYPE, RESULT_NUMBER,
     RESULT_STRING, RESULT_BOOLEAN and RESULT_JSON (NULL-safe) and the same
-    PARAMETERS label (sensor_id, observed_property). The lowest ID is kept.
+    PARAMETERS label (sensor_id, observed_property, sensor_name). The lowest ID is
+    kept. sensor_name because co-located Sensor.Community sensors share a
+    sensor_id, and so a datastream: only sensor_name tells their readings apart.
+    Rows that differ in sensor_name are never duplicates (a missing sensor_name on
+    both sides counts as equal).
     RESULT_BOOLEAN and RESULT_JSON are compared too, so a boolean or JSON result
     is never taken for a duplicate of a different one. Rows that share a
     datastream and phenomenonTime but differ in value or label are conflicts:
@@ -31,7 +39,7 @@ Selections (one per run; each is a dry run unless --apply is given)
     'move-blocked': the datastream matching their label exists) but leaves in
     place because that datastream already has an observation at their
     phenomenonTime, when that observation is the same reading: the same label
-    (sensor_id, observed_property), phenomenon time and result. A different
+    (sensor_id, observed_property, sensor_name), phenomenon time and result. A different
     reading at that time is a conflict: reported, never deleted. The groups,
     labels and target datastreams come from that script's own catalogue, scan and
     plan (imported, not reimplemented). Run it after that script's --apply.
@@ -40,6 +48,16 @@ Selections (one per run; each is a dry run unless --apply is given)
     or a CSV whose header names an observation_id (or id) column and optionally a
     datastream_id column. A row that is no longer in its listed datastream is left
     alone. Blank lines and lines starting with '#' are skipped.
+    With --require-twin a listed row is deleted only while another row holds the
+    same reading (the --duplicates definition: phenomenon start and end, every
+    RESULT_* column and the label), checked by the dry run and again by each
+    DELETE: in the row's own datastream (the listed one) with a lower ID, or in
+    another datastream of the row's Thing or of the Thing its PARAMETERS
+    thing_name names (--prefix + thing_name). For KNMI rows (sensor_id 'knmi-%')
+    the station is PARAMETERS thing_name, not sensor_id: until 2026-11 their
+    sensor_id was the station's place in the EDR response. Use it for the twins
+    file of scripts/fix_knmi_observations.py: rows whose copy is in their own
+    station's datastream; one whose copy is gone by then is left alone.
 
 Never touched, by any selection or by --restore: rows of datastreams of TGV
 Things. TGV Things carry properties.site = 'tgv' and properties.source = 'kafka'
@@ -147,8 +165,9 @@ Runbook (production)
 4. --misrouted-leftovers, after the move script's --apply.
 5. Once the connector's dead-letter queue has expired (48 h after the deploy):
    the dry runs again, and --apply again where they find rows.
-6. --ids-file with the KNMI cross-station rows, if the KNMI lane lists them:
-   their conflict groups keep --duplicates away from those times.
+6. --ids-file knmi_twins.csv --require-twin, the twins file of
+   scripts/fix_knmi_observations.py: their conflict groups keep --duplicates
+   away from those times.
 7. --duplicates last: canary, then everything.
 8. Consider VACUUM (ANALYZE) "OBSERVATIONS" in a session with statement_timeout = 0:
    the dead rows stay below autovacuum's threshold (20% of the table).
@@ -162,7 +181,7 @@ Usage
     python scripts/cleanup_frost_observations.py --ssh ... --tgv-misplaced --apply --archive tgv.jsonl
     python scripts/cleanup_frost_observations.py --ssh ... --duplicates [--apply --archive duplicates.jsonl]
     python scripts/cleanup_frost_observations.py --ssh ... --misrouted-leftovers [--apply --archive leftovers.jsonl]
-    python scripts/cleanup_frost_observations.py --ssh ... --ids-file knmi_cross_station.csv [--apply --archive knmi.jsonl]
+    python scripts/cleanup_frost_observations.py --ssh ... --ids-file knmi_twins.csv --require-twin [--apply --archive knmi.jsonl]
     python scripts/cleanup_frost_observations.py --ssh ... --restore --archive tgv.jsonl [--apply] [--datastream ID]
     python scripts/cleanup_frost_observations.py --container <local-db-container> --duplicates
 """
@@ -219,7 +238,8 @@ WRITERS = (APP_NAME, pressure.WRITE_APP_NAME, _app_name_of(move.WRITE_SESSION, "
 
 # What two rows of one datastream and phenomenonTime must share to hold the same reading.
 READING_COLUMNS = ("PHENOMENON_TIME_END", "RESULT_TYPE", "RESULT_NUMBER", "RESULT_STRING", "RESULT_BOOLEAN", "RESULT_JSON")
-LABEL_KEYS = ("sensor_id", "observed_property")
+# sensor_name: co-located Sensor.Community sensors share a sensor_id, and so a datastream; only it tells them apart.
+LABEL_KEYS = ("sensor_id", "observed_property", "sensor_name")
 
 # Every session: the database stops statements after 60 s; fixed output formats, because
 # md5(row_to_json(row)) must come out the same in the read and in the DELETE.
@@ -283,10 +303,22 @@ def label(o: str, key: str) -> str:
     return f"""({o}."PARAMETERS"->>'{key}')"""
 
 
-def same_reading(a: str, b: str) -> str:
-    """Rows a and b hold the same reading: phenomenon end, every result column and the label; NULL-safe."""
+def station(o: str) -> str:
+    """The station of row o's label: thing_name for a KNMI row (sensor_id 'knmi-%': until 2026-11 that was the
+    station's place in the EDR response, which shifted), else sensor_id."""
+    sid = label(o, "sensor_id")
+    return f"(CASE WHEN {sid} LIKE 'knmi-%' THEN coalesce('knmi:' || {label(o, 'thing_name')}, {sid}) ELSE {sid} END)"
+
+
+def same_reading(a: str, b: str, *, by_station: bool = False) -> str:
+    """Rows a and b hold the same reading: phenomenon end, every result column and the label; NULL-safe.
+    With by_station, a KNMI row's sensor_id is compared as its station (see station())."""
     parts = [f'{a}."{c}" IS NOT DISTINCT FROM {b}."{c}"' for c in READING_COLUMNS]
-    parts += [f"{label(a, k)} IS NOT DISTINCT FROM {label(b, k)}" for k in LABEL_KEYS]
+    for k in LABEL_KEYS:
+        if by_station and k == "sensor_id":
+            parts.append(f"{station(a)} IS NOT DISTINCT FROM {station(b)}")
+        else:
+            parts.append(f"{label(a, k)} IS NOT DISTINCT FROM {label(b, k)}")
     return " AND ".join(parts)
 
 
@@ -295,8 +327,15 @@ def reading_key(x: str) -> str:
     return ", ".join([*(f'{x}."{c}"' for c in READING_COLUMNS), *(label(x, k) for k in LABEL_KEYS)])
 
 
-def tgv_label(o: str) -> str:
+def tgv_prefix(o: str) -> str:
     return f"{label(o, 'sensor_id')} LIKE 'tgv-%'"
+
+
+def tgv_label(o: str) -> str:
+    """Row o is labelled as a TGV Kafka-lane reading: a 'tgv-' sensor_id and location 'tgv' (the lane sets both),
+    and not a Levellog sensor ('tgv-levellog-', also at location 'tgv')."""
+    return (f"({tgv_prefix(o)} AND {label(o, 'sensor_id')} NOT LIKE 'tgv-levellog-%' "
+            f"AND coalesce({label(o, 'location')} = 'tgv', false))")
 
 
 def own_label(o: str, d: str) -> str:
@@ -758,18 +797,18 @@ def _merge_windows(windows: Sequence[tuple[int, int, int]], limit: int, span: in
 
 
 def tgv_scan_sql(where: str, key: int) -> str:
-    """TGV-labelled rows selected by ``where`` (on o): per datastream, label, FoI and class, and heap pages to touch."""
+    """'tgv-' labelled rows selected by ``where`` (on o): per datastream, label, FoI and class, and heap pages to touch."""
     return f"""
 WITH c AS (
     SELECT o."ID" AS id, o."DATASTREAM_ID" AS ds, o."FEATURE_ID" AS foi, o."PHENOMENON_TIME_START" AS t,
            {label("o", "sensor_id")} AS sid, {label("o", "observed_property")} AS prop,
-           CASE WHEN {protected_thing("th")} THEN 'protected' WHEN {own_label("o", "d")} THEN 'own' ELSE 'delete' END
-               AS class,
+           CASE WHEN {protected_thing("th")} THEN 'protected' WHEN NOT {tgv_label("o")} THEN 'other'
+                WHEN {own_label("o", "d")} THEN 'own' ELSE 'delete' END AS class,
            length(row_to_json(o)::text) AS len, (o.ctid::text::point)[0] AS page
       FROM "OBSERVATIONS" o
       JOIN "DATASTREAMS" d ON d."ID" = o."DATASTREAM_ID"
       JOIN "THINGS" th ON th."ID" = d."THING_ID"
-     WHERE {where} AND {tgv_label("o")}
+     WHERE {where} AND {tgv_prefix("o")}
 )
 SELECT json_build_object('t', 'tgv', 'w', {int(key)}, 'ds', ds, 'sid', sid, 'prop', prop, 'foi', foi, 'class', class,
                          'n', count(*), 'min_id', min(id), 'max_id', max(id), 'first', min(t), 'last', max(t),
@@ -810,8 +849,8 @@ class TgvGroup:
 
 class TgvSelection(Selection):
     name = TGV
-    summary = ("TGV-labelled rows (PARAMETERS sensor_id LIKE 'tgv-%') in datastreams of Things that are not TGV "
-               "Things and were not registered for that sensor_id")
+    summary = ("TGV-labelled rows (PARAMETERS sensor_id LIKE 'tgv-%' and location 'tgv', not 'tgv-levellog-%') in "
+               "datastreams of Things that are not TGV Things and were not registered for that sensor_id")
 
     def __init__(self, catalogue: Catalogue, args: argparse.Namespace) -> None:
         super().__init__(catalogue, args)
@@ -843,10 +882,11 @@ class TgvSelection(Selection):
         for g in self.groups:
             by_class[g.cls] += g.n
         delete = [g for g in self.groups if g.cls == "delete"]
-        print(f"\nTGV-labelled rows found: {sum(by_class.values()):,}")
+        print(f"\nRows with a 'tgv-' sensor_id found: {sum(by_class.values()):,}")
         print(f"  to delete: {by_class['delete']:,} in {len(self.plan.by_ds):,} datastreams")
         print(f"  left alone, in datastreams of TGV Things: {by_class['protected']:,}")
         print(f"  left alone, in a datastream registered for their own sensor_id: {by_class['own']:,}")
+        print(f"  left alone, not a TGV Kafka label (a Levellog sensor, or location not 'tgv'): {by_class['other']:,}")
         if not delete:
             return
         span: dict[str, list[str]] = defaultdict(list)
@@ -995,7 +1035,8 @@ def dup_recheck() -> str:
 class DuplicateSelection(Selection):
     name = DUPLICATES
     summary = ("exact duplicates within a datastream: same DATASTREAM_ID, PHENOMENON_TIME_START/END, "
-               "RESULT_TYPE/NUMBER/STRING/BOOLEAN/JSON and label (sensor_id, observed_property); the lowest ID stays")
+               "RESULT_TYPE/NUMBER/STRING/BOOLEAN/JSON and label (sensor_id, observed_property, sensor_name); "
+               "the lowest ID stays")
 
     def __init__(self, catalogue: Catalogue, args: argparse.Namespace) -> None:
         super().__init__(catalogue, args)
@@ -1238,29 +1279,45 @@ def _ids_rows(batch: Sequence[tuple[int, int | None]]) -> str:
             'JOIN "OBSERVATIONS" o ON o."ID" = v.id')
 
 
-def ids_class(only: set[int]) -> str:
+def twin_sql(o: str, prefix: str) -> str:
+    """--require-twin: another row holds the same reading as row o (the --duplicates definition, a KNMI row's
+    station by thing_name): in o's datastream with a lower ID, or in another datastream of o's Thing or of the Thing
+    o's thing_name label names. The lower ID keeps one copy of rows listed together in one DELETE."""
+    return f"""EXISTS (SELECT 1 FROM "OBSERVATIONS" x
+         WHERE x."DATASTREAM_ID" IN (
+                   SELECT td."ID" FROM "DATASTREAMS" td
+                    WHERE td."THING_ID" = (SELECT sd."THING_ID" FROM "DATASTREAMS" sd WHERE sd."ID" = {o}."DATASTREAM_ID")
+                       OR td."THING_ID" IN (SELECT tt."ID" FROM "THINGS" tt
+                                             WHERE tt."NAME" = {pressure.sql_literal(prefix)} || {label(o, 'thing_name')}))
+           AND x."PHENOMENON_TIME_START" = {o}."PHENOMENON_TIME_START"
+           AND (x."DATASTREAM_ID" <> {o}."DATASTREAM_ID" OR x."ID" < {o}."ID")
+           AND {same_reading("x", o, by_station=True)})"""
+
+
+def ids_class(only: set[int], twin: str | None = None) -> str:
     outside = f'o."DATASTREAM_ID" <> ALL({int_array(sorted(only))})' if only else "false"
+    no_twin = f"WHEN NOT {twin} THEN 'no-twin' " if twin else ""
     return (f"""CASE WHEN v.ds IS NOT NULL AND v.ds <> o."DATASTREAM_ID" THEN 'elsewhere' """
             f"""WHEN {outside} THEN 'outside' WHEN {protected_ds('o."DATASTREAM_ID"')} THEN 'protected' """
-            """ELSE 'delete' END""")
+            f"""{no_twin}ELSE 'delete' END""")
 
 
-def ids_scan_sql(batch: Sequence[tuple[int, int | None]], only: set[int]) -> str:
+def ids_scan_sql(batch: Sequence[tuple[int, int | None]], only: set[int], twin: str | None = None) -> str:
     return f"""
 SELECT json_build_object('t', 'ids', 'ds', a.ds, 'class', a.class, 'foi', a.foi, 'n', a.n, 'bytes', a.bytes,
                          'pages', a.pages)::text
-  FROM (SELECT o."DATASTREAM_ID" AS ds, {ids_class(only)} AS class, o."FEATURE_ID" AS foi, count(*) AS n,
+  FROM (SELECT o."DATASTREAM_ID" AS ds, {ids_class(only, twin)} AS class, o."FEATURE_ID" AS foi, count(*) AS n,
                sum(length(row_to_json(o)::text)) AS bytes, count(DISTINCT (o.ctid::text::point)[0]) AS pages
           FROM {_ids_rows(batch)}
          GROUP BY 1, 2, 3) a;
 """
 
 
-def ids_read_sql(batch: Sequence[tuple[int, int | None]], only: set[int]) -> str:
+def ids_read_sql(batch: Sequence[tuple[int, int | None]], only: set[int], twin: str | None = None) -> str:
     return candidates_sql(f"""
 SELECT o."DATASTREAM_ID" AS ds, o."ID" AS id, row_to_json(o)::text AS j
   FROM {_ids_rows(batch)}
- WHERE {ids_class(only)} = 'delete'""")
+ WHERE {ids_class(only, twin)} = 'delete'""")
 
 
 class IdsSelection(Selection):
@@ -1272,9 +1329,13 @@ class IdsSelection(Selection):
         self.listed = read_ids_file(args.ids_file)
         self.batches = _chunks(self.listed, args.page_rows)
         self.by_class: Counter[str] = Counter()
+        self.twin = twin_sql("o", args.prefix) if args.require_twin else None
+        if self.twin:
+            self.summary += (", each only while another row holds the same reading: in its datastream, or in another "
+                             "datastream of its Thing or of the Thing its thing_name names")
 
     def scan(self, run_sql: RunSql) -> None:
-        statements = [ids_scan_sql(batch, self.only) for batch in self.batches]
+        statements = [ids_scan_sql(batch, self.only, self.twin) for batch in self.batches]
         for r in _json_lines(run_reads(run_sql, statements, self.args.chunk, "checking the listed rows"), "ids"):
             self.by_class[str(r["class"])] += int(r["n"])
             if r["class"] == "delete":
@@ -1291,6 +1352,8 @@ class IdsSelection(Selection):
         print(f"  to delete: {self.by_class['delete']:,}")
         print(f"  left alone, in datastreams of TGV Things: {self.by_class['protected']:,}")
         print(f"  left alone, no longer in their listed datastream: {self.by_class['elsewhere']:,}")
+        if self.twin:
+            print(f"  left alone, no other row holds the same reading (--require-twin): {self.by_class['no-twin']:,}")
         if self.only:
             print(f"  left alone, outside --datastream: {self.by_class['outside']:,}")
         if self.plan.rows:
@@ -1300,14 +1363,15 @@ class IdsSelection(Selection):
             self._print_datastreams(self.plan.by_ds, "To delete, by datastream")
 
     def pages(self) -> list[Page]:
-        return [Page(_ids_page(batch, self.only), paged=False) for batch in self.batches] if self.plan.rows else []
+        return ([Page(_ids_page(batch, self.only, self.twin), paged=False) for batch in self.batches]
+                if self.plan.rows else [])
 
     def recheck(self) -> str:
-        return "true"
+        return self.twin or "true"
 
 
-def _ids_page(batch: Sequence[tuple[int, int | None]], only: set[int]) -> Callable[[int, int], str]:
-    return lambda after, limit: ids_read_sql(batch, only)
+def _ids_page(batch: Sequence[tuple[int, int | None]], only: set[int], twin: str | None) -> Callable[[int, int], str]:
+    return lambda after, limit: ids_read_sql(batch, only, twin)
 
 
 SELECTIONS: dict[str, type[Selection]] = {
@@ -1849,7 +1913,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--apply", action="store_true", help="write (default: dry run)")
     parser.add_argument("--datastream", type=int, action="append", metavar="ID",
                         help="limit to this datastream (repeatable), e.g. for a canary")
-    parser.add_argument("--prefix", default="GEO_", help="entity name prefix, for the move script's plan (%(default)s)")
+    parser.add_argument("--require-twin", action="store_true",
+                        help="with --ids-file: delete a listed row only while another row holds the same reading")
+    parser.add_argument("--prefix", default="GEO_", help="entity name prefix, for the move script's plan and the Thing "
+                                                         "a thing_name label names (%(default)s)")
     parser.add_argument("--range-ids", type=int, default=200_000,
                         help="observation IDs per scan statement (%(default)s)")
     parser.add_argument("--count-datastreams", type=int, default=100,
@@ -1876,6 +1943,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                      "--restore needs the --archive to restore from")
     if args.restore and not args.archive.is_file():
         parser.error(f"--archive {args.archive} does not exist")
+    if args.require_twin and args.ids_file is None:
+        parser.error("--require-twin goes with --ids-file")
     if args.ids_file is not None and not args.ids_file.is_file():
         parser.error(f"--ids-file {args.ids_file} does not exist")
     return args
