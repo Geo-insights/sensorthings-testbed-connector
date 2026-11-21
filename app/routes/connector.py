@@ -178,17 +178,25 @@ def kafka_push(
     finally:
         consumer.close()
 
+    from app.pipeline.kafka_tgv import TGVRegistrationPending, tgv_primary
+
     pulled = len(raw_records)
     readings = avro_batch_to_sensor_readings(raw_records)
     mapped = len(readings)
+    # As the Kafka loop: register the TGV entity sets on the primary target first and push TGV readings only
+    # into their datastreams there, never into an id kept from another server. Nothing was committed above.
+    try:
+        readings = tgv_primary.prepare_push(readings)
+    except TGVRegistrationPending as exc:
+        raise HTTPException(status_code=503, detail=f"TGV registration pending: {exc}") from exc
 
     if not readings:
         return {
             "pulled": pulled,
-            "mapped": 0,
+            "mapped": mapped,
             "pushed": 0,
             "failed": 0,
-            "message": "No mappable readings in batch.",
+            "message": "No mappable readings in batch." if not mapped else "No reading has a TGV datastream.",
         }
 
     push_result = client.push_observations(readings)
