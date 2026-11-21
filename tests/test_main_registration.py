@@ -1,12 +1,15 @@
 """The polling loop registers the entity sets a source discovers after startup.
 
 Before each push the loop registers the sets that are new since its last
-registration (or whose registration failed), and only those.
+registration (or whose registration failed), and only those. It tells the sets
+apart by site_key and Thing name: most sources give all of their sets one
+site_key.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import types
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -18,6 +21,8 @@ import app.main as main
 
 SOURCE = "registration_test_source"  # not a real source: keeps health_monitor state apart
 T0 = datetime(2026, 11, 20, 10, 0, tzinfo=UTC)
+# What client.register_entity_set returns when FROST refuses a set's Location (HTTP 400): for good.
+REFUSED = {"mode": "live", "primary_ok": True, "thing_id": "1", "location_id": None, "sensor_ids": {}, "datastream_ids": {}}
 
 
 class _Stop(BaseException):
@@ -29,14 +34,18 @@ class _Reading:
     sensor_id: str
     observed_property: str
     timestamp: datetime
+    value: float = 1.0
 
 
-def _set(site: str, *props: str) -> dict[str, Any]:
-    """An entity set with one sensor (``<site>-sensor``) observing ``props``."""
+def _set(name: str, *props: str, site_key: str | None = None, sensor_id: str | None = None) -> dict[str, Any]:
+    """An entity set: Thing ``name`` with one sensor (``<name>-sensor``) observing ``props``.
+
+    Its site_key is ``name`` unless given: most sources share one across their sets.
+    """
     return {
-        "site_key": site,
-        "thing": {"name": site},
-        "sensors": [{"sensor_id": f"{site}-sensor", "observed_properties": list(props or ("pm10",))}],
+        "site_key": site_key or name,
+        "thing": {"name": name},
+        "sensors": [{"sensor_id": sensor_id or f"{name}-sensor", "observed_properties": list(props or ("pm10",))}],
     }
 
 
@@ -88,7 +97,7 @@ class _Harness:
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self.events: list[tuple] = []
         self.seed: dict[str, datetime] = {}
-        # site_key -> scripted outcomes of its next registrations ("ok", "raise", or a result dict)
+        # Thing name -> scripted outcomes of its next registrations ("ok", "raise", or a result dict)
         self.outcomes: dict[str, list[Any]] = {}
         monkeypatch.setattr(main.client, "register_entity_set", self._register)
         monkeypatch.setattr(main.client, "push_observations", self._push)
@@ -96,9 +105,9 @@ class _Harness:
         monkeypatch.setattr(main, "asyncio", types.SimpleNamespace(sleep=self._sleep))
 
     def _register(self, entity_set: dict[str, Any]) -> dict[str, Any]:
-        site = entity_set["site_key"]
-        self.events.append(("register", site))
-        queue = self.outcomes.get(site)
+        name = entity_set["thing"]["name"]
+        self.events.append(("register", name))
+        queue = self.outcomes.get(name)
         outcome = queue.pop(0) if queue else "ok"
         if outcome == "raise":
             raise RuntimeError("FROST unreachable")
@@ -140,6 +149,10 @@ def _cycles(*events: tuple) -> list[list[tuple]]:
         elif cycles:
             cycles[-1].append(event)
     return cycles
+
+
+def _registered_in(cycle: list[tuple]) -> list[str]:
+    return [event[1] for event in cycle if event[0] == "register"]
 
 
 def test_new_entity_sets_are_registered_before_the_push_that_needs_them(harness):
@@ -243,9 +256,80 @@ def test_failures_in_a_row_defer_the_rest_to_the_next_cycle(harness):
     events = harness.run(source)
 
     first, second = _cycles(*events)
-    assert [e[1] for e in first if e[0] == "register"] == ["site-1", "site-2", "site-3"]
+    assert _registered_in(first) == ["site-1", "site-2", "site-3"]
     # Sets not tried yet go first, those that failed after them.
-    assert [e[1] for e in second if e[0] == "register"] == ["site-4", "site-5", "site-1", "site-2", "site-3"]
+    assert _registered_in(second) == ["site-4", "site-5", "site-1", "site-2", "site-3"]
+
+
+def test_sets_sharing_a_site_key_are_each_registered(harness):
+    # Ohnics gives all of its sets site_key "delft". A set whose datastream keys another
+    # set of that site_key registered before (here one sensor id on two Things) is still a
+    # set of its own, and its Thing, Location and Sensor need registering.
+    one = _set("Ohnics de-1", site_key="delft", sensor_id="ohnics-shared")
+    two = _set("Ohnics de-2", site_key="delft", sensor_id="ohnics-shared")
+    reading = _Reading("ohnics-shared", "pm10", T0)
+    source = _Source([([one], [reading]), ([one, two], [reading])], harness.events)
+
+    harness.run(source)
+
+    assert harness.registrations() == ["Ohnics de-1", "Ohnics de-2"]
+
+
+def test_permanently_failing_sets_sharing_a_site_key_do_not_starve_new_ones(harness):
+    """Luchtmeetnet gives every station site_key "luchtmeetnet"; FROST refuses three of them for good."""
+    stations = [_set(f"Luchtmeetnet NL0{n}", site_key="luchtmeetnet") for n in range(1, 6)]
+    discovered_later = _set("Luchtmeetnet NL99", site_key="luchtmeetnet")
+    for n in (2, 3, 4):
+        harness.outcomes[f"Luchtmeetnet NL0{n}"] = [REFUSED] * 10
+    readings = [_Reading("Luchtmeetnet NL01-sensor", "no2", T0)]
+    source = _Source(
+        [(stations, readings)] + [([*stations, discovered_later], readings)] * 3,
+        harness.events,
+    )
+
+    events = harness.run(source)
+
+    first, second, third, fourth = _cycles(*events)
+    # Three failures in a row defer NL05...
+    assert _registered_in(first) == [f"Luchtmeetnet NL0{n}" for n in (1, 2, 3, 4)]
+    # ...which goes first next time, with the station discovered since; the failing ones after them.
+    assert _registered_in(second) == [
+        "Luchtmeetnet NL05", "Luchtmeetnet NL99", "Luchtmeetnet NL02", "Luchtmeetnet NL03", "Luchtmeetnet NL04",
+    ]
+    assert _registered_in(third) == _registered_in(fourth) == [f"Luchtmeetnet NL0{n}" for n in (2, 3, 4)]
+
+
+def test_deferred_sets_take_turns_with_the_failing_ones(harness):
+    # Four sets FROST always refuses and one fine set behind them: deferral never parks a set for good.
+    sets = [_set(f"Luchtmeetnet NL0{n}", site_key="luchtmeetnet") for n in range(1, 6)]
+    for n in (1, 2, 3, 4):
+        harness.outcomes[f"Luchtmeetnet NL0{n}"] = [REFUSED] * 10
+    source = _Source([(sets, [_Reading("x", "no2", T0)])] * 3, harness.events)
+
+    events = harness.run(source)
+
+    first, second, third = _cycles(*events)
+    assert _registered_in(first) == [f"Luchtmeetnet NL0{n}" for n in (1, 2, 3)]
+    assert _registered_in(second) == ["Luchtmeetnet NL04", "Luchtmeetnet NL05", "Luchtmeetnet NL01",
+                                      "Luchtmeetnet NL02", "Luchtmeetnet NL03"]
+    assert _registered_in(third) == [f"Luchtmeetnet NL0{n}" for n in (4, 1, 2)]
+
+
+def test_sets_that_failed_are_named_by_their_things(harness, caplog):
+    stations = [_set(f"Luchtmeetnet NL0{n}", site_key="luchtmeetnet") for n in range(1, 6)]
+    for n in (2, 3, 4):
+        harness.outcomes[f"Luchtmeetnet NL0{n}"] = ["raise"]
+    source = _Source([(stations, [_Reading("x", "no2", T0)])], harness.events)
+
+    with caplog.at_level(logging.WARNING, logger="connector.events"):
+        harness.run(source)
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert f"{SOURCE}: registering entity set Luchtmeetnet NL02 raised" in warnings
+    assert (
+        f"{SOURCE}: 4 of 5 new entity sets not registered (3 failed, 1 deferred after 3 failures in a row); "
+        "retrying next cycle: Luchtmeetnet NL02, Luchtmeetnet NL03, Luchtmeetnet NL04"
+    ) in warnings
 
 
 def test_skipped_push_waits_for_the_next_cycle(harness):
@@ -312,3 +396,17 @@ def test_eager_registration_retries_what_failed(harness):
 )
 def test_registration_complete(result, complete):
     assert main._registration_complete(result) is complete
+
+
+@pytest.mark.parametrize(
+    ("entity_set", "identity", "name"),
+    [
+        (_set("Luchtmeetnet Vredepeel", site_key="luchtmeetnet"), "luchtmeetnet::Luchtmeetnet Vredepeel",
+         "Luchtmeetnet Vredepeel"),
+        ({"site_key": "bro", "thing": {}}, "bro::bro", "bro"),
+        ({"site_key": "bro"}, "bro::bro", "bro"),
+    ],
+)
+def test_entity_set_identity_and_name(entity_set, identity, name):
+    assert main._entity_set_identity(entity_set) == identity
+    assert main._entity_set_name(entity_set) == name
