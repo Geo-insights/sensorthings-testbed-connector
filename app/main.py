@@ -414,8 +414,11 @@ _SEED_RETRY_PAGE_DIVISOR = 5
 # reading into every Observation's parameters. FROST answers it with one index
 # probe per Datastream where OBSERVATIONS is indexed on (DATASTREAM_ID,
 # PHENOMENON_TIME_START), as on frost.geo-insights.nl; without that index it
-# reads all of each Datastream's Observations.
-_SEED_NEWEST_OBSERVATION = "Observations($select=phenomenonTime,parameters;$orderby=phenomenonTime desc;$top=1)"
+# reads all of each Datastream's Observations. The Datastream's Thing name says
+# whether that Observation's station is the Datastream's own (``_same_thing``).
+_SEED_NEWEST_OBSERVATION = (
+    "Observations($select=phenomenonTime,parameters;$orderby=phenomenonTime desc;$top=1),Thing($select=name)"
+)
 
 
 def _odata_string(value: str) -> str:
@@ -473,6 +476,35 @@ def _label_key(entity: dict[str, Any], attribute: str) -> str | None:
     return _mark_key(labels.get("sensor_id"), labels.get("observed_property"))
 
 
+def _unprefixed(name: str) -> str:
+    """``name`` without the configured entity name prefix."""
+    prefix = settings.entity_name_prefix.strip()
+    return name[len(prefix):] if prefix and name.startswith(prefix) else name
+
+
+def _same_thing(observation: dict[str, Any], datastream: dict[str, Any]) -> bool:
+    """Whether the reading behind ``observation`` came from the Datastream's own Thing.
+
+    push_observations writes the reading's Thing name, without the entity name
+    prefix, into the Observation's ``parameters.thing_name``; the Datastream's
+    Thing (expanded by the seed) carries it with the prefix. Both are compared
+    without the prefix. An Observation or Datastream without a Thing name never
+    matches.
+    """
+    parameters = observation.get("parameters")
+    thing = datastream.get("Thing")
+    written = parameters.get("thing_name") if isinstance(parameters, dict) else None
+    registered = thing.get("name") if isinstance(thing, dict) else None
+    if not isinstance(written, str) or not isinstance(registered, str) or not written.strip():
+        return False
+    return _unprefixed(written) == _unprefixed(registered)
+
+
+def _property_of_key(key: str) -> str:
+    """The (canonical) observed property of a ``_mark_key``."""
+    return key.rpartition("::")[2]
+
+
 def _entity_id(row: dict[str, Any], fields: FrostODataFields) -> Any:
     """``@iot.id`` (v1.1) or ``id`` (v2.0) of an entity row, or None."""
     for name in (fields.id, "@iot.id", "id"):
@@ -506,12 +538,24 @@ def _seed_timestamps_from_frost(
     key of the reading it was. That is not always the Datastream's own key (its
     properties): Samen Meten keys its Datastreams on the remote Thing's name but
     its readings on the Thing's id. A newest Observation labelled for another
-    sensor or property (a TGV or misrouted reading, KNMI's old ``knmi-0``
-    label) marks only its own key, never the Datastream's, and an unlabelled one
-    marks nothing: a missing mark re-posts what the source serves again, a wrong
-    one drops readings FROST does not hold. That is also why the Datastream's
-    own phenomenonTime is not used: FROST keeps it over all rows in the
-    Datastream, foreign ones included, and it does not say whose row is newest.
+    sensor or property (a TGV or misrouted reading, another KNMI station's)
+    marks only its own key, never the Datastream's, and an unlabelled one marks
+    nothing: a missing mark re-posts what the source serves again, a wrong one
+    drops readings FROST does not hold. That is also why the Datastream's own
+    phenomenonTime is not used: FROST keeps it over all rows in the Datastream,
+    foreign ones included, and it does not say whose row is newest.
+
+    One exception: a row of the Datastream's own Thing (``_same_thing``:
+    ``parameters.thing_name`` is the Thing's name without the entity name
+    prefix) and observed property, labelled with an older sensor id of that
+    Thing, marks the Datastream's key too. That is the same station's reading
+    under an id that was moved since: ``scripts/migrate_knmi_sensor_ids.py``
+    moves KNMI Datastreams from ``knmi-<position>`` to WIGOS ids and leaves
+    the Observations' labels; without this mark every KNMI Datastream's latest
+    value is posted again under the new label, a row that duplicate cleanup
+    cannot pair with the original. Such a mark fills only a key that no row is
+    labelled with: a key's own rows always decide its mark (for Samen Meten,
+    whose Datastream keys no reading uses, the extra mark is never read).
 
     Best effort and bounded: a page that fails is asked once more with a fifth
     of its rows; when that fails too, or ``time_budget_seconds`` are used up,
@@ -530,11 +574,13 @@ def _seed_timestamps_from_frost(
     started = time.monotonic()
     deadline = started + time_budget_seconds
     timestamps: dict[str, datetime] = {}
+    # Datastream keys marked by their own Thing's rows under an older sensor id.
+    inherited: dict[str, datetime] = {}
     last_id: Any = None
     top = max(1, page_size)
     asking_again = False
     retries: list[str] = []
-    pages = datastreams = own_key = other_key = unlabelled = without_observations = 0
+    pages = datastreams = own_key = other_key = earlier_id = unlabelled = without_observations = 0
     stopped: str | None = None
     while True:
         remaining = deadline - time.monotonic()
@@ -583,10 +629,19 @@ def _seed_timestamps_from_frost(
             if key is None:
                 unlabelled += 1
                 continue
-            if key == _label_key(ds, "properties"):
+            datastream_key = _label_key(ds, "properties")
+            if key == datastream_key:
                 own_key += 1
             else:
                 other_key += 1
+                if (
+                    datastream_key is not None
+                    and _property_of_key(key) == _property_of_key(datastream_key)
+                    and _same_thing(newest, ds)
+                ):
+                    earlier_id += 1
+                    if datastream_key not in inherited or ts > inherited[datastream_key]:
+                        inherited[datastream_key] = ts
             # Several Datastreams can hold rows of one key: keep the newest.
             if key not in timestamps or ts > timestamps[key]:
                 timestamps[key] = ts
@@ -598,9 +653,14 @@ def _seed_timestamps_from_frost(
             break
         last_id = next_id
 
+    # A key's own rows decide its mark; an inherited one only fills a key without any.
+    for datastream_key, ts in inherited.items():
+        timestamps.setdefault(datastream_key, ts)
+
     counts = (
         f"{datastreams} datastreams in {pages} page(s); newest Observation labelled with the datastream's "
         f"key: {own_key}, with another key: {other_key}, unlabelled: {unlabelled}, none: {without_observations}; "
+        f"of the other keys, the datastream's Thing and property under an older sensor id: {earlier_id}; "
         f"{time.monotonic() - started:.1f}s"
     )
     if retries:

@@ -27,7 +27,7 @@ from app.sources import ohnics, samen_meten
 BASE = "https://frost.test/FROST-Server/v1.1"
 BASE_V2 = "https://frost.test/FROST-Server/v2.0"
 AUTH = {"Authorization": "Basic dGVzdDp0ZXN0"}
-EXPAND = "Observations($select=phenomenonTime,parameters;$orderby=phenomenonTime desc;$top=1)"
+EXPAND = "Observations($select=phenomenonTime,parameters;$orderby=phenomenonTime desc;$top=1),Thing($select=name)"
 SC_FILTER = "Thing/properties/source eq 'sensor_community'"
 OWN = ("own", "label")  # sentinel: the newest Observation is labelled with its Datastream's own key
 
@@ -90,13 +90,17 @@ def _ds(
     ds_time: Any = None,
     v2: bool = False,
     expanded: bool = True,
+    thing: str | None = None,
+    written_thing: str | None = None,
 ) -> dict[str, Any]:
     """A Datastream row with its newest Observation (phenomenonTime ``newest``) expanded.
 
     ``label`` is the (sensor_id, observed_property) that push_observations wrote
     into that Observation's parameters: by default the Datastream's own, None
     for an Observation without parameters. ``ds_time`` is the Datastream's own
-    phenomenonTime, which FROST's triggers keep over all of its rows.
+    phenomenonTime, which FROST's triggers keep over all of its rows. ``thing``
+    is the name of the Datastream's Thing (expanded), ``written_thing`` the
+    ``thing_name`` push_observations wrote into the Observation's parameters.
     """
     props: dict[str, Any] = {"site_key": "x"}
     if sensor_id:
@@ -106,6 +110,8 @@ def _ds(
     row: dict[str, Any] = {("id" if v2 else "@iot.id"): ds_id, "properties": props}
     if ds_time is not None:
         row["phenomenonTime"] = ds_time
+    if expanded and thing is not None:
+        row["Thing"] = {("id" if v2 else "@iot.id"): 1, "name": thing}
     if expanded:
         row["Observations"] = []
         if newest is not None:
@@ -114,6 +120,8 @@ def _ds(
                 label = (sensor_id, prop)
             if label is not None:
                 observation["parameters"] = {"sensor_id": label[0], "observed_property": label[1], "unit": "ug/m3"}
+                if written_thing is not None:
+                    observation["parameters"]["thing_name"] = written_thing
             row["Observations"].append(observation)
     return row
 
@@ -145,13 +153,16 @@ def _reading(sensor_id: str, prop: str, at: str, value: float = 1.0) -> SensorRe
     )
 
 
-def _stored(readings: list[Any], datastream_of: dict[str, tuple[str, str]]) -> list[dict[str, Any]]:
+def _stored(
+    readings: list[Any], datastream_of: dict[str, tuple[str, str]], thing: str | None = None,
+) -> list[dict[str, Any]]:
     """The Datastream rows FROST serves after ``readings`` were pushed.
 
     ``datastream_of`` routes a reading's ``sensor_id::observed_property`` to the
     (sensor_id, observed_property) in its Datastream's properties. Each
-    Datastream's newest Observation is labelled with its reading's own keys, as
-    push_observations writes them into the parameters.
+    Datastream's newest Observation is labelled with its reading's own keys and
+    Thing name, as push_observations writes them into the parameters; ``thing``
+    is the name of the Datastream's Thing on FROST (with the entity name prefix).
     """
     newest: dict[tuple[str, str], Any] = {}
     for reading in readings:
@@ -159,7 +170,8 @@ def _stored(readings: list[Any], datastream_of: dict[str, tuple[str, str]]) -> l
         if target not in newest or reading.timestamp > newest[target].timestamp:
             newest[target] = reading
     return [
-        _ds(n, sensor_id, prop, reading.timestamp.isoformat(), label=(reading.sensor_id, reading.observed_property))
+        _ds(n, sensor_id, prop, reading.timestamp.isoformat(), label=(reading.sensor_id, reading.observed_property),
+            thing=thing, written_thing=reading.thing_name)
         for n, ((sensor_id, prop), reading) in enumerate(sorted(newest.items()), start=1)
     ]
 
@@ -372,22 +384,35 @@ class _FakeSamenMeten:
 
 
 def test_samen_meten_restart_reposts_nothing(monkeypatch):
-    """Samen Meten keys its Datastreams on the remote Thing's name, its readings on the Thing's id."""
+    """Samen Meten keys its Datastreams on the remote Thing's name, its readings on the Thing's id.
+
+    The readings are the Datastream's own Thing's, so the Datastream's key
+    (sm-<name>) is marked as well as the readings' (sm-<id>). No Samen Meten
+    reading has a sm-<name> key, so that mark is never read: dedup is decided
+    by the sm-<id> marks alone, as before.
+    """
     from app.services.samen_meten_source import SamenMetenPollingSource
 
     source = SamenMetenPollingSource()
     source._client = _FakeSamenMeten()
     readings = asyncio.run(source._do_fetch_readings())
-    (sensor,) = source.entity_sets()[0]["sensors"]
+    entity_set = source.entity_sets()[0]
+    (sensor,) = entity_set["sensors"]
     assert {r.sensor_id for r in readings} == {"sm-4711"} and sensor["sensor_id"] == "sm-ohn_gm-2138"
-    _use_target(monkeypatch, BASE)
+    assert {r.thing_name for r in readings} == {entity_set["thing"]["name"]} == {"SamenMeten OHN_gm-2138"}
+    _use_target(monkeypatch, BASE, prefix="GEO_")
     _serve(monkeypatch, _page(_stored(readings, {
         f"sm-4711::{prop}": (sensor["sensor_id"], prop) for prop in sensor["observed_properties"]
-    })))
+    }, thing=f"GEO_{entity_set['thing']['name']}")))
 
     seeded = main._seed_timestamps_from_frost("samen_meten")
 
-    assert seeded == {"sm-4711::pm2_5": _utc("2026-11-20T09:10:00"), "sm-4711::pm10": _utc("2026-11-20T09:10:00")}
+    newest = _utc("2026-11-20T09:10:00")
+    assert seeded == {
+        "sm-4711::pm2_5": newest, "sm-4711::pm10": newest,
+        "sm-ohn_gm-2138::pm2_5": newest, "sm-ohn_gm-2138::pm10": newest,
+    }
+    assert not {main._reading_key(r) for r in readings} & {"sm-ohn_gm-2138::pm2_5", "sm-ohn_gm-2138::pm10"}
     # The restarted loop's look-back serves the same Observations again: none is posted twice.
     assert main._dedup_readings(readings, seeded) == []
     later = samen_meten.parse_observations(
@@ -413,11 +438,11 @@ def test_ohnics_restart_reposts_nothing_although_its_datastreams_say_pm25(monkey
     (sensor,) = source.entity_sets()[0]["sensors"]
     assert sorted(sensor["observed_properties"]) == ["air_temperature", "pm25"]
     assert sorted(r.observed_property for r in readings) == ["air_temperature", "pm2_5"]
-    _use_target(monkeypatch, BASE)
+    _use_target(monkeypatch, BASE, prefix="GEO_")
     _serve(monkeypatch, _page(_stored(readings, {
         "ohnics-de-1::pm2_5": ("ohnics-de-1", "pm25"),
         "ohnics-de-1::air_temperature": ("ohnics-de-1", "air_temperature"),
-    })))
+    }, thing=f"GEO_{source.entity_sets()[0]['thing']['name']}")))
 
     seeded = main._seed_timestamps_from_frost("ohnics")
 
@@ -448,36 +473,135 @@ def test_labels_are_compared_and_marked_canonical(monkeypatch, caplog):
     assert "labelled with the datastream's key: 3, with another key: 0," in caplog.text
 
 
-def test_knmi_datastreams_moved_to_station_ids_are_posted_again_once_and_lose_nothing(monkeypatch):
-    """fix/knmi-station-ids moves KNMI Datastreams' sensor_id from knmi-0 to station ids.
+KNMI_A = "KNMI KNMI-52.1-5.18"  # parameters.thing_name of station A's readings
+KNMI_B = "KNMI KNMI-52.46-4.56"
+WIGOS_A = "knmi-0-20000-0-06260"
+WIGOS_B = "knmi-0-20000-0-06225"
 
-    Their Observations keep the knmi-0 label until the first reading with the
-    new id lands, so the new keys have no mark: their readings are posted again
-    once, not dropped. The next restart marks them.
+
+def test_knmi_datastreams_moved_to_wigos_ids_keep_their_marks(monkeypatch, caplog):
+    """scripts/migrate_knmi_sensor_ids.py moves KNMI Datastreams from knmi-<position> to WIGOS ids.
+
+    Their Observations keep the old label until the first reading with the new
+    id lands. The newest row is the Datastream's own Thing's (parameters.thing_name
+    is the Thing's name without the GEO_ prefix) and property, so the WIGOS key
+    is marked too: the restarted loop posts nothing again. Without that mark
+    every KNMI Datastream's latest value was posted once more under the WIGOS
+    label, a row duplicate cleanup cannot pair with the original.
     """
-    _use_target(monkeypatch, BASE)
+    _use_target(monkeypatch, BASE, prefix="GEO_")
     _serve(
         monkeypatch,
         _page([
-            _ds(1, "knmi-06344", "temperature", _instant("10:00"), label=("knmi-0", "temperature")),
-            _ds(2, "knmi-06260", "temperature", _instant("09:50"), label=("knmi-0", "temperature")),
-        ]),
-        _page([
-            _ds(1, "knmi-06344", "temperature", _instant("10:10")),
-            _ds(2, "knmi-06260", "temperature", _instant("09:50"), label=("knmi-0", "temperature")),
+            _ds(1, WIGOS_A, "temperature", _instant("10:00"), label=("knmi-5", "temperature"),
+                thing=f"GEO_{KNMI_A}", written_thing=KNMI_A),
+            _ds(2, WIGOS_A, "humidity", _instant("10:00"), label=("knmi-5", "humidity"),
+                thing=f"GEO_{KNMI_A}", written_thing=KNMI_A),
+            # The same Thing's row of another property (misplaced) does not mark the Datastream's key.
+            _ds(3, WIGOS_A, "ground_temperature", _instant("10:00"), label=("knmi-5", "temperature"),
+                thing=f"GEO_{KNMI_A}", written_thing=KNMI_A),
+            # A row written without thing_name in its parameters marks nothing extra.
+            _ds(4, WIGOS_B, "temperature", _instant("09:50"), label=("knmi-7", "temperature"),
+                thing=f"GEO_{KNMI_B}"),
         ]),
     )
 
-    before = main._seed_timestamps_from_frost("knmi_weather")
-    readings = [_reading("knmi-06344", "temperature", "10:00:00"), _reading("knmi-06260", "temperature", "09:50:00")]
-    after = main._seed_timestamps_from_frost("knmi_weather")
+    with caplog.at_level(logging.INFO, logger="connector.events"):
+        seeded = main._seed_timestamps_from_frost("knmi_weather")
 
-    assert before == {"knmi-0::temperature": _utc("2026-11-20T10:00:00")}
-    assert main._dedup_readings(readings, before) == readings
-    assert after == {
-        "knmi-06344::temperature": _utc("2026-11-20T10:10:00"),
-        "knmi-0::temperature": _utc("2026-11-20T09:50:00"),
+    ten = _utc("2026-11-20T10:00:00")
+    assert seeded == {
+        "knmi-5::temperature": ten,
+        "knmi-5::humidity": ten,
+        f"{WIGOS_A}::temperature": ten,
+        f"{WIGOS_A}::humidity": ten,
+        "knmi-7::temperature": _utc("2026-11-20T09:50:00"),
     }
+    assert "with another key: 4," in caplog.text
+    assert "of the other keys, the datastream's Thing and property under an older sensor id: 2;" in caplog.text
+    # The restarted loop's look-back serves 10:00 again under the WIGOS id: nothing is posted twice.
+    again = [_reading(WIGOS_A, "temperature", "10:00:00"), _reading(WIGOS_A, "humidity", "10:00:00")]
+    assert main._dedup_readings(again, seeded) == []
+    later = [_reading(WIGOS_A, "temperature", "10:10:00"), _reading(WIGOS_A, "ground_temperature", "10:00:00"),
+             _reading(WIGOS_B, "temperature", "09:50:00")]
+    assert main._dedup_readings(later, seeded) == later
+
+
+def test_without_an_entity_name_prefix_thing_names_compare_as_they_are(monkeypatch):
+    _use_target(monkeypatch, BASE)
+    _serve(monkeypatch, _page([
+        _ds(1, WIGOS_A, "temperature", _instant("10:00"), label=("knmi-5", "temperature"),
+            thing=KNMI_A, written_thing=KNMI_A),
+        _ds(2, WIGOS_B, "temperature", _instant("10:00"), label=("knmi-7", "temperature"),
+            thing=f"GEO_{KNMI_B}", written_thing=KNMI_B),
+    ]))
+
+    seeded = main._seed_timestamps_from_frost("knmi_weather")
+
+    assert f"{WIGOS_A}::temperature" in seeded
+    assert f"{WIGOS_B}::temperature" not in seeded  # GEO_ is not the prefix here: another name
+
+
+def test_another_stations_row_never_marks_the_datastream_key(monkeypatch):
+    """Station B's reading in station A's Datastream (the old position shift put it there).
+
+    Same property, an older KNMI id, but parameters.thing_name names B: A's key
+    gets no mark and A's next reading is posted.
+    """
+    _use_target(monkeypatch, BASE, prefix="GEO_")
+    _serve(monkeypatch, _page([
+        _ds(1, WIGOS_A, "temperature", _instant("10:00"), label=("knmi-1", "temperature"),
+            thing=f"GEO_{KNMI_A}", written_thing=KNMI_B),
+    ]))
+
+    seeded = main._seed_timestamps_from_frost("knmi_weather")
+
+    assert seeded == {"knmi-1::temperature": _utc("2026-11-20T10:00:00")}
+    fresh = [_reading(WIGOS_A, "temperature", "09:55:00")]
+    assert main._dedup_readings(fresh, seeded) == fresh
+
+
+def test_foreign_rows_never_mark_the_datastream_key(monkeypatch):
+    """A TGV row in an Ohnics Datastream and a misrouted Sensor.Community row, both of the
+    Datastream's own observed property: their Things are others, so only their own keys are marked."""
+    _use_target(monkeypatch, BASE, prefix="GEO_")
+    _serve(monkeypatch, _page([
+        _ds(1, "ohnics-DELFT-1", "air_temperature", _instant("10:57"),
+            label=("tgv-weatherstation-1", "air_temperature"),
+            thing="GEO_Ohnics DELFT-1", written_thing="TGV weatherstation 1"),
+        _ds(2, "sc-10", "pm10", _instant("10:40"), label=("sc-11", "P1"),
+            thing="GEO_SensorCommunity 10", written_thing="SensorCommunity 11"),
+    ]))
+
+    seeded = main._seed_timestamps_from_frost("ohnics")
+
+    assert seeded == {
+        "tgv-weatherstation-1::air_temperature": _utc("2026-11-20T10:57:00"),
+        "sc-11::pm10": _utc("2026-11-20T10:40:00"),
+    }
+    fresh = [_reading("ohnics-DELFT-1", "air_temperature", "10:55:00"), _reading("sc-10", "pm10", "10:30:00")]
+    assert main._dedup_readings(fresh, seeded) == fresh
+
+
+def test_rows_labelled_with_a_key_decide_its_mark_over_an_older_sensor_id(monkeypatch):
+    """A key that rows are labelled with keeps the mark of those rows, even an older one.
+
+    Datastream 1 (WIGOS_A) holds A's 10:30 row under knmi-5; datastream 2 holds
+    a 10:00 row labelled WIGOS_A. 10:00 is the mark: what is newer may be posted
+    again, never dropped.
+    """
+    _use_target(monkeypatch, BASE, prefix="GEO_")
+    _serve(monkeypatch, _page([
+        _ds(1, WIGOS_A, "temperature", _instant("10:30"), label=("knmi-5", "temperature"),
+            thing=f"GEO_{KNMI_A}", written_thing=KNMI_A),
+        _ds(2, "knmi-5", "temperature", _instant("10:00"), label=(WIGOS_A, "temperature"),
+            thing=f"GEO_{KNMI_A}", written_thing=KNMI_A),
+    ]))
+
+    seeded = main._seed_timestamps_from_frost("knmi_weather")
+
+    assert seeded[f"{WIGOS_A}::temperature"] == _utc("2026-11-20T10:00:00")
+    assert seeded["knmi-5::temperature"] == _utc("2026-11-20T10:30:00")
 
 
 @pytest.mark.parametrize(
