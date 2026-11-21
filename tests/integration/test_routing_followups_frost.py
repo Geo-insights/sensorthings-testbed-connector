@@ -126,7 +126,7 @@ def frost_root() -> Iterator[str]:
         _wait_until_ready(root)
         yield root
     finally:
-        _docker("rm", "-f", frost, db, check=False)
+        _docker("rm", "-f", "-v", frost, db, check=False)  # -v: the database image's anonymous volume
         _docker("network", "rm", net, check=False)
 
 
