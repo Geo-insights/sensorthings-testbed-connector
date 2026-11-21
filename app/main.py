@@ -39,7 +39,8 @@ def _consume_and_push_once(consumer, max_messages: int = 500, timeout: float = 5
     records = consumer.consume_batch(max_messages=max_messages, timeout=timeout)
     if not records:
         return {"pulled": 0}
-    # Registers the TGV entity sets on the primary FROST target first, and raises (batch not committed) until one is.
+    # Registers the TGV entity sets on the primary FROST target first, and raises (batch not committed) while
+    # any reading belongs to a set that is not registered yet.
     readings = tgv_primary.prepare_push(avro_batch_to_sensor_readings(records))
     if settings.frost_async_push_enabled:
         # Decoupled path: hand the readings to the background FROST worker and
