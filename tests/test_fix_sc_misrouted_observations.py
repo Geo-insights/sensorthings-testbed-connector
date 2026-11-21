@@ -7,13 +7,18 @@ throwaway FROST-Server 2.8 + PostGIS.
 
 from __future__ import annotations
 
+import argparse
 import json
+import os
+import re
 import shutil
 import socket
 import subprocess
 import time
 import uuid
+from collections import Counter
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -133,46 +138,149 @@ def _line(**fields: Any) -> str:
     return json.dumps(fields)
 
 
-class FakeDb:
-    """Answers the script's statements from fixed rows and records every session."""
+_DS_PROPS = {1386: "pressure", 1388: "pm10", 1389: "pm2_5"}  # datastreams of one Thing (10), FoI 110
+_SID, _THING = "sensor_community-93182", "SensorCommunity 93182"
+_VALUES_ID = re.compile(r"\((\d+)::bigint, ")
+_STATE_ROW = re.compile(r"\((\d+)::bigint, ([^,()]+)::double precision, (true|false)\)")
 
-    def __init__(self, ids_file: Path | None = None) -> None:
-        self.sessions: list[str] = []
+
+@dataclass
+class _Obs:
+    ds: int
+    prop: str
+    num: float | None = 12.0
+    foi: int | None = 110
+    dup: bool = False  # its datastream-to-be already has an observation at its phenomenonTime
+
+
+class FakeDb:
+    """psql on the FROST database, in memory: answers the script's statements by their JSON tag.
+
+    It keeps where every observation is, so plans, moves, rollbacks and refreshes can be
+    followed end to end; it does not evaluate SQL (the integration tests below run the real
+    SQL on FROST 2.8). fail_at makes the n-th move or restore statement fail, as a lock
+    timeout would.
+    """
+
+    def __init__(self, ids_file: Path | None = None, observations: dict[int, _Obs] | None = None) -> None:
+        self.obs = observations if observations is not None else {
+            11: _Obs(1386, "pm10", num=12.0),
+            12: _Obs(1386, "pm10", num=2500.0, dup=True),
+        }
         self.ids_file = ids_file
-        self.rows_served = False
+        self.sessions: list[str] = []
         self.recorded_before_write: list[bool] = []
+        self.busy: list[str] = []
+        self.busy_while_writing: list[str] = []  # sessions that show up once the run has sent a write
+        self.fail_at: set[int] = set()
+        self.stuck: set[int] = set()  # rows a restore does not move, as if another writer put them back at once
+        self.writes = 0
+        self.refreshed: list[list[int]] = []  # the datastreams of each refresh session
 
     def __call__(self, sql: str) -> list[str]:
         self.sessions.append(sql)
-        if "'t', 'ds'" in sql:
-            return [
-                _line(t="ds", id=1386, name="GEO_SensorCommunity 93182 sensor - Air pressure", thing_id=10,
-                      thing="GEO_SensorCommunity 93182", source="sensor_community",
-                      sensor_id="sensor_community-93182", prop="pressure"),
-                _line(t="ds", id=1388, name="GEO_SensorCommunity 93182 sensor - PM10", thing_id=10,
-                      thing="GEO_SensorCommunity 93182", source="sensor_community",
-                      sensor_id="sensor_community-93182", prop="pm10"),
-                _line(t="foi", thing_id=10, locations=1, foi=110, fois=1),
-                _line(t="bounds", min=1, max=450_000),
-            ]
-        if "'t', 'grp'" in sql:
-            return [_line(t="grp", ds=1386, sid="sensor_community-93182", prop="pm10", thing="SensorCommunity 93182",
-                          loc="93182", n=2, min_id=11, max_id=12, first="2026-11-12T14:12:23+00:00",
-                          last="2026-11-12T14:17:23+00:00")] if "BETWEEN 1 AND" in sql or '= 1386' in sql else []
-        if "'t', 'dup'" in sql:
+        if 'UPDATE "DATASTREAMS"' in sql:
+            self.refreshed.append([int(i) for i in re.findall(r'WHERE d\."ID" = (\d+);', sql)])
             return []
+        if "'t', 'busy'" in sql:
+            return [*self.busy, *(self.busy_while_writing if self.writes else [])]
+        if "'t', 'ds'" in sql:
+            return self._catalogue()
+        if "'t', 'grp'" in sql:
+            return self._groups(sql)
         if "'t', 'row'" in sql:
-            if self.rows_served:
-                return []
-            self.rows_served = True
-            return [_line(t="row", id=11, foi=110, dup=False), _line(t="row", id=12, foi=110, dup=True)]
-        if "moved AS" in sql:
-            recorded = self.ids_file is not None and '"rows":[[11,110]]' in self.ids_file.read_text(encoding="utf-8")
-            self.recorded_before_write.append(recorded)
-            return [_line(t="moved", n=1)]
-        if "restored AS" in sql:
-            return [_line(t="restored", n=1)]
-        return []
+            return self._batch(sql)
+        if "moved AS" in sql or "restored AS" in sql:
+            return self._write(sql)
+        if "'t', 'rbstate'" in sql:
+            return [self._state(statement) for statement in sql.split(";\n") if "'t', 'rbstate'" in statement]
+        return []  # duplicates: none
+
+    def _catalogue(self) -> list[str]:
+        lines = [
+            _line(t="ds", id=ds, name=f"GEO_{_THING} sensor - {prop}", thing_id=10, thing=f"GEO_{_THING}",
+                  source="sensor_community", sensor_id=_SID, prop=prop)
+            for ds, prop in _DS_PROPS.items()
+        ]
+        return [*lines, _line(t="foi", thing_id=10, locations=1, foi=110, fois=1), _line(t="bounds", min=1, max=450_000)]
+
+    def _groups(self, sql: str) -> list[str]:
+        scoped = {int(ds) for ds in re.findall(r'WHERE o\."DATASTREAM_ID" = (\d+) AND', sql)}
+        groups: dict[tuple[int, str], list[int]] = {}
+        for i, o in sorted(self.obs.items()):
+            if o.prop != _DS_PROPS.get(o.ds) and (not scoped or o.ds in scoped):
+                groups.setdefault((o.ds, o.prop), []).append(i)
+        return [
+            _line(t="grp", ds=ds, sid=_SID, prop=prop, thing=_THING, loc="93182", n=len(ids), min_id=min(ids),
+                  max_id=max(ids), first="2026-11-12T14:12:23+00:00", last="2026-11-12T14:17:23+00:00")
+            for (ds, prop), ids in groups.items()
+        ]
+
+    def _batch(self, sql: str) -> list[str]:
+        where = re.search(r'WHERE o\."DATASTREAM_ID" = (\d+) AND o\."ID" > (\d+)', sql)
+        prop = re.search(r"'observed_property' IS NOT DISTINCT FROM '([^']*)'", sql)
+        limit = re.search(r"LIMIT (\d+);", sql)
+        assert where is not None and prop is not None and limit is not None
+        ds, after = int(where[1]), int(where[2])
+        rows = [(i, o) for i, o in sorted(self.obs.items()) if o.ds == ds and o.prop == prop[1] and i > after]
+        return [_line(t="row", id=i, foi=o.foi, num=o.num, dup=o.dup) for i, o in rows[: int(limit[1])]]
+
+    def _write(self, sql: str) -> list[str]:
+        listed = [int(i) for i in _VALUES_ID.findall(sql)]
+        if self.ids_file is not None and "moved AS" in sql:
+            text = self.ids_file.read_text(encoding="utf-8")
+            self.recorded_before_write.append(all(f"[{i}," in text for i in listed))
+        self.writes += 1
+        if self.writes in self.fail_at:
+            raise fix.PsqlError("psql exited with 3: ERROR:  canceling statement due to lock timeout")
+        new = re.search(r'SET "DATASTREAM_ID" = (\d+)', sql)
+        now = re.search(r'WHERE o\."ID" = v\.id AND o\."DATASTREAM_ID" = (\d+)', sql)
+        assert new is not None and now is not None
+        count = 0
+        for i in listed:
+            if i in self.obs and self.obs[i].ds == int(now[1]) and not ("restored AS" in sql and i in self.stuck):
+                self.obs[i].ds = int(new[1])
+                count += 1
+        return [_line(t="moved" if "moved AS" in sql else "restored", n=count)]
+
+    def _state(self, statement: str) -> str:
+        label = re.search(r"'batch', '([^']*)'", statement)
+        to_ds = re.search(r"""'in_to', count\(\*\) FILTER \(WHERE o\."DATASTREAM_ID" = (\d+)\)""", statement)
+        from_ds = re.search(r"""'in_from', count\(\*\) FILTER \(WHERE o\."DATASTREAM_ID" = (\d+)\)""", statement)
+        assert label is not None and to_ds is not None and from_ds is not None
+        counts: Counter[str] = Counter()
+        for i, num, known in _STATE_ROW.findall(statement):
+            counts["listed"] += 1
+            o = self.obs.get(int(i))
+            if o is None:
+                counts["missing"] += 1
+                continue
+            counts["in_to"] += o.ds == int(to_ds[1])
+            counts["in_from"] += o.ds == int(from_ds[1])
+            recorded = None if num == "NULL" else float(num)
+            counts["changed"] += o.ds == int(to_ds[1]) and known == "true" and o.num != recorded
+        return _line(t="rbstate", batch=label[1], **{k: counts[k] for k in ("listed", "in_to", "in_from", "missing", "changed")})
+
+
+def _apply(ids_file: Path, *extra: str) -> argparse.Namespace:
+    return fix.parse_args(["--container", "db", "--apply", "--ids-file", str(ids_file), *extra])
+
+
+def _rollback(ids_file: Path, *extra: str) -> argparse.Namespace:
+    return fix.parse_args(["--container", "db", "--rollback", "--ids-file", str(ids_file), *extra])
+
+
+def _ids_file(path: Path, *records: dict[str, Any]) -> Path:
+    path.write_text("".join(json.dumps(r) + "\n" for r in (fix.IDS_HEADER, *records)), encoding="utf-8")
+    return path
+
+
+def _move_record(batch: str, from_ds: int, to_ds: int, rows: list[list[Any]], to_foi: int | None = None) -> dict[str, Any]:
+    return {"op": "move", "batch": batch, "from_ds": from_ds, "to_ds": to_ds, "to_foi": to_foi, "rows": rows}
+
+
+def _writes(db: FakeDb) -> list[str]:
+    return [sql for sql in db.sessions if not sql.startswith(fix.READ_ONLY_SESSION)]
 
 
 def test_dry_run_only_opens_read_only_sessions(tmp_path) -> None:
@@ -193,9 +301,8 @@ def test_dry_run_only_opens_read_only_sessions(tmp_path) -> None:
 def test_apply_records_every_batch_before_writing_it_and_skips_duplicates(tmp_path, capsys) -> None:
     ids_file = tmp_path / "moved.jsonl"
     db = FakeDb(ids_file)
-    args = fix.parse_args(["--container", "db", "--apply", "--ids-file", str(ids_file)])
 
-    assert fix.run(args, db) == 0
+    assert fix.run(_apply(ids_file), db) == 0
 
     assert db.recorded_before_write == [True]
     (move_sql,) = [sql for sql in db.sessions if "moved AS" in sql]
@@ -204,39 +311,328 @@ def test_apply_records_every_batch_before_writing_it_and_skips_duplicates(tmp_pa
     assert 'o."DATASTREAM_ID" = 1386' in move_sql  # only while still in the source
     assert "(11::bigint, 110::bigint)" in move_sql and "12::bigint" not in move_sql  # 12 is a duplicate
     assert 'SET "DATASTREAM_ID" = 1388, "FEATURE_ID" = o."FEATURE_ID"' in move_sql  # same Thing: FoI kept
-    refreshed = [sql for sql in db.sessions if 'UPDATE "DATASTREAMS"' in sql]
-    assert refreshed and 'd."ID" = 1386' in refreshed[0] and 'd."ID" = 1388' in refreshed[0]
+    assert db.refreshed == [[1386, 1388]]
     records = [json.loads(line) for line in ids_file.read_text(encoding="utf-8").splitlines()]
-    assert [r["op"] for r in records] == ["run", "move", "committed"]
-    assert records[1] | {"batch": None} == {
-        "op": "move", "batch": None, "from_ds": 1386, "to_ds": 1388, "to_foi": None, "rows": [[11, 110]],
+    assert records[0] == fix.IDS_HEADER
+    assert [r["op"] for r in records[1:]] == ["run", "move", "committed"]
+    assert records[2] | {"batch": None} == {  # with each row's FEATURE_ID and RESULT_NUMBER before the move
+        "op": "move", "batch": None, "from_ds": 1386, "to_ds": 1388, "to_foi": None, "rows": [[11, 110, 12.0]],
     }
     assert "Moved 1 observations (1 left in place" in capsys.readouterr().out
 
 
-def test_rollback_moves_recorded_rows_back_with_their_feature_ids(tmp_path) -> None:
-    ids_file = tmp_path / "moved.jsonl"
-    ids_file.write_text(
-        json.dumps({"op": "move", "batch": "b1", "from_ds": 1386, "to_ds": 2016, "to_foi": 120,
-                    "rows": [[11, 110], [12, None]]}) + "\n" + json.dumps({"op": "committed", "batch": "b1", "moved": 2}) + "\n",
-        encoding="utf-8",
-    )
-    db = FakeDb(ids_file)
+def test_batches_read_each_rows_result_number() -> None:
+    planned = fix.PlannedGroup(fix.Group(1386, _SID, "pm10", _THING, min_id=1, max_id=9), fix.MOVE,
+                               _catalogue().datastreams[1388])
+    assert """'num', o."RESULT_NUMBER\"""" in fix.batch_select_sql(planned, 0, 10)
 
-    assert fix.run(fix.parse_args(["--container", "db", "--rollback", "--ids-file", str(ids_file)]), db) == 0
+
+def test_only_the_same_reading_in_the_target_keeps_a_row_in_place() -> None:
+    """Another row at that phenomenonTime (e.g. another misrouted row, which moves away itself) must not strand
+    it: only a row with the same label, time and result is a duplicate, as the cleanup script's --duplicates."""
+    planned = fix.PlannedGroup(fix.Group(1386, _SID, "pm10", _THING, min_id=1, max_id=9), fix.MOVE,
+                               _catalogue().datastreams[1388])
+    for sql in (fix.batch_select_sql(planned, 0, 10), fix.duplicates_sql(planned)):
+        assert fix.same_reading_sql(1388) in sql
+    same = fix.same_reading_sql(1388)
+    assert 'x."DATASTREAM_ID" = 1388' in same
+    assert 'x."PHENOMENON_TIME_START" = o."PHENOMENON_TIME_START"' in same
+    for key in ("sensor_id", "observed_property"):
+        assert f"""x."PARAMETERS"->>'{key}' IS NOT DISTINCT FROM o."PARAMETERS"->>'{key}'""" in same
+    for column in ("PHENOMENON_TIME_END", "RESULT_TYPE", "RESULT_NUMBER", "RESULT_STRING", "RESULT_BOOLEAN",
+                   "RESULT_JSON"):
+        assert f'x."{column}" IS NOT DISTINCT FROM o."{column}"' in same
+
+
+def _two_groups() -> dict[int, _Obs]:
+    return {11: _Obs(1386, "pm10"), 12: _Obs(1386, "pm10"), 13: _Obs(1386, "pm2_5", num=7.0)}
+
+
+def test_apply_refreshes_each_group_once_its_batches_are_done(tmp_path) -> None:
+    db = FakeDb(tmp_path / "moved.jsonl", _two_groups())
+
+    assert fix.run(_apply(tmp_path / "moved.jsonl", "--batch-rows", "1"), db) == 0
+
+    kinds = ["move" if "moved AS" in sql else "refresh" for sql in _writes(db)]
+    assert kinds == ["move", "move", "refresh", "move", "refresh"]
+    assert db.refreshed == [[1386, 1388], [1386, 1389]]
+
+
+def test_a_failed_batch_still_refreshes_what_its_group_touched(tmp_path) -> None:
+    """A lock timeout, statement timeout, dropped connection or Ctrl-C ends the run: FROST's trigger ignores
+    a changed DATASTREAM_ID, so nothing else would ever fix the times of the datastreams moved between."""
+    db = FakeDb(tmp_path / "moved.jsonl", _two_groups())
+    db.fail_at = {3}  # the pm2_5 group's batch
+
+    with pytest.raises(fix.PsqlError, match=r"lock timeout.*Datastreams \[1386, 1389\] were refreshed"):
+        fix.run(_apply(tmp_path / "moved.jsonl", "--batch-rows", "1"), db)
+
+    assert db.refreshed == [[1386, 1388], [1386, 1389]]
+
+
+def test_a_failed_batch_is_not_refreshed_while_its_session_may_still_run(tmp_path) -> None:
+    """After a client-side timeout or Ctrl-C the UPDATE can still finish on the server: a refresh before it has
+    would leave the times stale again, so the error says to re-run (which refreshes first) instead."""
+    db = FakeDb(tmp_path / "moved.jsonl")
+    db.fail_at = {1}
+    db.busy_while_writing = [_line(t="busy", pid=4242, state="active", running="00:00:12")]
+
+    with pytest.raises(fix.PsqlError, match=r"Not refreshed yet: datastreams \[1386, 1388\]"):
+        fix.run(_apply(tmp_path / "moved.jsonl"), db)
+
+    assert db.refreshed == []
+
+
+def test_every_write_run_first_refreshes_the_datastreams_the_ids_file_names(tmp_path, capsys) -> None:
+    """An interrupted run may have left any of them stale; a re-run moves other rows, so it refreshes them all."""
+    ids_file = _ids_file(tmp_path / "moved.jsonl", _move_record("b1", 5, 6, [[31, 1, 1.0]]))
+    db = FakeDb(ids_file)
+    assert fix.run(_apply(ids_file), db) == 0
+    assert db.refreshed == [[5, 6], [1386, 1388]]
+
+    db = FakeDb(ids_file, {11: _Obs(1388, "pm10"), 31: _Obs(6, "pm10")})
+    assert fix.run(_rollback(ids_file, "--apply", "--datastream", "1386"), db) == 0
+    assert db.refreshed == [[5, 6], [1386, 1388]]  # the rest first; then what it moves back
+
+    db = FakeDb(ids_file)
+    assert fix.run(fix.parse_args(["--container", "db", "--refresh-only", "--ids-file", str(ids_file)]), db) == 0
+    assert db.refreshed == [[5, 6, 1386, 1388]]
+    assert [sql for sql in _writes(db) if 'UPDATE "DATASTREAMS"' not in sql] == []
+    assert "Refreshed 4 datastreams." in capsys.readouterr().out
+
+
+def test_writes_refuse_while_another_write_session_is_active(tmp_path, capsys) -> None:
+    ids_file = _ids_file(tmp_path / "moved.jsonl", _move_record("b1", 1386, 1388, [[11, 110, 12.0]]))
+    for args in (_apply(ids_file), _rollback(ids_file, "--apply"),
+                 fix.parse_args(["--container", "db", "--refresh-only", "--ids-file", str(ids_file)])):
+        db = FakeDb(ids_file)
+        db.busy = [_line(t="busy", pid=4242, state="active", running="00:00:12")]
+        assert fix.run(args, db) == 1
+        assert _writes(db) == []
+        assert "pid 4242: active" in capsys.readouterr().out
+
+
+def test_rollback_is_a_dry_run_unless_apply_is_given(tmp_path, capsys) -> None:
+    ids_file = tmp_path / "moved.jsonl"
+    db = FakeDb(ids_file)
+    assert fix.run(_apply(ids_file), db) == 0
+    sessions = len(db.sessions)
+    capsys.readouterr()
+
+    assert fix.run(_rollback(ids_file), db) == 0
+
+    assert db.sessions[sessions:]
+    assert all(sql.startswith(fix.READ_ONLY_SESSION) for sql in db.sessions[sessions:])
+    assert db.obs[11].ds == 1388  # still moved
+    out = capsys.readouterr().out
+    assert "DRY RUN" in out
+    assert re.search(r" 1386 <- 1388\s+1\s+0\s+1\s+0\s+0\s+0\s+0\n", out)  # rows, later, in to, back, else, gone, changed
+    assert re.search(r"still where the script put them: to move back\s+1\n", out)
+    assert "Re-run with --apply to move 1 rows back." in out
+
+
+def test_rollback_apply_moves_back_newest_batch_first_and_verifies(tmp_path, capsys) -> None:
+    """Row 11 was moved twice (1386 -> 1388, later 1388 -> 1389): undone in reverse order it ends where it began."""
+    ids_file = _ids_file(
+        tmp_path / "moved.jsonl",
+        _move_record("b1", 1386, 1388, [[11, 110, 12.0]]),
+        _move_record("b2", 1388, 1389, [[11, 110, 12.0]]),
+    )
+    db = FakeDb(ids_file, {11: _Obs(1389, "pm10")})
+
+    assert fix.run(_rollback(ids_file, "--apply"), db) == 0
+
+    assert db.obs[11].ds == 1386
+    restores = [sql for sql in db.sessions if "restored AS" in sql]
+    assert ['o."DATASTREAM_ID" = 1389' in sql for sql in restores] == [True, False]  # b2 first
+    out = capsys.readouterr().out
+    assert "Moved back 2 observations (planned 1)" in out  # b1's row only got back into 1388 by b2's rollback
+    assert "Verification: no recorded row is left where the script put it." in out
+    ops = [json.loads(line)["op"] for line in ids_file.read_text(encoding="utf-8").splitlines()]
+    assert ops == ["ids-file", "move", "move", "rollback", "rolled_back", "rolled_back"]
+
+
+def test_rollback_counts_a_row_listed_by_a_failed_batch_and_the_reruns_once(tmp_path, capsys) -> None:
+    """A batch that failed (a lock timeout) is in the IDs file; the re-run moved its rows in a batch of its own."""
+    ids_file = _ids_file(
+        tmp_path / "moved.jsonl",
+        _move_record("b1", 1386, 1388, [[11, 110, 12.0], [12, 110, 12.0]]),
+        _move_record("b2", 1386, 1388, [[11, 110, 12.0], [12, 110, 12.0]]),
+        {"op": "committed", "batch": "b2", "moved": 2},
+    )
+    db = FakeDb(ids_file, {11: _Obs(1388, "pm10"), 12: _Obs(1388, "pm10")})
+
+    assert fix.run(_rollback(ids_file), db) == 0
+    out = capsys.readouterr().out
+    assert re.search(r"b2\s+1386 <- 1388\s+2\s+0\s+2\s+0\s+0\s+0\s+0\n", out)
+    assert re.search(r"b1\s+1386 <- 1388\s+2\s+2\s+0\s+0\s+0\s+0\s+0\n", out)
+    assert re.search(r"still where the script put them: to move back\s+2\n", out)
+
+    assert fix.run(_rollback(ids_file, "--apply"), db) == 0
+    assert "Moved back 2 observations (planned 2)" in capsys.readouterr().out
+    assert (db.obs[11].ds, db.obs[12].ds) == (1386, 1386)
+
+
+def test_rollback_apply_checks_that_no_recorded_row_is_left_behind(tmp_path, capsys) -> None:
+    ids_file = _ids_file(tmp_path / "moved.jsonl", _move_record("b1", 1386, 1388, [[11, 110, 12.0], [12, 110, 12.0]]))
+    db = FakeDb(ids_file, {11: _Obs(1388, "pm10"), 12: _Obs(1388, "pm10")})
+    db.stuck = {12}
+
+    assert fix.run(_rollback(ids_file, "--apply"), db) == 1
+
+    out = capsys.readouterr().out
+    assert "Moved back 1 observations (planned 2)" in out
+    assert "Verification: 1 recorded rows are still where the script put them. Re-run to move them back." in out
+
+
+def test_rollback_datastream_limits_it_to_batches_from_those_sources(tmp_path) -> None:
+    ids_file = _ids_file(
+        tmp_path / "moved.jsonl",
+        _move_record("b1", 1386, 1388, [[11, 110, 12.0]]),
+        _move_record("b2", 5, 1389, [[20, 110, 3.0]]),
+    )
+    db = FakeDb(ids_file, {11: _Obs(1388, "pm10"), 20: _Obs(1389, "pm2_5", num=3.0)})
+
+    assert fix.run(_rollback(ids_file, "--apply", "--datastream", "1386"), db) == 0
+    assert (db.obs[11].ds, db.obs[20].ds) == (1386, 1389)
+
+    assert fix.run(_rollback(ids_file, "--apply", "--datastream", "77"), db) == 1  # no batch from 77
+    assert fix.run(_rollback(ids_file, "--apply"), db) == 0
+    assert (db.obs[11].ds, db.obs[20].ds) == (1386, 5)
+
+
+def test_rollback_reports_rows_whose_value_changed_since_the_move(tmp_path, capsys) -> None:
+    ids_file = tmp_path / "moved.jsonl"
+    db = FakeDb(ids_file, {11: _Obs(1386, "pm10", num=100500.0), 12: _Obs(1386, "pm10", num=100501.0)})
+    assert fix.run(_apply(ids_file), db) == 0
+    db.obs[11].num = 1005.0  # converted by the pressure backfill's re-run
+    capsys.readouterr()
+
+    assert fix.run(_rollback(ids_file), db) == 0
+
+    out = capsys.readouterr().out
+    assert re.search(r"of those with another RESULT_NUMBER than when moved\s+1\n", out)
+    assert "fix_sc_pressure_units.py" in out
+
+
+def test_rollback_moves_recorded_rows_back_with_their_feature_ids(tmp_path) -> None:
+    ids_file = _ids_file(
+        tmp_path / "moved.jsonl",
+        _move_record("b1", 1386, 2016, [[11, 110, 12.0], [12, None, None]], to_foi=120),
+        {"op": "committed", "batch": "b1", "moved": 2},
+    )
+    db = FakeDb(ids_file, {11: _Obs(2016, "pm10"), 12: _Obs(2016, "pm10", num=None, foi=120)})
+
+    assert fix.run(_rollback(ids_file, "--apply"), db) == 0
 
     (restore,) = [sql for sql in db.sessions if "restored AS" in sql]
     assert 'SET "DATASTREAM_ID" = 1386, "FEATURE_ID" = v.foi' in restore
     assert 'o."DATASTREAM_ID" = 2016' in restore  # only rows still where the script put them
     assert "(11::bigint, 110::bigint), (12::bigint, NULL::bigint)" in restore
-    assert any('UPDATE "DATASTREAMS"' in sql and 'd."ID" = 2016' in sql for sql in db.sessions)
+    assert db.refreshed == [[1386, 2016]]
     assert json.loads(ids_file.read_text(encoding="utf-8").splitlines()[-1])["op"] == "rolled_back"
 
 
-@pytest.mark.parametrize("mode", ["--apply", "--rollback"])
+@pytest.mark.parametrize("mode", ["--apply", "--rollback", "--refresh-only"])
 def test_writes_need_an_ids_file(mode: str) -> None:
     with pytest.raises(SystemExit):
         fix.parse_args(["--container", "db", mode])
+
+
+def test_rollback_and_refresh_only_need_an_existing_ids_file(tmp_path) -> None:
+    for mode in ("--rollback", "--refresh-only"):
+        with pytest.raises(SystemExit):
+            fix.parse_args(["--container", "db", mode, "--ids-file", str(tmp_path / "none.jsonl")])
+    ids_file = _ids_file(tmp_path / "moved.jsonl")
+    for extra in (["--apply"], ["--rollback"]):
+        with pytest.raises(SystemExit):
+            fix.parse_args(["--container", "db", "--refresh-only", "--ids-file", str(ids_file), *extra])
+
+
+# --- the IDs file ------------------------------------------------------------
+
+
+def test_ids_file_refuses_another_scripts_file(tmp_path) -> None:
+    """E.g. the pressure backfill's CSV: appending to it would corrupt both records."""
+    csv_file = tmp_path / "sc_pressure_ids.csv"
+    text = "datastream_id,observation_id,result_number,result_string\n16,1,100391.86,\"100391.86\"\n"
+    csv_file.write_text(text, encoding="utf-8")
+    for args in (_apply(csv_file), _rollback(csv_file), _rollback(csv_file, "--apply")):
+        db = FakeDb(csv_file)
+        with pytest.raises(fix.IdsFileError, match="not an IDs file of this script"):
+            fix.run(args, db)
+        assert db.sessions == []
+    assert csv_file.read_text(encoding="utf-8") == text
+    assert fix.main(["--container", "db", "--apply", "--ids-file", str(csv_file)]) == 1
+
+
+def test_a_cut_off_last_line_is_dropped_before_anything_is_appended(tmp_path, capsys) -> None:
+    ids_file = _ids_file(tmp_path / "moved.jsonl", _move_record("b1", 1386, 1388, [[11, 110, 12.0]]))
+    complete = ids_file.read_bytes()
+    ids_file.write_bytes(complete + b'{"op":"move","batch":"b2","from_ds":1386,"to_ds":13')  # an interrupted append
+
+    assert [r["batch"] for r in fix.IdsFile(ids_file).moves()] == ["b1"]  # skipped when read
+    assert "unreadable last line skipped" in capsys.readouterr().err
+    fix.IdsFile(ids_file).prepare()
+    assert ids_file.read_bytes() == complete
+    assert "dropping the cut-off last line" in capsys.readouterr().err
+
+    db = FakeDb(ids_file, {11: _Obs(1388, "pm10"), 12: _Obs(1386, "pm10")})
+    assert fix.run(_apply(ids_file), db) == 0  # appends whole lines after it
+    batches = [r["batch"] for r in fix.IdsFile(ids_file).moves()]
+    assert len(batches) == 2 and batches[0] == "b1"
+    assert fix.run(_rollback(ids_file, "--apply"), db) == 0
+    assert (db.obs[11].ds, db.obs[12].ds) == (1386, 1386)
+
+
+def test_an_unreadable_line_before_the_last_is_refused(tmp_path) -> None:
+    ids_file = _ids_file(tmp_path / "moved.jsonl", _move_record("b1", 1386, 1388, [[11, 110, 12.0]]))
+    lines = ids_file.read_text(encoding="utf-8").splitlines()
+    ids_file.write_text("\n".join([lines[0], '{"op":"move","batch":"b0",', *lines[1:]]) + "\n", encoding="utf-8")
+    with pytest.raises(fix.IdsFileError, match="line 2"):
+        fix.IdsFile(ids_file).moves()
+
+
+def test_ids_file_gets_its_header_when_it_is_new_or_empty(tmp_path) -> None:
+    for path in (tmp_path / "new.jsonl", tmp_path / "empty.jsonl"):
+        if path.name == "empty.jsonl":
+            path.write_bytes(b"")
+        fix.IdsFile(path).append({"op": "run"})
+        assert [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] == [fix.IDS_HEADER, {"op": "run"}]
+    header_only = tmp_path / "header.jsonl"
+    header_only.write_text(json.dumps(fix.IDS_HEADER, separators=(",", ":")), encoding="utf-8")  # its line end lost
+    fix.IdsFile(header_only).prepare()
+    assert header_only.read_text(encoding="utf-8").endswith("}\n")
+
+
+# --- SQL and transport -----------------------------------------------------------
+
+
+def test_refresh_gives_a_datastream_without_an_observed_area_one() -> None:
+    """A datastream registered after the misrouting has no OBSERVED_AREA; moves are its first rows."""
+    sql = fix.refresh_sql(1388)
+    assert """"OBSERVED_AREA" = CASE WHEN d."OBSERVED_AREA" IS NOT NULL THEN d."OBSERVED_AREA" ELSE""" in sql
+    assert """SELECT ST_ConvexHull(ST_Collect(f."GEOM")) FROM "FEATURES" f""" in sql
+    assert """"LAST_FOI_ID" = CASE WHEN d."OBSERVED_AREA" IS NOT NULL THEN d."LAST_FOI_ID" ELSE""" in sql
+    assert '"PHENOMENON_TIME_START" = a.p0' in sql and 'WHERE d."ID" = 1388;' in sql
+
+
+def test_psql_over_ssh_uses_keepalives() -> None:
+    """A silently dropped connection must fail within about a minute, not hang until --timeout."""
+    argv = fix.psql_argv(ssh="root@frost.example", ssh_key="~/.ssh/key")
+    assert argv[:7] == ["ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4"]
+    assert argv[7] == "-i" and not argv[8].startswith("~")
+    assert argv[9] == "root@frost.example"
+    assert "PASSWORD" not in " ".join(argv).upper()
+
+
+def test_psql_runner_turns_ctrl_c_into_an_error(monkeypatch) -> None:
+    def interrupted(*args: Any, **kwargs: Any) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(fix.subprocess, "run", interrupted)
+    with pytest.raises(fix.PsqlError, match="interrupted"):
+        fix.psql_runner(["psql"], timeout=1)("SELECT 1;")
 
 
 # ---------------------------------------------------------------------------
@@ -250,20 +646,28 @@ def _docker(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
 
 @pytest.fixture(scope="module")
 def frost() -> Iterator[tuple[str, str]]:
-    """(v1.1 base URL, database container) of a throwaway FROST 2.8 + PostGIS, torn down afterwards."""
+    """(v1.1 base URL, database container) of a throwaway FROST 2.8 + PostGIS, torn down afterwards.
+
+    Container and network names start with $TEST_DOCKER_PREFIX when set (default scfix-it).
+    """
     if shutil.which("docker") is None:
         pytest.skip("docker is not available")
-    suffix = uuid.uuid4().hex[:8]
-    net, db, server = f"scfix-it-{suffix}", f"scfix-it-db-{suffix}", f"scfix-it-frost-{suffix}"
+    name = f"{os.environ.get('TEST_DOCKER_PREFIX') or 'scfix-it'}-{uuid.uuid4().hex[:8]}"
+    net, db, server = f"{name}-net", f"{name}-db", f"{name}-frost"
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
-    root = f"http://localhost:{port}/FROST-Server"
+    root = f"http://127.0.0.1:{port}/FROST-Server"  # not localhost: IPv6 first is slow on Windows
     try:
         _docker("network", "create", net)
         _docker("run", "-d", "--name", db, "--network", net, "-e", "POSTGRES_DB=sensorthings",
                 "-e", "POSTGRES_USER=sensorthings", "-e", "POSTGRES_PASSWORD=sensorthings",
                 "postgis/postgis:16-3.4-alpine")
+        deadline = time.monotonic() + 120
+        while _docker("exec", db, "pg_isready", "-h", "127.0.0.1", "-U", "sensorthings", check=False).returncode:
+            if time.monotonic() > deadline:  # over TCP: the image's init phase runs a socket-only server first
+                raise TimeoutError("PostGIS not ready")
+            time.sleep(1)
         _docker("run", "-d", "--name", server, "--network", net, "-p", f"127.0.0.1:{port}:8080",
                 "-e", f"serviceRootUrl={root}", "-e", "persistence_db_driver=org.postgresql.Driver",
                 "-e", f"persistence_db_url=jdbc:postgresql://{db}:5432/sensorthings",
@@ -281,7 +685,7 @@ def frost() -> Iterator[tuple[str, str]]:
             time.sleep(2)
         yield f"{root}/v1.1", db
     finally:
-        _docker("rm", "-f", server, db, check=False)
+        _docker("rm", "-f", "-v", server, db, check=False)  # -v: the PostGIS image's anonymous data volume too
         _docker("network", "rm", net, check=False)
 
 
@@ -413,5 +817,338 @@ def test_plan_apply_and_rollback_on_frost_28(frost, tmp_path, capsys) -> None:
     assert fix.main([*script, "--apply", "--ids-file", str(ids_file)]) == 0  # nothing left to move
     assert "Moved 0 observations" in capsys.readouterr().out
 
-    assert fix.main([*script, "--rollback", "--ids-file", str(ids_file)]) == 0
+    assert fix.main([*script, "--rollback", "--ids-file", str(ids_file)]) == 0  # a dry run
+    assert "Re-run with --apply to move 6 rows back." in capsys.readouterr().out
+    assert fix.main([*script, "--rollback", "--apply", "--ids-file", str(ids_file)]) == 0
     assert _state(db) == before
+
+
+# --- the 2026-11-20 review's scenario: five Things, rows misrouted the ways the pre-fix connector did ---
+
+_TABLES = ('"OBSERVATIONS", "DATASTREAMS", "FEATURES", "THINGS_LOCATIONS", "LOCATIONS_HIST_LOCATIONS", '
+           '"HIST_LOCATIONS", "LOCATIONS", "THINGS", "SENSORS", "OBS_PROPERTIES"')
+_UNITS = {"pressure": ("Air pressure", "hPa"), "pm10": ("PM10 concentration", "ug/m3"),
+          "pm2_5": ("PM2.5 concentration", "ug/m3"), "temperature": ("Air temperature", "Cel"),
+          "humidity": ("Relative humidity", "%"), "air_pressure": ("Air pressure", "hPa")}
+_HTTP = requests.Session()
+_STALE_SQL = """
+SELECT d."ID" FROM "DATASTREAMS" d
+  LEFT JOIN (SELECT "DATASTREAM_ID" AS id, min("PHENOMENON_TIME_START") AS p0,
+                    max(coalesce("PHENOMENON_TIME_END", "PHENOMENON_TIME_START")) AS p1,
+                    min("RESULT_TIME") AS r0, max("RESULT_TIME") AS r1, count(*) AS n
+               FROM "OBSERVATIONS" GROUP BY 1) a ON a.id = d."ID"
+ WHERE (d."PHENOMENON_TIME_START", d."PHENOMENON_TIME_END", d."RESULT_TIME_START", d."RESULT_TIME_END")
+       IS DISTINCT FROM (a.p0, a.p1, a.r0, a.r1)
+    OR (a.n > 0 AND d."OBSERVED_AREA" IS NULL)
+ ORDER BY 1;
+"""
+
+
+@dataclass
+class Scenario:
+    base: str
+    db: str
+    ds: dict[str, int]  # datastream ID per label, e.g. "A.pressure"
+    obs: dict[str, int]  # observation ID per label, e.g. "B.p_in_A.h.2"
+
+
+def _post(base: str, path: str, body: dict[str, Any]) -> int:
+    response = _HTTP.post(f"{base}/{path}", json=body, timeout=60)
+    assert response.status_code == 201, response.text
+    match = re.search(r"\((\d+)\)$", response.headers["Location"])
+    assert match is not None
+    return int(match[1])
+
+
+def _seed_scenario(base: str, db: str) -> Scenario:
+    """Things A, B, D (Sensor.Community), SM (Samen Meten) and K (KNMI); their correct rows first (so each Thing's
+    FoI is generated from its own Location), then what the pre-fix connector misrouted, then A's PM datastreams
+    as the fixed connector registers them (empty)."""
+    ops: dict[str, int] = {}
+    sensors: dict[str, int] = {}
+
+    def op(prop: str) -> int:
+        name = _UNITS[prop][0]
+        if name not in ops:
+            ops[name] = _post(base, "ObservedProperties", {"name": name, "description": name,
+                                                           "definition": f"https://example.org/{prop}"})
+        return ops[name]
+
+    def thing(name: str, source: str, lon: float, lat: float) -> int:
+        thing_id = _post(base, "Things", {"name": name, "description": "-", "properties": {"source": source}})
+        _post(base, "Locations", {"name": f"{name} location", "description": "-", "encodingType": "application/geo+json",
+                                  "location": {"type": "Point", "coordinates": [lon, lat]},
+                                  "Things": [{"@iot.id": thing_id}]})
+        return thing_id
+
+    def datastream(thing_id: int, thing_name: str, sid: str, prop: str) -> int:
+        if sid not in sensors:
+            sensors[sid] = _post(base, "Sensors", {"name": f"{thing_name} sensor", "description": "-",
+                                                   "encodingType": "application/json", "metadata": "-"})
+        name, symbol = _UNITS[prop]
+        return _post(base, "Datastreams", {
+            "name": f"{thing_name} sensor - {name}", "description": "-",
+            "observationType": "http://www.opengis.net/def/observationType/OGC-OM/2.0/OM_Measurement",
+            "unitOfMeasurement": {"name": name, "symbol": symbol, "definition": "-"},
+            "Thing": {"@iot.id": thing_id}, "Sensor": {"@iot.id": sensors[sid]}, "ObservedProperty": {"@iot.id": op(prop)},
+            "properties": {"thing_name": thing_name, "sensor_id": sid, "observed_property": prop, "streamKey": prop},
+        })
+
+    a, b, d = "sensor_community-93182", "sensor_community-91154", "sensor_community-77"
+    ta, tb, td = "SensorCommunity 93182", "SensorCommunity 91154", "SensorCommunity 77"
+    things = {
+        "A": thing(f"GEO_{ta}", "sensor_community", 4.1, 52.1), "B": thing(f"GEO_{tb}", "sensor_community", 4.2, 52.2),
+        "D": thing(f"GEO_{td}", "sensor_community", 4.3, 52.3),
+        "SM": thing("GEO_SamenMeten SSK_X", "samen_meten", 4.4, 52.4), "K": thing("GEO_KNMI 260", "knmi_weather", 5.18, 52.1),
+    }
+    ds: dict[str, int] = {}
+    for prop in ("temperature", "pressure", "humidity"):
+        ds[f"A.{prop}"] = datastream(things["A"], f"GEO_{ta}", a, prop)
+    for prop in ("temperature", "pressure", "humidity", "pm10", "pm2_5"):
+        ds[f"B.{prop}"] = datastream(things["B"], f"GEO_{tb}", b, prop)
+    ds["D.pressure"] = datastream(things["D"], f"GEO_{td}", d, "pressure")
+    ds["SM.pm10"] = datastream(things["SM"], "GEO_SamenMeten SSK_X", "sm-ssk_x", "pm10")
+    ds["K.air_pressure"] = datastream(things["K"], "GEO_KNMI 260", "knmi-0", "air_pressure")
+    obs: dict[str, int] = {}
+
+    def add(label: str, stream: str, day: int, minute: int, value: float, sid: str | None = None, prop: str = "",
+            thing_name: str = "") -> None:
+        body: dict[str, Any] = {"phenomenonTime": f"2026-11-{day:02d}T{minute // 60:02d}:{minute % 60:02d}:00Z",
+                                "result": value, "resultQuality": ["good"], "Datastream": {"@iot.id": ds[stream]}}
+        if sid is not None:  # labelled as SensorThingsClient.push_observations labels a reading
+            body["parameters"] = {"sensor_id": sid, "sensor_name": f"{thing_name} sensor", "observed_property": prop,
+                                  "unit": "", "location": sid.rsplit("-", 1)[-1], "thing_name": thing_name,
+                                  "device_eui": None, "stream_key": None}
+        obs[label] = _post(base, "Observations", body)
+
+    for k in range(20):
+        add(f"A.p.{k}", "A.pressure", 10, k, 100000 + k * 11.37, a, "pressure", ta)
+    for k in range(3):
+        add(f"A.p.hpa.{k}", "A.pressure", 10, 100 + k, 1013.25 + k, a, "pressure", ta)
+    for k in range(5):
+        add(f"A.h.{k}", "A.humidity", 10, k, 60 + k, a, "humidity", ta)
+    for k in range(3):
+        add(f"A.t.{k}", "A.temperature", 10, k, 7.5 + k, a, "temperature", ta)
+    for k in range(10):
+        add(f"B.p.{k}", "B.pressure", 10, k, 101000 + k * 3.3, b, "pressure", tb)
+    for k in range(3):
+        add(f"B.pm10.{k}", "B.pm10", 10, k, 10 + k, b, "pm10", tb)
+    for k in range(5):
+        add(f"D.p.{k}", "D.pressure", 10, k, 99000 + k * 7.1, d, "pressure", td)
+    for k in range(3):
+        add(f"SM.pm10.{k}", "SM.pm10", 10, k, 20 + k, "sm-ssk_x", "pm10", "SamenMeten SSK_X")
+    for k in range(3):
+        add(f"K.ap.{k}", "K.air_pressure", 10, k, 1012.5 + k, "knmi-0", "air_pressure", "KNMI 260")
+    # Misrouted. A's PM readings in A's Air pressure datastream (the bare sensor-id fallback), one in the Pa band:
+    for k, value in enumerate([12.0, 2500.0, 15.5, 30.0, 8.0]):
+        add(f"A.pm10_in_A.p.{k}", "A.pressure", 11, k, value, a, "pm10", ta)
+    for k in range(3):
+        add(f"A.pm25_in_A.p.{k}", "A.pressure", 11, 10 + k, 5.0 + k, a, "pm2_5", ta)
+    for k in range(5):  # B's pressure in Pa in A's Air pressure datastream: a stale id of the previous server
+        add(f"B.p_in_A.p.{k}", "A.pressure", 11, 20 + k, 100500 + k * 1.25, b, "pressure", tb)
+    for k in range(4):  # ... and in A's humidity datastream; the first at a phenomenonTime B.pressure has already
+        # (another reading: another value), the second at the time of a misrouted PM10 row in B.pressure below
+        add(f"B.p_in_A.h.{k}", "A.humidity", 11 if k else 10, 30 + k if k else 0, 100700 + k * 2.5, b, "pressure", tb)
+    add("B.p_dup_in_A.h", "A.humidity", 10, 1, 101000 + 1 * 3.3, b, "pressure", tb)  # B.p.1's very reading: stays
+    for k in range(2):
+        add(f"B.pm25_in_A.h.{k}", "A.humidity", 11, 40 + k, 9.0 + k, b, "pm2_5", tb)
+    # B's PM10 in B's Air pressure datastream, at B.p_in_A.h.1's phenomenonTime: it moves out to B.pm10 after
+    # (B.pressure's rows are scanned after A.humidity's), so it must not keep B.p_in_A.h.1 from moving in.
+    add("B.pm10_in_B.p.0", "B.pressure", 11, 31, 13.5, b, "pm10", tb)
+    for k in range(2):  # TGV readings (a bare stream key): no datastream on this server
+        add(f"tgv_in_A.p.{k}", "A.pressure", 11, 50 + k, 100800.5 + k, "tgv-officelab-climate", "pressure",
+            "Climate adaptation setup")
+    for k in range(2):  # no labels
+        add(f"nolabel_in_A.p.{k}", "A.pressure", 11, 60 + k, 101000 + k)
+    for k in range(3):  # Sensor.Community readings in other sources' datastreams
+        add(f"A.pm10_in_SM.{k}", "SM.pm10", 11, 70 + k, 11.0 + k, a, "pm10", ta)
+    for k in range(2):
+        add(f"A.p_in_K.{k}", "K.air_pressure", 11, 80 + k, 100900.25 + k, a, "pressure", ta)
+    ds["A.pm10"] = datastream(things["A"], f"GEO_{ta}", a, "pm10")
+    ds["A.pm2_5"] = datastream(things["A"], f"GEO_{ta}", a, "pm2_5")
+    return Scenario(base, db, ds, obs)
+
+
+def _wipe(db: str) -> None:
+    _psql(db, f"TRUNCATE {_TABLES} RESTART IDENTITY CASCADE;")
+
+
+@pytest.fixture()
+def scenario(frost: tuple[str, str]) -> Iterator[Scenario]:
+    """The scenario in an emptied database, emptied again afterwards (the module's first test seeds its own)."""
+    base, db = frost
+    _wipe(db)
+    try:
+        yield _seed_scenario(base, db)
+    finally:
+        _wipe(db)
+
+
+def _rows(db: str) -> dict[int, tuple[str, ...]]:
+    """(DATASTREAM_ID, FEATURE_ID, RESULT_NUMBER, RESULT_STRING) per observation, as PostgreSQL prints them."""
+    lines = _psql(db, """SELECT "ID", "DATASTREAM_ID", coalesce("FEATURE_ID"::text, ''),
+                                coalesce(to_json("RESULT_NUMBER")::text, 'null'), coalesce(to_json("RESULT_STRING")::text, 'null')
+                           FROM "OBSERVATIONS" ORDER BY 1;""")
+    return {int(i): tuple(rest.split("|", 3)) for i, rest in (line.split("|", 1) for line in lines)}
+
+
+def _datastreams(db: str) -> dict[int, tuple[str, ...]]:
+    """(phenomenon and result time extents, OBSERVED_AREA as text, LAST_FOI_ID) per datastream."""
+    lines = _psql(db, """SELECT "ID", "PHENOMENON_TIME_START", "PHENOMENON_TIME_END", "RESULT_TIME_START", "RESULT_TIME_END",
+                                coalesce(ST_AsText("OBSERVED_AREA"), ''), coalesce("LAST_FOI_ID"::text, '')
+                           FROM "DATASTREAMS" ORDER BY 1;""")
+    return {int(i): tuple(rest.split("|")) for i, rest in (line.split("|", 1) for line in lines)}
+
+
+def _stale(db: str) -> list[str]:
+    """Datastreams whose times are not their rows', or that have rows but no observed area."""
+    return _psql(db, _STALE_SQL)
+
+
+class _RowLock:
+    """A concurrent writer holding a row lock, here past the scripts' 10 s lock timeout."""
+
+    def __init__(self, db: str, obs_id: int) -> None:
+        self.proc = subprocess.Popen(["docker", "exec", "-i", db, "sh", "-c", fix.CONTAINER_PSQL], stdin=subprocess.PIPE,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, encoding="utf-8")
+        assert self.proc.stdin is not None
+        self.proc.stdin.write("SET application_name = 'scfix_test_lock';\nBEGIN;\n"
+                              f'SELECT 1 FROM "OBSERVATIONS" WHERE "ID" = {obs_id} FOR UPDATE;\n')
+        self.proc.stdin.flush()
+        held = ("SELECT count(*) FROM pg_stat_activity "
+                "WHERE application_name = 'scfix_test_lock' AND state = 'idle in transaction';")
+        deadline = time.monotonic() + 60
+        while _psql(db, held) != ["1"]:
+            if time.monotonic() > deadline:
+                raise TimeoutError("the row lock was not taken")
+            time.sleep(0.5)
+
+    def __enter__(self) -> _RowLock:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if self.proc.poll() is None:
+            assert self.proc.stdin is not None
+            self.proc.stdin.write("COMMIT;\n")
+            self.proc.stdin.close()
+            self.proc.wait(timeout=60)
+
+
+_EMPTY_BEFORE = ("A.pm10", "A.pm2_5", "B.pm2_5")  # targets without observations before the moves
+
+
+@pytest.mark.integration
+def test_interrupted_moves_leave_no_stale_datastream_and_roll_back_on_frost_28(
+    scenario: Scenario, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A batch failing mid-run (a concurrent writer past the lock timeout) leaves no datastream with stale times;
+    targets that had no observations get the observed area FROST would give them; the rollback is a dry run
+    unless --apply, counts rows whose value changed since the move, can be limited to source datastreams, and
+    puts every row back."""
+    s = scenario
+    seeded_rows, seeded_ds = _rows(s.db), _datastreams(s.db)
+    ids_file = tmp_path / "moved.jsonl"
+    script = ["--container", s.db]
+
+    # Its group (A.humidity -> B.pressure) comes after A.pressure's; one row per batch, so the batch moving
+    # B.p_in_A.h.2 (later than any B.pressure row, B.pm10_in_B.p.0 included) has committed when the next one fails.
+    with _RowLock(s.db, s.obs["B.p_in_A.h.3"]):
+        assert fix.main([*script, "--apply", "--ids-file", str(ids_file), "--batch-rows", "1"]) == 1
+    err = capsys.readouterr().err
+    assert "lock timeout" in err and "were refreshed" in err
+    rows = _rows(s.db)
+    assert rows[s.obs["B.p_in_A.h.0"]][0] == str(s.ds["B.pressure"])  # B.pressure has that time, not that reading
+    assert rows[s.obs["B.p_in_A.h.1"]][0] == str(s.ds["B.pressure"])  # that time held by a row about to move out
+    assert rows[s.obs["B.p_in_A.h.2"]][0] == str(s.ds["B.pressure"])
+    assert rows[s.obs["B.pm10_in_B.p.0"]][0] == str(s.ds["B.pressure"])  # ... which has not moved yet
+    assert _stale(s.db) == []
+
+    assert fix.main([*script, "--apply", "--ids-file", str(ids_file)]) == 0
+    out = capsys.readouterr().out
+    assert "Moved 9 observations (1 left in place: their target already holds the same reading)" in out
+    assert _stale(s.db) == []
+    rows = _rows(s.db)
+    assert rows[s.obs["B.pm10_in_B.p.0"]][:2] == (str(s.ds["B.pm10"]), seeded_rows[s.obs["B.pm10_in_B.p.0"]][1])
+    assert rows[s.obs["B.p_dup_in_A.h"]] == seeded_rows[s.obs["B.p_dup_in_A.h"]]  # B.p.1's reading: left in place
+    moved = {i for i, row in rows.items() if row[0] != seeded_rows[i][0]}
+    assert len(moved) == 25  # all but the identical reading; not the TGV or unlabelled rows
+    now = _datastreams(s.db)
+    for empty, sibling in zip(_EMPTY_BEFORE, ("A.pressure", "A.pressure", "B.pressure"), strict=True):
+        assert seeded_ds[s.ds[empty]][4:] == ("", "")  # no area, no last FoI
+        assert now[s.ds[empty]][4:] == now[s.ds[sibling]][4:]  # what FROST's insert trigger gave its sibling
+
+    k_rows = (s.obs["A.p_in_K.0"], s.obs["A.p_in_K.1"])  # moved into A's Air pressure; converted, as the backfill would
+    _psql(s.db, f'UPDATE "OBSERVATIONS" SET "RESULT_NUMBER" = "RESULT_NUMBER" / 100 WHERE "ID" IN {k_rows};')
+    converted = (_rows(s.db), _datastreams(s.db))
+    assert fix.main([*script, "--rollback", "--ids-file", str(ids_file)]) == 0  # a dry run
+    assert (_rows(s.db), _datastreams(s.db)) == converted
+    out = capsys.readouterr().out
+    assert re.search(r"still where the script put them: to move back\s+25\n", out)
+    assert re.search(r"of those with another RESULT_NUMBER than when moved\s+2\n", out)
+
+    k = s.ds["K.air_pressure"]
+    assert fix.main([*script, "--rollback", "--apply", "--ids-file", str(ids_file), "--datastream", str(k)]) == 0
+    rows = _rows(s.db)
+    assert {i for i, row in rows.items() if row[0] != seeded_rows[i][0]} == moved - set(k_rows)
+    assert all(rows[i][:2] == seeded_rows[i][:2] for i in k_rows)
+    assert _stale(s.db) == []
+    capsys.readouterr()
+
+    assert fix.main([*script, "--rollback", "--apply", "--ids-file", str(ids_file)]) == 0
+    assert "Verification: no recorded row is left where the script put it." in capsys.readouterr().out
+    rows = _rows(s.db)
+    assert {i: row[:2] for i, row in rows.items()} == {i: row[:2] for i, row in seeded_rows.items()}
+    assert {i: r for i, r in rows.items() if i not in k_rows} == {i: r for i, r in seeded_rows.items() if i not in k_rows}
+    assert _stale(s.db) == []
+    after = _datastreams(s.db)
+    emptied = {s.ds[label] for label in _EMPTY_BEFORE}
+    assert {i: v[:4] for i, v in after.items()} == {i: v[:4] for i, v in seeded_ds.items()}  # times as seeded
+    assert {i: v for i, v in after.items() if i not in emptied} == {i: v for i, v in seeded_ds.items() if i not in emptied}
+    assert all(after[i][4] for i in emptied)  # an observed area stays, as FROST keeps it on a delete
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("case", ["pressure-rollback-first", "move-rollback-first", "interrupted-backfill"])
+def test_with_the_pressure_backfill_either_undo_order_restores_the_seed_on_frost_28(
+    scenario: Scenario, tmp_path: Path, capsys: pytest.CaptureFixture[str], case: str
+) -> None:
+    """The review's combined sequence: the pressure backfill (b), the moves (d), the backfill again (e). Both
+    rollbacks, in either order, give back every seeded row exactly; the pressure rollback alone restores every
+    value wherever the row is. With b interrupted and not re-run before d, rows are recorded under two
+    datastreams, and the pressure rollback still takes the file.
+
+    Needs scripts/fix_sc_pressure_units.py (fix/sc-pressure-hpa): it runs once both branches are merged.
+    """
+    backfill = pytest.importorskip("scripts.fix_sc_pressure_units", reason="needs fix/sc-pressure-hpa merged in")
+    s = scenario
+    seeded_rows, seeded_ds = _rows(s.db), _datastreams(s.db)
+    db = ["--container", s.db]
+    pressure_ids, moved_ids = str(tmp_path / "sc_pressure_ids.csv"), str(tmp_path / "moved.jsonl")
+
+    if case == "interrupted-backfill":
+        with _RowLock(s.db, s.obs["B.p_in_A.p.0"]):  # A's Air pressure batch waits past the lock timeout
+            assert backfill.main([*db, "--apply", "--ids-file", pressure_ids]) == 1
+    else:
+        assert backfill.main([*db, "--apply", "--ids-file", pressure_ids]) == 0  # b
+    assert fix.main([*db, "--apply", "--ids-file", moved_ids]) == 0  # d
+    assert backfill.main([*db, "--apply", "--ids-file", pressure_ids]) == 0  # e
+    capsys.readouterr()
+    assert backfill.main(db) == 0  # its dry run: no Sensor.Community pressure reading left in Pa
+    assert re.search(r"pressure readings to convert \(Pa band\)\s+0\n", capsys.readouterr().out)
+
+    if case == "move-rollback-first":
+        assert fix.main([*db, "--rollback", "--apply", "--ids-file", moved_ids]) == 0
+        # Moved in Pa by d, converted by e: B.p_in_A.h.0-3, A.p_in_K.0-1, and B.p_dup_in_A.h (no longer
+        # B.p.1's reading once b converted B.p.1).
+        assert re.search(r"of those with another RESULT_NUMBER than when moved\s+7\n", capsys.readouterr().out)
+        assert backfill.main([*db, "--rollback", "--apply", "--ids-file", pressure_ids]) == 0
+    else:
+        assert backfill.main([*db, "--rollback", "--apply", "--ids-file", pressure_ids]) == 0
+        values = {i: row[2:] for i, row in _rows(s.db).items()}
+        assert values == {i: row[2:] for i, row in seeded_rows.items()}  # wherever the rows are now
+        assert fix.main([*db, "--rollback", "--apply", "--ids-file", moved_ids]) == 0
+    assert _rows(s.db) == seeded_rows
+    assert _stale(s.db) == []
+    after = _datastreams(s.db)
+    emptied = {s.ds[label] for label in _EMPTY_BEFORE}
+    assert {i: v for i, v in after.items() if i not in emptied} == {i: v for i, v in seeded_ds.items() if i not in emptied}
