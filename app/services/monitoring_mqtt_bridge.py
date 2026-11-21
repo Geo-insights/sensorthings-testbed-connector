@@ -17,8 +17,10 @@ def _resolve_monitoring_payloads(readings: list[SensorReading]) -> list[Monitori
     payloads: list[MonitoringMqttPayload] = []
     datastream_ids = client._datastream_ids or dict(settings.datastream_ids)
     for reading in readings:
-        datastream_id = datastream_ids.get(client._datastream_key(reading.sensor_id, reading.observed_property))
-        datastream_id = datastream_id or datastream_ids.get(reading.sensor_id)
+        # As push_observations resolves it: only a cached mapping to a datastream
+        # of the reading's own sensor and observed property, then the live
+        # lookup on the reading's own Thing.
+        datastream_id, _refused = client._resolve_cached_datastream_id(datastream_ids, reading)
         if not datastream_id:
             datastream_id = client._resolve_datastream_id_live(base_url, reading)
         if not datastream_id:

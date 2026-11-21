@@ -472,7 +472,7 @@ def test_warm_up_lists_datastreams_in_id_order(make_client, monkeypatch) -> None
     client.warm_datastream_cache()
 
     assert calls and calls[0] is not None
-    assert calls[0]["$orderby"] == "id"
+    assert calls[0]["$orderby"] == "id asc"
     assert client._datastream_ids["s1::temperature"] == "1"
     assert client._datastream_ids["s1::humidity"] == "2"
 
