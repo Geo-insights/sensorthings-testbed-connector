@@ -74,7 +74,10 @@ Rollback (--rollback --ids-file F)
 A dry run unless --apply. Moves each recorded row that is still exactly where the
 script put it (target datastream, target FEATURE_ID) back to its recorded datastream
 and FEATURE_ID, honours --datastream (source or target), recomputes the datastreams
-involved and verifies.
+involved and verifies. A row goes back only while its recorded datastream and
+FeatureOfInterest still exist (OBSERVATIONS has foreign keys to both, so one such
+row would fail its whole batch): the report counts the others as "source gone",
+and they stay where the move put them.
 
 Retiring the stale datastreams (--retire-stale-ground-temperature)
 ------------------------------------------------------------------
@@ -86,6 +89,12 @@ Ground temperature' with observed_property ground_temperature on a KNMI Thing th
 also has a '... - Ground surface temperature' one. Deleting a Datastream in FROST
 deletes its observations, so each is checked empty ($count) right before its
 DELETE, and a datastream with observations is never deleted.
+
+Retirement is the point of no return for rolling back the moves out of those
+datastreams: a row can only go back to a datastream that exists. With --ids-file
+(the record of --apply) an empty stale datastream that the file names as the
+source of a move is left alone unless --force-retire; the dry run lists them.
+Without --ids-file nothing is checked, so always give it.
 
 Safety
 ------
@@ -112,16 +121,21 @@ Runbook (production)
 4. Everything: --apply --ids-file knmi_moves.csv (the same file).
 5. scripts/cleanup_frost_observations.py --ids-file knmi_twins.csv (archives, then
    deletes the twins) and --tgv-misplaced (the TGV rows in KNMI datastreams).
-6. --retire-stale-ground-temperature (dry run), then with --apply.
-If a run is interrupted, run the same command again. To undo the moves:
---rollback --ids-file knmi_moves.csv, then the same with --apply.
+6. Only once the moves will not be rolled back: --retire-stale-ground-temperature
+   --ids-file knmi_moves.csv (dry run: the stale datastreams emptied by the moves
+   are held back), then --apply --ids-file knmi_moves.csv --force-retire. This is
+   the point of no return for the moves out of them; the other moves can still be
+   rolled back (their rows are counted, not restored, as "source gone").
+If a run is interrupted, run the same command again. To undo the moves (before
+step 6): --rollback --ids-file knmi_moves.csv, then the same with --apply.
 
 Usage
 -----
     python scripts/fix_knmi_observations.py --ssh root@<frost-host> --ssh-key ~/.ssh/id_hetzner [--twins-file T]
     python scripts/fix_knmi_observations.py --ssh ... --apply --ids-file knmi_moves.csv [--datastream ID]
     python scripts/fix_knmi_observations.py --ssh ... --rollback --ids-file knmi_moves.csv [--apply]
-    python scripts/fix_knmi_observations.py --retire-stale-ground-temperature [--apply] [--target-url URL]
+    python scripts/fix_knmi_observations.py --retire-stale-ground-temperature --ids-file knmi_moves.csv
+        [--apply [--force-retire]] [--target-url URL]
 """
 
 from __future__ import annotations
@@ -133,7 +147,7 @@ import os
 import re
 import sys
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -951,12 +965,22 @@ def _move_relation(moves: Sequence[Move]) -> str:
     return f"(VALUES {values}) AS v(id, from_ds, to_ds, from_foi, to_foi)"
 
 
+# A recorded row can go back only while its source datastream and FeatureOfInterest exist: OBSERVATIONS has
+# foreign keys to both, so one row pointing at a deleted one fails the whole UPDATE (its batch and every re-run).
+# --retire-stale-ground-temperature deletes emptied stale datastreams, the sources of the moves out of them.
+_SOURCE_EXISTS = ('EXISTS (SELECT 1 FROM "DATASTREAMS" sd WHERE sd."ID" = v.from_ds) '
+                  'AND EXISTS (SELECT 1 FROM "FEATURES" sf WHERE sf."ID" = v.from_foi)')
+_AT_TARGET = 'o."DATASTREAM_ID" = v.to_ds AND o."FEATURE_ID" = v.to_foi'
+
+
 def rollback_state_sql(moves: Sequence[Move]) -> str:
-    """How many recorded rows are where the move put them, back where they were, elsewhere, or gone (read-only)."""
+    """How many recorded rows are where the move put them (with their source there or deleted since), back where
+    they were, elsewhere, or gone (read-only)."""
     return f"""
 SELECT json_build_object(
          't', 'rbstate', 'listed', count(*),
-         'moved', count(*) FILTER (WHERE o."DATASTREAM_ID" = v.to_ds AND o."FEATURE_ID" = v.to_foi),
+         'moved', count(*) FILTER (WHERE {_AT_TARGET} AND {_SOURCE_EXISTS}),
+         'source_gone', count(*) FILTER (WHERE {_AT_TARGET} AND NOT ({_SOURCE_EXISTS})),
          'back', count(*) FILTER (WHERE o."DATASTREAM_ID" = v.from_ds AND o."FEATURE_ID" = v.from_foi),
          'gone', count(*) FILTER (WHERE o."ID" IS NULL))::text
   FROM {_move_relation(moves)}
@@ -965,12 +989,14 @@ SELECT json_build_object(
 
 
 def restore_sql(moves: Sequence[Move]) -> str:
+    """Move the recorded rows still where the move put them back, those whose source datastream and FoI exist."""
     return f"""
 WITH restored AS (
     UPDATE "OBSERVATIONS" o
        SET "DATASTREAM_ID" = v.from_ds, "FEATURE_ID" = v.from_foi
       FROM {_move_relation(moves)}
-     WHERE o."ID" = v.id AND o."DATASTREAM_ID" = v.to_ds AND o."FEATURE_ID" = v.to_foi
+     WHERE o."ID" = v.id AND {_AT_TARGET}
+       AND {_SOURCE_EXISTS}
     RETURNING o."ID"
 )
 SELECT json_build_object('t', 'restored', 'listed', {len(moves)}, 'n', count(*))::text FROM restored;
@@ -981,12 +1007,13 @@ SELECT json_build_object('t', 'restored', 'listed', {len(moves)}, 'n', count(*))
 class RollbackState:
     listed: int = 0
     moved: int = 0  # where the move put them: restored by --rollback --apply
+    source_gone: int = 0  # where the move put them, but their source datastream or FoI was deleted: they stay
     back: int = 0  # where they were: nothing to do
     gone: int = 0
 
     @property
     def elsewhere(self) -> int:
-        return self.listed - self.moved - self.back - self.gone
+        return self.listed - self.moved - self.source_gone - self.back - self.gone
 
 
 def rollback_scan(run_sql: RunSql, moves: Sequence[Move], batch_rows: int, chunk: int) -> RollbackState:
@@ -999,6 +1026,7 @@ def rollback_scan(run_sql: RunSql, moves: Sequence[Move], batch_rows: int, chunk
         for row in rows:
             state.listed += int(row["listed"])
             state.moved += int(row["moved"])
+            state.source_gone += int(row["source_gone"])
             state.back += int(row["back"])
             state.gone += int(row["gone"])
     return state
@@ -1008,9 +1036,14 @@ def print_rollback_state(state: RollbackState) -> None:
     print("\nRecorded moves")
     _line("observations recorded", state.listed)
     _line("  where the move put them: to restore", state.moved)
+    _line("  where the move put them, source gone: they stay", state.source_gone)
     _line("  back where they were: nothing to do", state.back)
     _line("  elsewhere (changed since): left alone", state.elsewhere)
     _line("  deleted since", state.gone)
+    if state.source_gone:
+        print(f"  {state.source_gone:,} rows cannot go back: the datastream or FeatureOfInterest they were moved out "
+              "of was deleted since (--retire-stale-ground-temperature deletes the emptied stale datastreams). "
+              "They stay in their station's current datastream.")
 
 
 def run_rollback(args: argparse.Namespace, run_sql: RunSql) -> int:
@@ -1053,9 +1086,11 @@ def run_rollback(args: argparse.Namespace, run_sql: RunSql) -> int:
     _progress("Verifying, read-only ...")
     after = rollback_scan(run_sql, moves, args.batch_rows, args.chunk)
     if after.moved:
-        print(f"Verification: {after.moved:,} recorded rows are still where the move put them. Re-run.")
+        print(f"Verification: {after.moved:,} recorded rows whose source exists are still where the move put them. "
+              "Re-run.")
         return EXIT_VERIFY
-    print("Verification: no recorded row is where the move put it any more.")
+    print("Verification: no recorded row is where the move put it any more"
+          + (f", except {after.source_gone:,} whose source is gone." if after.source_gone else "."))
     return EXIT_OK
 
 
@@ -1202,13 +1237,21 @@ def delete_datastream(http: Any, endpoint: str, timeout: float) -> requests.Resp
     return requests.delete(endpoint, headers=http.headers(), timeout=timeout)
 
 
+def recorded_sources(moves: Iterable[Move]) -> Counter[str]:
+    """Recorded moves per source datastream (as FROST ids are printed): the rows only that datastream takes back."""
+    return Counter(str(m.from_ds) for m in distinct_moves(moves))
+
+
 def retire(http: Any, things_path: str, datastreams_path: str, prefix: str, fields: Any, *, apply: bool,
-           only: set[str] | None = None, timeout: float = 30.0) -> int:
+           only: set[str] | None = None, timeout: float = 30.0, recorded: Mapping[str, int] | None = None,
+           force: bool = False) -> int:
+    """Delete the empty stale datastreams. One that ``recorded`` (an IDs file's moves per source datastream) names
+    as a source is kept unless ``force``: deleting it ends the rollback of the rows moved out of it."""
     things = migrate.fetch_knmi_things(http, things_path, prefix, fields)
     stale = [s for s in stale_ground_temperature(things, fields) if not only or s.id in only]
     print(f"{len(things)} KNMI Things; {len(stale)} stale ground temperature datastreams"
           + (f" (limited to {sorted(only)})" if only else ""))
-    deleted = kept = failed = 0
+    deleted = kept = held = failed = 0
     for s in stale:
         try:
             count = observation_count(http, datastreams_path, s.id, fields)
@@ -1220,8 +1263,15 @@ def retire(http: Any, things_path: str, datastreams_path: str, prefix: str, fiel
             print(f"  {s.id:>8} {s.name!r}: {count:,} observations; never deleted while it has any")
             kept += 1
             continue
+        sources = (recorded or {}).get(s.id, 0)
+        if sources and not force:
+            print(f"  {s.id:>8} {s.name!r}: empty, but the source of {sources:,} moves in the IDs file; deleting it "
+                  "ends their rollback: left alone (--force-retire deletes it)")
+            held += 1
+            continue
+        note = f" (source of {sources:,} recorded moves: they can no longer be rolled back)" if sources else ""
         if not apply:
-            print(f"  {s.id:>8} {s.name!r}: empty, would be deleted")
+            print(f"  {s.id:>8} {s.name!r}: empty, would be deleted{note}")
             continue
         endpoint = http.endpoint(f"{datastreams_path}({s.id})")
         try:
@@ -1231,17 +1281,18 @@ def retire(http: Any, things_path: str, datastreams_path: str, prefix: str, fiel
             failed += 1
             continue
         if response.ok:
-            print(f"  {s.id:>8} {s.name!r}: deleted")
+            print(f"  {s.id:>8} {s.name!r}: deleted{note}")
             deleted += 1
         else:
             print(f"  {s.id:>8} {s.name!r}: DELETE failed with HTTP {response.status_code}")
             failed += 1
     empty = len(stale) - kept - failed
     print(f"\n{empty} empty" + (f", {deleted} deleted" if apply else " (dry run: nothing deleted)")
-          + f"; {kept} with observations left alone; {failed} failed.")
+          + f"; {kept} with observations left alone; {held} empty but named as a source in the IDs file left alone; "
+          f"{failed} failed.")
     if failed:
         return EXIT_ERROR
-    return EXIT_REFUSED if kept else EXIT_OK
+    return EXIT_REFUSED if kept or held else EXIT_OK
 
 
 def run_retire(args: argparse.Namespace) -> int:
@@ -1259,8 +1310,18 @@ def run_retire(args: argparse.Namespace) -> int:
           f"{'yes' if has_auth else 'none'})")
     print(f"Mode: {'APPLY: deletes empty stale datastreams' if args.apply else 'dry run'}\n")
     only = {str(i) for i in args.datastream} if args.datastream else None
+    recorded = None
+    if args.ids_file:
+        recorded = recorded_sources(read_ids_file(args.ids_file))
+        print(f"IDs file {args.ids_file}: {sum(recorded.values()):,} recorded moves out of {len(recorded)} "
+              "datastreams; a stale datastream named as their source is "
+              + ("deleted anyway (--force-retire): the point of no return for those moves\n" if args.force_retire
+                 else "left alone (--force-retire deletes it)\n"))
+    else:
+        print("No --ids-file: not checked whether recorded moves came out of these datastreams. Deleting one ends "
+              "the rollback of every row moved out of it.\n")
     return retire(http, settings.things_path, settings.datastreams_path, args.prefix, fields, apply=args.apply,
-                  only=only, timeout=settings.request_timeout_seconds)
+                  only=only, timeout=settings.request_timeout_seconds, recorded=recorded, force=args.force_retire)
 
 
 # ---------------------------------------------------------------------------
@@ -1286,7 +1347,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                       help="delete the empty stale 'Ground temperature' datastreams through the FROST API")
     parser.add_argument("--apply", action="store_true", help="write (default: dry run)")
     parser.add_argument("--ids-file", type=Path, metavar="PATH",
-                        help="CSV every moved row is appended to before it is moved; --rollback reads it")
+                        help="CSV every moved row is appended to before it is moved; --rollback reads it; "
+                             "--retire-stale-ground-temperature keeps the datastreams it names as a source")
+    parser.add_argument("--force-retire", action="store_true",
+                        help="with --retire-stale-ground-temperature --ids-file: delete empty stale datastreams even "
+                             "when moves out of them are recorded (they can no longer be rolled back)")
     parser.add_argument("--twins-file", type=Path, metavar="PATH",
                         help="write the twins as observation_id,datastream_id (for cleanup_frost_observations.py)")
     parser.add_argument("--plan-file", type=Path, metavar="PATH", help="write the plan per group as CSV")
@@ -1300,9 +1365,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=1800, help="seconds per psql session (%(default)s)")
     args = parser.parse_args(argv)
     if args.retire_stale_ground_temperature:
-        if args.ssh or args.container or args.ids_file:
-            parser.error("--retire-stale-ground-temperature uses the FROST API: no --ssh/--container or --ids-file")
+        if args.ssh or args.container:
+            parser.error("--retire-stale-ground-temperature uses the FROST API: no --ssh/--container")
+        if args.ids_file is not None and not args.ids_file.is_file():
+            parser.error("--ids-file: no such file (the record written by --apply)")
+        if args.force_retire and args.ids_file is None:
+            parser.error("--force-retire overrides the check against --ids-file: give the IDs file")
         return args
+    if args.force_retire:
+        parser.error("--force-retire goes with --retire-stale-ground-temperature")
     if not (args.ssh or args.container):
         parser.error("one of --ssh or --container is required")
     if min(args.batch_rows, args.chunk, args.top) < 1:

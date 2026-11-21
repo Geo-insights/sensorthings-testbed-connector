@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import dataclasses
 import json
 import re
 from dataclasses import dataclass, field
@@ -16,7 +17,9 @@ from typing import Any
 
 import pytest
 
+from app import config
 from app.frost.odata_fields import odata_fields_for
+from app.frost.target import FrostTarget
 from scripts import fix_knmi_observations as fix
 from scripts import fix_sc_misrouted_observations as misrouted
 from scripts import fix_sc_pressure_units as pressure
@@ -278,6 +281,7 @@ class FakeDb:
     fail_write: int = 0  # fail the n-th move session (after it committed), 0: never
     writes: int = 0
     on_write: Any = None
+    deleted: set[int] = field(default_factory=set)  # datastreams and FeaturesOfInterest deleted since the moves
 
     def __call__(self, sql: str) -> list[str]:
         self.sessions.append(sql)
@@ -355,13 +359,19 @@ class FakeDb:
                 r"\((\d+)::bigint, (\d+)::bigint, (\d+)::bigint, (\d+)::bigint, (\d+)::bigint\)", stmt)]
             at = [m for m in moves if m.observation_id in self.rows
                   and (self.rows[m.observation_id].ds, self.rows[m.observation_id].foi) == (m.to_ds, m.to_foi)]
+            guarded = 'FROM "DATASTREAMS" sd' in stmt and 'FROM "FEATURES" sf' in stmt
+            orphans = [m for m in at if m.from_ds in self.deleted or m.from_foi in self.deleted]
             if "restored AS (" in stmt:
+                if orphans and not guarded:  # the foreign keys fail the whole statement, as in PostgreSQL
+                    raise fix.PsqlError("violates foreign key constraint", [])
                 for m in at:
-                    self.rows[m.observation_id].ds, self.rows[m.observation_id].foi = m.from_ds, m.from_foi
-                return [self._json(t="restored", listed=len(moves), n=len(at))]
+                    if m not in orphans:
+                        self.rows[m.observation_id].ds, self.rows[m.observation_id].foi = m.from_ds, m.from_foi
+                return [self._json(t="restored", listed=len(moves), n=len(at) - len(orphans))]
             back = [m for m in moves if m.observation_id in self.rows
                     and (self.rows[m.observation_id].ds, self.rows[m.observation_id].foi) == (m.from_ds, m.from_foi)]
-            return [self._json(t="rbstate", listed=len(moves), moved=len(at), back=len(back),
+            return [self._json(t="rbstate", listed=len(moves), moved=len(at) - len(orphans),
+                               source_gone=len(orphans), back=len(back),
                                gone=sum(1 for m in moves if m.observation_id not in self.rows))]
         if m := re.search(r"'t', 'refreshed', 'ds', (\d+)", stmt):
             self.refreshed.append(int(m[1]))
@@ -445,6 +455,40 @@ def test_apply_records_before_each_write_and_refreshes(tmp_path: Path, capsys: p
     assert set(db.refreshed) == {1, 2, 3, 4, 6}
 
 
+def test_rollback_skips_rows_whose_source_was_retired(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    db = FakeDb(DATASTREAMS, _rows())
+    before = _state(db)
+    ids_file = tmp_path / "moves.csv"
+    assert fix.run(_args(tmp_path, "--apply"), db) == 0
+    # Retirement deleted the emptied stale datastream 2: rows 4 and 5 were moved out of it.
+    db.deleted.add(2)
+    capsys.readouterr()
+    rollback = ["--container", "db", "--rollback", "--ids-file", str(ids_file), "--batch-rows", "100"]
+    assert fix.run(fix.parse_args(rollback), db) == 0
+    out = capsys.readouterr().out
+    assert re.search(r"where the move put them: to restore\s+3\n", out), out
+    assert re.search(r"where the move put them, source gone: they stay\s+2\n", out), out
+    assert "2 rows cannot go back" in out
+    # One batch holds all five rows: the three with a source go back, the other two stay.
+    assert fix.run(fix.parse_args([*rollback, "--apply"]), db) == 0
+    assert _state(db) == {**before, 4: AFTER[4], 5: AFTER[5]}
+    assert "except 2 whose source is gone" in capsys.readouterr().out
+    # A re-run has nothing left to do and does not fail either.
+    assert fix.run(fix.parse_args([*rollback, "--apply"]), db) == 0
+    assert _state(db) == {**before, 4: AFTER[4], 5: AFTER[5]}
+
+
+def test_a_rollback_without_the_source_check_would_fail_its_batch(tmp_path: Path) -> None:
+    db = FakeDb(DATASTREAMS, _rows())
+    assert fix.run(_args(tmp_path, "--apply"), db) == 0
+    db.deleted.add(2)
+    moves = fix.distinct_moves(fix.read_ids_file(tmp_path / "moves.csv"))
+    unguarded = fix.restore_sql(moves).replace(f"AND {fix._SOURCE_EXISTS}", "")
+    with pytest.raises(fix.PsqlError, match="foreign key"):
+        db(unguarded)
+    assert fix._SOURCE_EXISTS in fix.restore_sql(moves) and fix._SOURCE_EXISTS in fix.rollback_state_sql(moves)
+
+
 def test_a_failed_write_still_refreshes_what_it_touched(tmp_path: Path) -> None:
     db = FakeDb(DATASTREAMS, _rows(), fail_write=1)
     with pytest.raises(fix.PsqlError, match="connection reset"):
@@ -506,6 +550,12 @@ def test_parse_args() -> None:
         fix.parse_args(["--retire-stale-ground-temperature", "--container", "db"])
     with pytest.raises(SystemExit):
         fix.parse_args(["--rollback", "--retire-stale-ground-temperature"])
+    with pytest.raises(SystemExit):
+        fix.parse_args(["--retire-stale-ground-temperature", "--ids-file", "does-not-exist.csv"])
+    with pytest.raises(SystemExit):
+        fix.parse_args(["--retire-stale-ground-temperature", "--force-retire"])  # nothing to override
+    with pytest.raises(SystemExit):
+        fix.parse_args(["--container", "db", "--force-retire"])
     assert fix.parse_args(["--retire-stale-ground-temperature"]).apply is False
     assert fix.parse_args(["--container", "db"]).apply is False
 
@@ -601,6 +651,54 @@ def test_retire_deletes_only_empty_ones(frost: FakeFrost) -> None:
     assert fix.retire(frost, "/Things", "/Datastreams", PREFIX, odata_fields_for("v1.1"), apply=True,
                       only={"5"}) == fix.EXIT_OK
     assert frost.deleted == ["2", "5"]
+
+
+def test_retire_keeps_a_source_of_recorded_moves_unless_forced(frost: FakeFrost, tmp_path: Path,
+                                                                capsys: pytest.CaptureFixture[str]) -> None:
+    ids_file = tmp_path / "moves.csv"
+    fix.prepare_ids_file(ids_file)
+    fix.append_moves(ids_file, [fix.Move(10, 2, 3, 100, 100), fix.Move(11, 2, 3, 100, 100), fix.Move(12, 9, 1, 1, 1)])
+    recorded = fix.recorded_sources(fix.read_ids_file(ids_file))
+    assert recorded == {"2": 2, "9": 1}
+    frost.counts["5"] = 0
+    fields = odata_fields_for("v1.1")
+    assert fix.retire(frost, "/Things", "/Datastreams", PREFIX, fields, apply=True, recorded=recorded) \
+        == fix.EXIT_REFUSED
+    assert frost.deleted == ["5"]
+    out = capsys.readouterr().out
+    assert "empty, but the source of 2 moves in the IDs file" in out
+    assert "1 empty but named as a source in the IDs file left alone" in out
+    assert fix.retire(frost, "/Things", "/Datastreams", PREFIX, fields, apply=False, recorded=recorded,
+                      force=True) == fix.EXIT_OK
+    assert "would be deleted (source of 2 recorded moves: they can no longer be rolled back)" in \
+        capsys.readouterr().out
+    assert fix.retire(frost, "/Things", "/Datastreams", PREFIX, fields, apply=True, recorded=recorded,
+                      force=True) == fix.EXIT_OK
+    assert frost.deleted == ["5", "2", "5"]
+
+
+def test_run_retire_reads_the_ids_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                       capsys: pytest.CaptureFixture[str]) -> None:
+    ids_file = tmp_path / "moves.csv"
+    fix.prepare_ids_file(ids_file)
+    fix.append_moves(ids_file, [fix.Move(10, 2, 3, 100, 100)])
+    seen: dict[str, Any] = {}
+
+    def fake_retire(*args: Any, **kwargs: Any) -> int:
+        seen.update(kwargs)
+        return fix.EXIT_OK
+
+    monkeypatch.setattr(fix, "retire", fake_retire)
+    target = FrostTarget(url="http://frost/v1.1", version="v1.1", label="t")
+    monkeypatch.setattr(config, "settings", dataclasses.replace(config.settings, frost_targets=(target,)))
+    assert fix.main(["--retire-stale-ground-temperature", "--ids-file", str(ids_file)]) == fix.EXIT_OK
+    assert seen["recorded"] == {"2": 1} and seen["force"] is False
+    assert "a stale datastream named as their source is left alone" in capsys.readouterr().out
+    assert fix.main(["--retire-stale-ground-temperature", "--ids-file", str(ids_file), "--force-retire"]) == 0
+    assert seen["force"] is True
+    assert fix.main(["--retire-stale-ground-temperature"]) == fix.EXIT_OK
+    assert seen["recorded"] is None
+    assert "No --ids-file" in capsys.readouterr().out
 
 
 def test_retire_never_deletes_when_the_count_fails(frost: FakeFrost) -> None:
