@@ -8,6 +8,10 @@ htmlcov/
 data/*.json
 data/*.jsonl
 data/validation/
+# Created by every test run and local start: app/main.py makes data/sensor_images/
+# at import, app/logging_config.py writes logs/connector.log.
+data/sensor_images/
+logs/
 deserializing-consumer-example/projectsecrets.py
 .claude/
 TASK_LEDGER.md

@@ -1,0 +1,9 @@
+# Everything the done-gate in CLAUDE.md needs: the connector, the MCP server
+# (tests/test_mcp_* import mcp_server, which needs mcp, PyJWT and stripe), the
+# asyncio plugin those tests run under (@pytest.mark.asyncio), and mypy.
+# The images install requirements.txt (connector) or mcp_server/requirements.txt
+# (MCP server) only.
+-r requirements.txt
+-r mcp_server/requirements.txt
+pytest-asyncio>=1.0,<2.0
+mypy>=2.4,<3.0

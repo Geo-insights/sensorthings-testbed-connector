@@ -24,6 +24,7 @@ Same as main Geo Insights project:
 - `app/sources/` — Source-specific parsers, normalizers, and entity builders
 - `data/` — Persistent entity caches (`registered_entities.json`, `entities_{target}.json`)
 - `scripts/` — Utility scripts (catchup, discovery, demo reset)
+- `deploy/` — Hetzner deployment of the connector; `deploy/frost/` — what FROST's database needs that FROST-Server does not create (index `OBS_DS_PHENTIME`), and when to put it back
 
 ### Data sources (10)
 | Source | Type | Module | Poll interval |
@@ -70,7 +71,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8010
 
 ## Verified commands
 ```bash
-# Unit tests (747 tests, ~14s, excludes integration by default)
+# Install what the gate needs: requirements.txt, mcp_server/requirements.txt
+# (tests/test_mcp_*), pytest-asyncio and mypy
+python -m pip install -r requirements-dev.txt
+
+# Unit tests (1172 tests, ~35s, excludes integration by default)
 python -m pytest tests/ -q
 
 # Integration tests (needs Docker: docker compose -f docker-compose.test.yaml up -d)
@@ -87,8 +92,9 @@ python -m mypy app/
 ```
 
 ### Done-gate (verification gate for any task)
-A task is done when **all three** pass with zero errors:
+A task is done when **all three** pass with zero errors, in an environment with `requirements-dev.txt` installed:
 ```bash
+python -m pip install -r requirements-dev.txt
 python -m pytest tests/ -q && python -m ruff check app/ tests/ scripts/ && python -m mypy app/
 ```
 
