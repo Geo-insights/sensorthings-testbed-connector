@@ -341,6 +341,8 @@ class TGVPrimaryRegistration:
                     pinned[key] = ds_id
             if not readings:
                 return []
+            if not self._sets():
+                self._hold_unconfigured(len(readings))
             owners = self._owner_of()
             waiting = Counter(
                 owners[key]
@@ -471,6 +473,30 @@ class TGVPrimaryRegistration:
             f"{len(sets)} TGV entity set(s) not registered on the primary FROST target yet; "
             f"{count} readings left uncommitted"
         )
+
+    def _hold_unconfigured(self, count: int) -> None:
+        """No TGV entity set is loaded at all: hold the batch rather than drop every reading.
+
+        An empty entity_configs/ (the directory missing from the image, say) is a
+        deployment fault, not a stream nobody defined. Dropping would commit the
+        offsets and lose the readings for good; held, Kafka delivers them again
+        once the configs are back.
+        """
+        _events.error(
+            "TGV: no TGV entity set loaded (entity_configs/tgv_*.yaml missing?); all %d readings of the batch "
+            "left uncommitted for Kafka to deliver again",
+            count,
+        )
+        if not self._holding:
+            self._holding = True
+            self._alert(
+                "TGV Kafka batches are held: no TGV entity set is loaded (entity_configs/tgv_*.yaml missing from "
+                "the deployment?). Kafka keeps the batches until the configs are back.",
+                level="critical",
+                context={"pending": []},
+            )
+        # Static text: the Kafka loop scans the message for auth errors.
+        raise TGVRegistrationPending(f"no TGV entity set loaded; {count} readings left uncommitted")
 
     def _routable(self, base_url: str, readings: list[SensorReading], routes: dict[str, str]) -> list[SensorReading]:
         """The readings with a registered datastream; the others (in no TGV set) are dropped, with an alert."""
