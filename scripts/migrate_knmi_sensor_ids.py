@@ -45,18 +45,66 @@ script reads everything again and reports what is left (nothing, normally).
 Rollout order: migrate first, then deploy
 -----------------------------------------
 1. Dry run; check the plan (production, 2026-11-20: 57 Things, 627 Datastreams).
-2. --apply while the old connector image still runs. It keeps routing as
-   before: its cache maps "knmi-<index>::<property>" to datastream ids, filled
-   at startup, and it never reads properties.sensor_id again; its registration
-   checks cached ids by name only.
-3. Deploy the fixed connector. At startup its warm-up maps the keys its readings
-   use ("knmi-<WIGOS id>::temperature") from the migrated properties and purges
-   the persisted "knmi-<index>::..." entries (they now name another sensor's
-   datastream); restart seeding finds the high-water marks under the new keys,
-   so the readings FROST already has are not posted again; registration finds
-   every entity by name.
+2. --apply --journal FILE while the old connector image still runs (see "The
+   journal and the way back"). The old image keeps routing as before: its cache
+   maps "knmi-<index>::<property>" to datastream ids, filled at startup, and it
+   never reads properties.sensor_id again; its registration checks cached ids by
+   name only.
+3. Deploy the fixed connector, which must include the restart seeding of
+   fix/seeding-followups (c9c1b6d). At startup its warm-up maps the keys its
+   readings use ("knmi-<WIGOS id>::temperature") from the migrated properties
+   and purges the persisted "knmi-<index>::..." entries (they now name another
+   sensor's datastream); registration finds every entity by name. The
+   Observations keep their old labels (sensor_id "knmi-<index>"), so no row is
+   labelled with a new key: restart seeding marks a Datastream's new key from
+   its newest Observation only when that row is the same station's under the
+   older sensor id (same canonical observed property, parameters.thing_name the
+   Thing's name without the entity name prefix). Where the newest row is
+   another's (another station's misplaced reading, a TGV or Sensor.Community
+   row), the new key gets no mark and the first cycle posts the station's
+   latest readings again, now into its own Datastream; where the old image had
+   put them into another station's Datastream, scripts/fix_knmi_observations.py
+   reports those as twins (--twins-file) instead of moving them. Without
+   c9c1b6d no new key is marked and the first cycle re-posts every KNMI
+   Datastream's latest value.
 4. Dry run again: nothing left. Stations that appeared between 2 and 3 (created
-   by the old image under an index) show up here: --apply again.
+   by the old image under an index) show up here: --apply again, with the same
+   journal.
+
+The journal and the way back
+----------------------------
+Every PATCH replaces a whole properties object, so --apply needs --journal FILE:
+before each PATCH it appends {entity_set, id, name, old properties, new
+properties, target} as one JSON line to FILE and fsyncs it, and prints the same
+line to stdout behind "JOURNAL ". A journal that cannot be written stops the run
+before the next PATCH. Re-runs append to the same file.
+
+--rollback --journal FILE (a dry run unless --apply) reads the current
+properties of every journaled entity and PATCHes the old object back where the
+entity is still as the migration left it (its properties equal the recorded
+new object; several records of one entity are walked back from the newest).
+An entity changed since is reported and left alone (exit 3), as is one deleted
+since. It refuses a journal recorded on another FROST target. It does not need
+the KNMI API. A rollback puts the old "knmi-<index>" ids back, so it only makes
+sense while the old image runs (before step 3), or together with a redeploy of
+the old image.
+
+The script runs inside the connector container, so FILE is a path there. Use
+the data volume (/app/data, kept when the container is recreated by the deploy)
+and keep stdout as a second copy outside the container: tee it on the machine
+the command is run from. --rollback reads either, the journal file or a saved
+stdout (it takes the "JOURNAL " lines and skips the rest):
+
+    docker compose exec -T connector python -u - --apply \
+        --journal /app/data/knmi_sensor_ids_journal.jsonl \
+        < scripts/migrate_knmi_sensor_ids.py | tee knmi_sensor_ids_apply.log
+    docker compose cp connector:/app/data/knmi_sensor_ids_journal.jsonl .
+    docker compose exec -T connector python -u - --rollback \
+        --journal /app/data/knmi_sensor_ids_journal.jsonl [--apply] < scripts/migrate_knmi_sensor_ids.py
+
+If the file inside the container is lost, copy the saved stdout in
+(docker compose cp knmi_sensor_ids_apply.log connector:/app/data/) and pass
+that as --journal.
 
 Deploying first delivers most readings, but worse: every cached mapping is
 refused (the datastream belongs to sensor knmi-<index>), so each (Thing,
@@ -82,8 +130,10 @@ database). Query options follow the target's declared ``version``; ids and next
 links in responses are read in either convention, so a v2.0 URL declared as
 v1.1 (the connector's default, and production's setting) works as well.
 
-    python -m scripts.migrate_knmi_sensor_ids             # dry run
-    python -m scripts.migrate_knmi_sensor_ids --apply     # write
+    python -m scripts.migrate_knmi_sensor_ids                               # dry run
+    python -m scripts.migrate_knmi_sensor_ids --apply --journal FILE        # write
+    python -m scripts.migrate_knmi_sensor_ids --rollback --journal FILE     # undo: dry run
+    python -m scripts.migrate_knmi_sensor_ids --rollback --journal FILE --apply
 
 The script only imports ``app.config``, ``app.exceptions`` and ``app.frost``,
 which predate it, so it can be piped into a running connector container whose
@@ -91,7 +141,8 @@ image does not contain it; arguments go after ``-``, and ``-u`` keeps the output
 unbuffered:
 
     docker compose exec -T connector python -u - < scripts/migrate_knmi_sensor_ids.py
-    docker compose exec -T connector python -u - --apply < scripts/migrate_knmi_sensor_ids.py
+    docker compose exec -T connector python -u - --apply --journal /app/data/knmi_sensor_ids_journal.jsonl \
+        < scripts/migrate_knmi_sensor_ids.py | tee knmi_sensor_ids_apply.log
 
 The FROST target and its credentials come from the connector's environment
 (SENSORTHINGS_BASE_URL / SENSORTHINGS_BASE_URLS and the SENSORTHINGS_AUTH_*
@@ -101,11 +152,12 @@ sent to a URL that is not configured. ``--locations-file`` reads a saved
 /locations response instead of asking the API.
 
 Exit status (the first that applies, in this order):
-    1  a FROST request failed (reading the Things, or a PATCH), or a PATCH did
-       not stick
+    1  a FROST request failed (reading the Things, or a PATCH), a PATCH did not
+       stick, or the journal could not be written or read
     2  the KNMI station list could not be read; nothing was planned
     3  Things or Datastreams were left alone (see the report): re-running won't
-       help until they are looked at
+       help until they are looked at; with --rollback: entities changed since
+       the migration were left alone
     0  otherwise
 """
 
@@ -114,12 +166,14 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import sys
 import time
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -151,6 +205,12 @@ EXIT_OK = 0
 EXIT_FROST_FAILED = 1
 EXIT_KNMI_FAILED = 2
 EXIT_LEFT = 3
+
+# The journal: one JSON object per PATCH, {"t": JOURNAL_TAG, "target", "entity_set", "id", "name", "old", "new",
+# "at"}, appended and fsynced before the PATCH is sent, and printed to stdout behind JOURNAL_MARKER.
+JOURNAL_TAG = "knmi-sensor-id-migration"
+JOURNAL_MARKER = "JOURNAL "
+ENTITY_SETS = (DATASTREAMS, SENSORS, THINGS)
 
 # Why a Thing is left alone.
 NOT_KNMI = "not_knmi"
@@ -192,6 +252,7 @@ class Patch:
     entity_name: str
     properties: dict[str, Any]  # the whole new properties object
     changes: tuple[tuple[str, Any, Any], ...]  # (key, old value, new value)
+    old_properties: dict[str, Any] = field(default_factory=dict)  # the whole properties object as read
 
 
 @dataclass
@@ -389,7 +450,7 @@ def plan_station(
         new_properties, changes = rewrite_properties(properties, old, new_sensor_id)
         if changes:
             plan.old_sensor_ids[old or "no sensor_id"] += 1
-            plan.patches.append(Patch(DATASTREAMS, ds_id, ds_name, new_properties, changes))
+            plan.patches.append(Patch(DATASTREAMS, ds_id, ds_name, new_properties, changes, dict(properties)))
         sensor = datastream.get("Sensor")
         sensor_entity_id = entity_id(sensor, fields) if isinstance(sensor, dict) else None
         if isinstance(sensor, dict) and sensor_entity_id is not None:
@@ -402,13 +463,15 @@ def plan_station(
             continue  # the connector sets no Sensor properties
         new_properties, changes = rewrite_properties(properties, old, new_sensor_id)
         if changes:
-            plan.patches.append(Patch(SENSORS, sensor_entity_id, str(sensor.get("name") or ""), new_properties, changes))
+            plan.patches.append(
+                Patch(SENSORS, sensor_entity_id, str(sensor.get("name") or ""), new_properties, changes, dict(properties))
+            )
 
     thing_properties = _properties(thing)
     if str(thing_properties.get("knmi_station_id") or "") != station.station_id:
         new_properties = {**thing_properties, "knmi_station_id": station.station_id}
         change = ("knmi_station_id", thing_properties.get("knmi_station_id"), station.station_id)
-        plan.patches.append(Patch(THINGS, thing_id, thing_name, new_properties, (change,)))
+        plan.patches.append(Patch(THINGS, thing_id, thing_name, new_properties, (change,), dict(thing_properties)))
 
     for observed_property, entries in sorted(by_property.items()):
         if len(entries) > 1:
@@ -603,8 +666,49 @@ def fetch_station_list(
     raise KnmiApiError(f"GET {url} failed after {len(_API_WAITS) + 1} attempts: {error}")
 
 
-def apply_plan(http: FrostHTTPClient, plan: Plan, paths: dict[str, str]) -> tuple[int, int]:
-    """PATCH every planned entity: Datastreams first, then Sensors, then Things."""
+class JournalError(Exception):
+    """The journal could not be written or read."""
+
+
+class Journal:
+    """Append-only record of every PATCH: written and fsynced before the PATCH is sent, and echoed to stdout.
+
+    The file is the record ``--rollback`` reads. The stdout copy (each line behind :data:`JOURNAL_MARKER`) is
+    for the operator's ``| tee``: the script usually runs inside the connector container, so the file lives
+    there (on the data volume); the tee keeps a copy outside. ``--rollback`` reads either.
+    """
+
+    def __init__(self, path: Path, target_url: str) -> None:
+        self.path = path
+        self.target_url = target_url.rstrip("/")
+
+    def record(self, patch: Patch) -> None:
+        entry = {
+            "t": JOURNAL_TAG,
+            "target": self.target_url,
+            "entity_set": patch.entity_set,
+            "id": patch.entity_id,
+            "name": patch.entity_name,
+            "old": patch.old_properties,
+            "new": patch.properties,
+            "at": datetime.now(UTC).isoformat(timespec="seconds"),
+        }
+        line = json.dumps(entry, sort_keys=True)
+        try:
+            with self.path.open("a", encoding="utf-8", newline="\n") as out:
+                out.write(line + "\n")
+                out.flush()
+                os.fsync(out.fileno())
+        except OSError as exc:
+            raise JournalError(f"cannot append to the journal {self.path}: {exc}") from exc
+        print(JOURNAL_MARKER + line, flush=True)
+
+
+def apply_plan(http: FrostHTTPClient, plan: Plan, paths: dict[str, str], journal: Journal) -> tuple[int, int]:
+    """PATCH every planned entity: Datastreams first, then Sensors, then Things.
+
+    Each PATCH is in the journal before it is sent; when the journal cannot be written, nothing more is sent.
+    """
     applied = failed = 0
     order = {DATASTREAMS: 0, SENSORS: 1, THINGS: 2}
     for station in plan.stations:
@@ -614,6 +718,11 @@ def apply_plan(http: FrostHTTPClient, plan: Plan, paths: dict[str, str]) -> tupl
             if not endpoint:
                 failed += 1
                 continue
+            try:
+                journal.record(patch)
+            except JournalError as exc:
+                print(f"  STOPPED before {label}: {exc}; nothing more was PATCHed")
+                return applied, failed + 1
             try:
                 response = http.patch(endpoint, patch_body(patch))
             except FrostConnectionError as exc:
@@ -700,7 +809,10 @@ def run(
     entity_prefix: str,
     paths: dict[str, str],
     apply: bool,
+    journal: Journal | None = None,
 ) -> int:
+    if apply and journal is None:
+        raise ValueError("--apply needs a journal: the record that makes --rollback possible")
     stations = parse_stations(stations_body)
     if not stations:
         print("The KNMI station list has no stations with an id and a Point; nothing was planned.")
@@ -715,7 +827,11 @@ def run(
         print("Dry run: nothing was written." + (" Re-run with --apply to PATCH them." if plan.patches else ""))
         return exit_status(plan, 0)
 
-    applied, failed = apply_plan(http, plan, paths)
+    assert journal is not None
+    if plan.patches:
+        print(f"Every PATCH is appended to the journal {journal.path} (and printed after {JOURNAL_MARKER.strip()!r}) "
+              "before it is sent.")
+    applied, failed = apply_plan(http, plan, paths, journal)
     print(f"Applied {applied} PATCHes, {failed} failed.")
     if applied:
         after = build_plan(fetch_knmi_things(http, paths[THINGS], entity_prefix, fields), stations, entity_prefix, fields)
@@ -728,9 +844,210 @@ def run(
     return exit_status(plan, failed)
 
 
+# ---------------------------------------------------------------------------
+# Rollback
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class JournalEntry:
+    target: str
+    entity_set: str
+    entity_id: str
+    name: str
+    old: dict[str, Any]
+    new: dict[str, Any]
+
+
+def _journal_entry(obj: Any) -> JournalEntry | None:
+    if not isinstance(obj, dict) or obj.get("t") != JOURNAL_TAG:
+        return None
+    entity_set, entity_id, old, new = obj.get("entity_set"), obj.get("id"), obj.get("old"), obj.get("new")
+    if entity_set not in ENTITY_SETS or not isinstance(entity_id, str) or not entity_id \
+            or not isinstance(old, dict) or not isinstance(new, dict):
+        raise ValueError("a journal record without entity_set, id, old and new")
+    return JournalEntry(str(obj.get("target") or ""), entity_set, entity_id, str(obj.get("name") or ""), old, new)
+
+
+def read_journal(path: Path) -> list[JournalEntry]:
+    """The records of a journal file, or of a saved stdout (lines behind JOURNAL_MARKER), in order.
+
+    Other lines of a saved stdout are skipped. A cut-off last line (a run killed while appending it: its PATCH
+    was never sent) is skipped with a warning; an unreadable line elsewhere is an error.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise JournalError(f"cannot read the journal {path}: {exc}") from exc
+    while lines and not lines[-1].strip():
+        lines.pop()
+    entries: list[JournalEntry] = []
+    for number, raw in enumerate(lines, start=1):
+        line = raw.strip()
+        marked = line.startswith(JOURNAL_MARKER)
+        if marked:
+            line = line[len(JOURNAL_MARKER):].strip()
+        if not marked and not line.startswith("{"):
+            continue
+        try:
+            entry = _journal_entry(json.loads(line))
+        except ValueError as exc:
+            if number == len(lines):
+                print(f"  WARNING: {path}, line {number}: cut-off last record skipped (its PATCH was never sent)")
+                break
+            raise JournalError(f"{path}, line {number}: {exc}") from exc
+        if entry is not None:
+            entries.append(entry)
+    return entries
+
+
+@dataclass
+class Restore:
+    entity_set: str
+    entity_id: str
+    name: str
+    properties: dict[str, Any]  # to PATCH
+
+
+@dataclass
+class RollbackPlan:
+    restore: list[Restore] = field(default_factory=list)
+    unchanged: list[str] = field(default_factory=list)  # already as before the migration
+    changed: list[str] = field(default_factory=list)  # changed since: left alone
+    missing: list[str] = field(default_factory=list)  # deleted since
+    errors: list[str] = field(default_factory=list)
+
+
+def fetch_properties(http: FrostHTTPClient, path: str, entity_id: str) -> dict[str, Any] | None:
+    """An entity's current properties ({} when it has none), or None when FROST no longer has it."""
+    endpoint = http.endpoint(f"{path}({entity_id})")
+    if not endpoint:
+        raise JournalError("No FROST endpoint configured.")
+    try:
+        response = http.get(endpoint)
+    except FrostConnectionError as exc:
+        raise RuntimeError(f"GET failed: {type(exc.cause or exc).__name__}") from None
+    if response.status_code == 404:
+        return None
+    if not response.ok:
+        raise RuntimeError(f"GET failed with {_frost_failure(response)}")
+    try:
+        body = response.json()
+    except ValueError:
+        raise RuntimeError("GET returned a body that is not JSON") from None
+    if not isinstance(body, dict):
+        raise RuntimeError("GET returned no entity")
+    properties = body.get("properties")
+    return dict(properties) if isinstance(properties, dict) else {}
+
+
+def rollback_target(current: dict[str, Any], entries: Sequence[JournalEntry]) -> dict[str, Any] | None:
+    """The properties before the first recorded PATCH, walking the entity's records back from ``current``;
+    None when the entity was changed since (``current`` is neither a record's new nor its old object)."""
+    state = current
+    for entry in reversed(entries):
+        if state == entry.new:
+            state = entry.old
+        elif state != entry.old:  # equal to old: that PATCH never took effect
+            return None
+    return state
+
+
+def plan_rollback(http: FrostHTTPClient, entries: Sequence[JournalEntry], paths: dict[str, str]) -> RollbackPlan:
+    by_entity: dict[tuple[str, str], list[JournalEntry]] = defaultdict(list)
+    for entry in entries:
+        by_entity[(entry.entity_set, entry.entity_id)].append(entry)
+    plan = RollbackPlan()
+    for (entity_set, entity_id), records in by_entity.items():
+        label = f"{entity_set}({entity_id}) {records[-1].name!r}"
+        try:
+            current = fetch_properties(http, paths[entity_set], entity_id)
+        except RuntimeError as exc:
+            plan.errors.append(f"{label}: {exc}")
+            continue
+        if current is None:
+            plan.missing.append(label)
+            continue
+        target = rollback_target(current, records)
+        if target is None:
+            plan.changed.append(label)
+        elif target == current:
+            plan.unchanged.append(label)
+        else:
+            plan.restore.append(Restore(entity_set, entity_id, records[-1].name, target))
+    return plan
+
+
+def print_rollback_plan(plan: RollbackPlan) -> None:
+    counts = Counter(item.entity_set for item in plan.restore)
+    print(f"To restore: {len(plan.restore)} ({', '.join(f'{counts[s]} {s}' for s in ENTITY_SETS)}); "
+          f"already as before: {len(plan.unchanged)}; changed since (left alone): {len(plan.changed)}; "
+          f"deleted since: {len(plan.missing)}; failed to read: {len(plan.errors)}")
+    for label in plan.changed:
+        print(f"  changed since the migration, left alone: {label}")
+    for label in plan.missing:
+        print(f"  deleted since the migration: {label}")
+    for error in plan.errors:
+        print(f"  FROST error: {error}")
+
+
+def run_rollback(
+    http: FrostHTTPClient, journal_path: Path, *, target_url: str, paths: dict[str, str], apply: bool
+) -> int:
+    """PATCH every journaled entity back to its properties before the migration, where it is still as the
+    migration left it. A dry run unless ``apply``."""
+    entries = read_journal(journal_path)
+    print(f"Journal {journal_path}: {len(entries)} records of "
+          f"{len({(e.entity_set, e.entity_id) for e in entries})} entities")
+    others = sorted({e.target for e in entries if e.target.rstrip('/') != target_url.rstrip('/')})
+    if others:
+        print(f"The journal records PATCHes on another FROST target ({', '.join(others)}); entity ids are per "
+              "server. Pick that target with --target-url. Nothing was done.")
+        return EXIT_FROST_FAILED
+    plan = plan_rollback(http, entries, paths)
+    print_rollback_plan(plan)
+    if not apply:
+        print("Dry run: nothing was written." + (" Re-run with --apply to restore them." if plan.restore else ""))
+        return EXIT_FROST_FAILED if plan.errors else (EXIT_LEFT if plan.changed else EXIT_OK)
+
+    restored = failed = 0
+    for item in plan.restore:
+        label = f"{item.entity_set}({item.entity_id})"
+        endpoint = http.endpoint(f"{paths[item.entity_set]}({item.entity_id})")
+        try:
+            response = http.patch(endpoint, {"properties": item.properties}) if endpoint else None
+        except FrostConnectionError as exc:
+            print(f"  FAILED {label}: {type(exc.cause or exc).__name__}")
+            failed += 1
+            continue
+        if response is not None and response.ok:
+            restored += 1
+        else:
+            failed += 1
+            print(f"  FAILED {label}: {_frost_failure(response) if response is not None else 'no endpoint'}")
+    print(f"Restored {restored} entities, {failed} failed.")
+    pending = 0
+    for item in plan.restore:
+        try:
+            if fetch_properties(http, paths[item.entity_set], item.entity_id) != item.properties:
+                pending += 1
+        except RuntimeError:
+            pending += 1
+    print(f"Read back: {pending} entities not as before the migration." if pending
+          else "Read back: every restored entity is as before the migration.")
+    if failed or pending or plan.errors:
+        return EXIT_FROST_FAILED
+    return EXIT_LEFT if plan.changed else EXIT_OK
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0] if __doc__ else None)
     parser.add_argument("--apply", action="store_true", help="PATCH the entities (default: dry run)")
+    parser.add_argument("--journal", type=Path, metavar="FILE",
+                        help="with --apply: append every PATCH (old and new properties) here before sending it; "
+                             "with --rollback: the journal to undo")
+    parser.add_argument("--rollback", action="store_true",
+                        help="restore the properties recorded in --journal (a dry run unless --apply)")
     parser.add_argument("--target-url", help="one of the configured FROST targets (default: the primary target)")
     parser.add_argument(
         "--api-url",
@@ -740,6 +1057,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--locations-file", type=Path, help="a saved EDR /locations response to use instead of the API")
     parser.add_argument("--prefix", default=settings.entity_name_prefix, help="entity name prefix (default from env)")
     args = parser.parse_args(argv)
+    if args.rollback and (args.journal is None or not args.journal.is_file()):
+        parser.error("--rollback needs --journal FILE: the journal an --apply wrote")
+    if args.apply and args.journal is None:
+        parser.error("--apply needs --journal FILE: the record of the old properties, for --rollback")
 
     target = select_target(settings.frost_targets, args.target_url)
     fields = odata_fields_for(target.version)
@@ -758,6 +1079,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     endpoint_version = url_version(target.url)
     if endpoint_version and odata_fields_for(endpoint_version) != fields:
         print(f"  note: the URL is a {endpoint_version} endpoint; ids and next links are read in both conventions")
+    paths = {THINGS: settings.things_path, DATASTREAMS: settings.datastreams_path, SENSORS: settings.sensors_path}
+    if args.rollback:
+        print(f"Mode: ROLLBACK {'APPLY' if args.apply else 'dry run'}\n")
+        try:
+            return run_rollback(http, args.journal, target_url=target.url, paths=paths, apply=args.apply)
+        except JournalError as exc:
+            print(f"{exc}; nothing was done.")
+            return EXIT_FROST_FAILED
     print(f"Thing name prefix: {thing_prefix(args.prefix)!r}")
     print(f"Mode: {'APPLY' if args.apply else 'dry run'}\n")
 
@@ -782,8 +1111,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         stations_body,
         fields=fields,
         entity_prefix=args.prefix,
-        paths={THINGS: settings.things_path, DATASTREAMS: settings.datastreams_path, SENSORS: settings.sensors_path},
+        paths=paths,
         apply=args.apply,
+        journal=Journal(args.journal, target.url) if args.apply else None,
     )
 
 

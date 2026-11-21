@@ -29,7 +29,8 @@ test_deploy_then_migrate shows what goes wrong the other way round.
 FROST comes from ``KNMI_MIGRATE_FROST_URL`` (a service root with Basic auth
 write/write and no anonymous reads) or from docker compose: FROST 2.8
 (``KNMI_MIGRATE_FROST_IMAGE`` overrides) and PostGIS 16 under the project name
-``lnknmi-it-<random>``, the database on tmpfs, removed afterwards.
+``lnknmi-it-<random>`` (``KNMI_IT_DOCKER_PREFIX`` replaces ``lnknmi``), the
+database on tmpfs, removed afterwards.
 
     python -m pytest tests/integration/test_migrate_knmi_sensor_ids.py -m integration
 """
@@ -175,7 +176,8 @@ def frost_root() -> Iterator[str]:
     port = _free_port()
     image = os.environ.get("KNMI_MIGRATE_FROST_IMAGE", "fraunhoferiosb/frost-server:2.8")
     compose = _COMPOSE.replace("IMAGE", image).replace("PORT", str(port))
-    project = ["docker", "compose", "-p", f"lnknmi-it-{uuid.uuid4().hex[:8]}", "-f", "-"]
+    prefix = os.environ.get("KNMI_IT_DOCKER_PREFIX", "lnknmi")
+    project = ["docker", "compose", "-p", f"{prefix}-it-{uuid.uuid4().hex[:8]}", "-f", "-"]
     try:
         subprocess.run([*project, "up", "-d"], input=compose, text=True, check=True, capture_output=True, timeout=600)
         root = f"http://127.0.0.1:{port}/FROST-Server"  # the port is bound to IPv4 only
@@ -278,6 +280,7 @@ class Env:
         monkeypatch.delenv("SENSORTHINGS_BASE_URL", raising=False)
         monkeypatch.setenv("SENSORTHINGS_BASE_URLS", json.dumps([target]))
         self.cache_file = tmp_path / "registered_entities.json"
+        self.journal = tmp_path / "knmi_sensor_ids_journal.jsonl"
         self.settings = dataclasses.replace(
             config.settings,
             sensorthings_base_url="",
@@ -495,6 +498,22 @@ def _sensor_ids(env: Env) -> dict[str, list[str]]:
     }
 
 
+def _properties(env: Env) -> dict[str, Any]:
+    """properties of every Thing, Datastream and Sensor of this test's KNMI Things, by entity."""
+    body = _get(f"{env.read}/Things", {
+        "$filter": f"startswith(name,'{env.prefix}KNMI ')",
+        "$expand": "Datastreams($top=1000;$expand=Sensor)",
+        "$top": "100",
+    })
+    found: dict[str, Any] = {}
+    for thing in body["value"]:
+        found[f"Things({thing['@iot.id']})"] = thing.get("properties")
+        for ds in thing["Datastreams"]:
+            found[f"Datastreams({ds['@iot.id']})"] = ds.get("properties")
+            found[f"Sensors({ds['Sensor']['@iot.id']})"] = ds["Sensor"].get("properties")
+    return found
+
+
 def _thing_name(env: Env, st: Station) -> str:
     return f"{env.prefix}KNMI {st.name}"
 
@@ -528,9 +547,31 @@ def test_migrate_then_deploy(env, capsys, endpoint, declared):
     assert f"share the key knmi-{S1.wigos}::ground_temperature" in out
     assert _sensor_ids(env)[_thing_name(env, S0)] == ["knmi-0"]
 
-    # 2. --apply while the old image runs.
-    assert env.migrate("--apply", endpoint=endpoint, declared=declared) == migrate.EXIT_OK
-    assert "Read back: every planned entity is on its station id." in capsys.readouterr().out
+    # 2. --apply while the old image runs; a journal is required.
+    original = _properties(env)
+    with pytest.raises(SystemExit):
+        env.migrate("--apply", endpoint=endpoint, declared=declared)
+    journal = ["--journal", str(env.journal)]
+    assert env.migrate("--apply", *journal, endpoint=endpoint, declared=declared) == migrate.EXIT_OK
+    out = capsys.readouterr().out
+    assert "Read back: every planned entity is on its station id." in out
+    migrated = _properties(env)
+    records = migrate.read_journal(env.journal)
+    assert len(records) == 45 == out.count(f"\n{migrate.JOURNAL_MARKER}")
+    assert {f"{r.entity_set}({r.entity_id})": r.old for r in records} == {
+        key: value for key, value in original.items() if value != migrated[key]
+    }
+
+    # The journal undoes it exactly (dry run first), and the migration runs again.
+    assert env.migrate("--rollback", *journal, endpoint=endpoint, declared=declared) == migrate.EXIT_OK
+    assert "To restore: 45 (41 Datastreams, 0 Sensors, 4 Things)" in capsys.readouterr().out
+    assert _properties(env) == migrated
+    assert env.migrate("--rollback", "--apply", *journal, endpoint=endpoint, declared=declared) == migrate.EXIT_OK
+    assert "Read back: every restored entity is as before the migration." in capsys.readouterr().out
+    assert _properties(env) == original
+    assert env.migrate("--apply", *journal, endpoint=endpoint, declared=declared) == migrate.EXIT_OK
+    capsys.readouterr()
+    assert _properties(env) == migrated
     things = _things(env)
     assert _sensor_ids(env) == {_thing_name(env, st): [st.sensor_id] for st in STATIONS}
     assert {things[_thing_name(env, st)]["properties"]["knmi_station_id"] for st in STATIONS} == {
@@ -601,7 +642,8 @@ def test_deploy_then_migrate(env, capsys):
     assert _counts(env) == entities
 
     # Migrating now does not help the running process: its routes hold the old ids until a restart.
-    assert env.migrate("--apply") == migrate.EXIT_OK
+    original = _properties(env)
+    assert env.migrate("--apply", "--journal", str(env.journal)) == migrate.EXIT_OK
     capsys.readouterr()
     new_image.client._rejected_routes_logged.clear()
     _, new, result = new_image.cycle(_area([S0, S3, S1, S2], T5))
@@ -615,3 +657,22 @@ def test_deploy_then_migrate(env, capsys):
     assert not restarted.client._rejected_routes_logged
     assert _misplaced(env, new) == []
     assert Counter(name for name, _ds, _obs in _rows_at(env, T6)) == {_thing_name(env, st): 3 for st in STATIONS}
+
+    # The rollback leaves an entity changed since the migration alone and restores the rest.
+    migrated = _properties(env)
+    s0_temperature = next(
+        ds for ds in _things(env)[_thing_name(env, S0)]["Datastreams"] if ds["properties"]["observed_property"] == "temperature"
+    )
+    edited = {**s0_temperature["properties"], "note": "edited after the migration"}
+    response = requests.patch(f"{env.read}/Datastreams({s0_temperature['@iot.id']})", json={"properties": edited},
+                              auth=_AUTH, timeout=30)
+    assert response.status_code == 200, response.text
+    capsys.readouterr()
+    assert env.migrate("--rollback", "--apply", "--journal", str(env.journal)) == migrate.EXIT_LEFT
+    out = capsys.readouterr().out
+    assert f"changed since the migration, left alone: Datastreams({s0_temperature['@iot.id']})" in out
+    after = _properties(env)
+    key = f"Datastreams({s0_temperature['@iot.id']})"
+    assert after[key] == edited
+    assert {k: v for k, v in after.items() if k != key} == {k: v for k, v in original.items() if k != key}
+    assert migrated != original
