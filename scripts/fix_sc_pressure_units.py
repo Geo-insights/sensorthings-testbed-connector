@@ -102,6 +102,9 @@ bypassing the mapper, until they are delivered or FAILED_DLQ_MAX_AGE_HOURS
         > dlq_copy.jsonl
     python scripts/fix_sc_pressure_units.py --check-dlq dlq_copy.jsonl
 
+It exits 0 when the copy holds no such reading, and 1 when it holds some (not
+an error: it tells a script to wait for the queue before the last re-run).
+
 1. Before the deploy, check a copy of the DLQ: it counts such readings per
    FROST host, so you know whether this database can still receive Pa rows.
 2. Deploy the connector with the mapper fix. From then on no new Pa reading
