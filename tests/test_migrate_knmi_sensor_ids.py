@@ -9,9 +9,12 @@ without properties, and knmi_station_id "<index>" on the Things.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import json
 import re
+import tempfile
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -74,6 +77,7 @@ class FakeFrost:
         self.gets: list[dict[str, str]] = []
         self.patches: list[tuple[str, int, dict[str, Any]]] = []
         self.fail_patch: set[tuple[str, int]] = set()
+        self.journal: Path | None = None  # when set, every PATCH must find its record there already
         self._next = 1
 
     def _id(self) -> int:
@@ -124,7 +128,18 @@ class FakeFrost:
     def endpoint(self, path: str) -> str:
         return f"{self.base}{path}"
 
+    def _store(self, collection: str) -> dict[int, dict[str, Any]]:
+        return {"Things": self.things, "Datastreams": self.datastreams, "Sensors": self.sensors}[collection]
+
     def get(self, url: str, params: dict[str, str] | None = None) -> _Resp:
+        single = re.fullmatch(rf"{re.escape(self.base)}/(Things|Datastreams|Sensors)\((\d+)\)", url)
+        if single:  # one entity, as FROST serves it: its properties are null when it has none
+            assert not params
+            entity = self._store(single.group(1)).get(int(single.group(2)))
+            if entity is None:
+                return _Resp(404, {"message": "Nothing found."})
+            return _Resp(200, {self.id_key: int(single.group(2)), "name": entity["name"],
+                               "properties": json.loads(json.dumps(entity["properties"]))})
         params = dict(params or {})
         self.gets.append(params)
         assert url == f"{self.base}/Things"
@@ -142,9 +157,13 @@ class FakeFrost:
         assert match, url
         collection, entity_id = match.group(1), int(match.group(2))
         assert set(payload) == {"properties"}, payload
+        if self.journal is not None:
+            recorded = [json.loads(line) for line in self.journal.read_text(encoding="utf-8").splitlines()]
+            assert any(r["entity_set"] == collection and r["id"] == str(entity_id)
+                       and r["new"] == payload["properties"] for r in recorded), "PATCH sent before its record"
         if (collection, entity_id) in self.fail_patch:
             return _Resp(500, {"message": "Internal error"})
-        store = {"Things": self.things, "Datastreams": self.datastreams, "Sensors": self.sensors}[collection]
+        store = self._store(collection)
         store[entity_id]["properties"] = json.loads(json.dumps(payload["properties"]))
         self.patches.append((collection, entity_id, payload))
         return _Resp(200, {})
@@ -192,8 +211,11 @@ def _production_like(frost: FakeFrost) -> dict[str, int]:
     }
 
 
-def _run(frost: FakeFrost, *, apply: bool, stations: Any = None, convention: str = "v1.1") -> int:
+def _run(frost: FakeFrost, *, apply: bool, stations: Any = None, convention: str = "v1.1",
+         journal: Path | None = None) -> int:
     body = stations if stations is not None else _locations_body(VLISSINGEN, VALKENBURG, IJMOND, ELSEWHERE)
+    if apply and journal is None:
+        journal = Path(tempfile.mkdtemp()) / "journal.jsonl"
     return migrate.run(
         frost,  # type: ignore[arg-type]
         body,
@@ -201,7 +223,20 @@ def _run(frost: FakeFrost, *, apply: bool, stations: Any = None, convention: str
         entity_prefix=PREFIX,
         paths=PATHS,
         apply=apply,
+        journal=migrate.Journal(journal, BASE) if journal is not None else None,
     )
+
+
+def _rollback(frost: FakeFrost, journal: Path, *, apply: bool, target: str = BASE) -> int:
+    return migrate.run_rollback(frost, journal, target_url=target, paths=PATHS, apply=apply)  # type: ignore[arg-type]
+
+
+def _snapshot(frost: FakeFrost) -> dict[tuple[str, int], Any]:
+    return copy.deepcopy({
+        **{("Things", i): e["properties"] for i, e in frost.things.items()},
+        **{("Datastreams", i): e["properties"] for i, e in frost.datastreams.items()},
+        **{("Sensors", i): e["properties"] for i, e in frost.sensors.items()},
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -503,7 +538,12 @@ def test_main_reads_a_saved_station_list_and_prints_no_secrets(monkeypatch, tmp_
 
     assert migrate.main(["--locations-file", str(saved)]) == migrate.EXIT_OK
     assert not frost.patches
-    assert migrate.main(["--locations-file", str(saved), "--apply"]) == migrate.EXIT_OK
+    with pytest.raises(SystemExit):  # --apply without a journal
+        migrate.main(["--locations-file", str(saved), "--apply"])
+    assert not frost.patches
+    journal = tmp_path / "journal.jsonl"
+    assert migrate.main(["--locations-file", str(saved), "--apply", "--journal", str(journal)]) == migrate.EXIT_OK
+    assert len(journal.read_text(encoding="utf-8").splitlines()) == len(frost.patches) == 15
 
     out = capsys.readouterr().out
     assert built[0]["base_urls"] == [BASE]
@@ -532,7 +572,7 @@ def test_main_stops_when_the_knmi_api_fails(monkeypatch, capsys):
 
     monkeypatch.setattr(migrate, "fetch_station_list", failing)
 
-    assert migrate.main(["--apply"]) == migrate.EXIT_KNMI_FAILED
+    assert migrate.main(["--apply", "--journal", "unused.jsonl"]) == migrate.EXIT_KNMI_FAILED
     assert not frost.patches
     assert "HTTP 403; nothing was planned." in capsys.readouterr().out
 
@@ -581,3 +621,167 @@ def test_migrated_ids_are_the_ones_the_parser_assigns():
 
     assert [r.sensor_id for r in readings] == frost.sensor_ids(thing)
     assert f"{PREFIX}{readings[0].thing_name}" == frost.things[thing]["name"]
+
+
+# ---------------------------------------------------------------------------
+# The journal and the rollback
+# ---------------------------------------------------------------------------
+
+
+def test_apply_journals_every_patch_before_sending_it(tmp_path, capsys):
+    frost = FakeFrost()
+    _production_like(frost)
+    before = _snapshot(frost)
+    journal = tmp_path / "journal.jsonl"
+    frost.journal = journal
+
+    assert _run(frost, apply=True, journal=journal) == migrate.EXIT_OK
+
+    records = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == len(frost.patches) == 15
+    for record, (collection, entity_id, payload) in zip(records, frost.patches, strict=True):
+        assert (record["t"], record["target"]) == (migrate.JOURNAL_TAG, BASE)
+        assert (record["entity_set"], record["id"]) == (collection, str(entity_id))
+        assert record["old"] == before[(collection, entity_id)]
+        assert record["new"] == payload["properties"]
+    # The same records on stdout, for the operator's tee.
+    out = capsys.readouterr().out
+    marked = [line[len(migrate.JOURNAL_MARKER):] for line in out.splitlines() if line.startswith(migrate.JOURNAL_MARKER)]
+    assert [json.loads(line) for line in marked] == records
+
+
+def test_a_journal_that_cannot_be_written_stops_the_patches(tmp_path, capsys):
+    frost = FakeFrost()
+    _production_like(frost)
+    before = _snapshot(frost)
+    journal = tmp_path / "missing-dir" / "journal.jsonl"
+
+    assert _run(frost, apply=True, journal=journal) == migrate.EXIT_FROST_FAILED
+
+    assert not frost.patches and _snapshot(frost) == before
+    assert "STOPPED before" in capsys.readouterr().out
+
+
+def test_run_refuses_apply_without_a_journal():
+    frost = FakeFrost()
+    _production_like(frost)
+    with pytest.raises(ValueError, match="needs a journal"):
+        migrate.run(frost, _locations_body(VLISSINGEN), fields=odata_fields_for("v1.1"),  # type: ignore[arg-type]
+                    entity_prefix=PREFIX, paths=PATHS, apply=True)
+    assert not frost.patches
+
+
+def test_apply_rollback_round_trip(tmp_path, capsys):
+    frost = FakeFrost()
+    _production_like(frost)
+    before = _snapshot(frost)
+    journal = tmp_path / "journal.jsonl"
+    assert _run(frost, apply=True, journal=journal) == migrate.EXIT_OK
+    migrated = _snapshot(frost)
+    patches = len(frost.patches)
+    capsys.readouterr()
+
+    # Dry run: the plan, nothing written.
+    assert _rollback(frost, journal, apply=False) == migrate.EXIT_OK
+    out = capsys.readouterr().out
+    assert "To restore: 15 (12 Datastreams, 0 Sensors, 3 Things); already as before: 0; changed since" in out
+    assert len(frost.patches) == patches and _snapshot(frost) == migrated
+
+    assert _rollback(frost, journal, apply=True) == migrate.EXIT_OK
+    assert _snapshot(frost) == before
+    assert "Read back: every restored entity is as before the migration." in capsys.readouterr().out
+    # Again: nothing to do. Then migrate again, into the same journal, and roll back once more.
+    patches = len(frost.patches)
+    assert _rollback(frost, journal, apply=True) == migrate.EXIT_OK
+    assert len(frost.patches) == patches
+    assert "To restore: 0 (0 Datastreams, 0 Sensors, 0 Things); already as before: 15" in capsys.readouterr().out
+    assert _run(frost, apply=True, journal=journal) == migrate.EXIT_OK
+    assert _snapshot(frost) == migrated
+    assert _rollback(frost, journal, apply=True) == migrate.EXIT_OK
+    assert _snapshot(frost) == before
+
+
+def test_rollback_leaves_entities_changed_since(tmp_path, capsys):
+    frost = FakeFrost()
+    ids = _production_like(frost)
+    before = _snapshot(frost)
+    journal = tmp_path / "journal.jsonl"
+    assert _run(frost, apply=True, journal=journal) == migrate.EXIT_OK
+    changed = frost.things[ids["ijmond"]]["datastreams"][0]
+    frost.datastreams[changed]["properties"]["note"] = "edited by hand"
+    edited = json.loads(json.dumps(frost.datastreams[changed]["properties"]))
+    deleted = frost.things[ids["ijmond"]]["datastreams"][1]
+    del frost.datastreams[deleted]
+    frost.things[ids["ijmond"]]["datastreams"].remove(deleted)
+    capsys.readouterr()
+
+    assert _rollback(frost, journal, apply=True) == migrate.EXIT_LEFT
+
+    out = capsys.readouterr().out
+    assert f"changed since the migration, left alone: Datastreams({changed})" in out
+    assert f"deleted since the migration: Datastreams({deleted})" in out
+    assert "To restore: 13 (10 Datastreams, 0 Sensors, 3 Things)" in out
+    assert frost.datastreams[changed]["properties"] == edited
+    assert {k: v for k, v in _snapshot(frost).items() if k not in {("Datastreams", changed)}} == {
+        k: v for k, v in before.items() if k not in {("Datastreams", changed), ("Datastreams", deleted)}
+    }
+
+
+def test_rollback_reads_a_saved_stdout_and_walks_records_back(tmp_path, capsys):
+    """A tee'd stdout works as the journal; a PATCH recorded but never applied (it failed) and a re-run
+    recording the entity again both roll back to the properties before the first record."""
+    frost = FakeFrost()
+    ids = _production_like(frost)
+    before = _snapshot(frost)
+    failing = frost.things[ids["valkenburg"]]["datastreams"][1]
+    frost.fail_patch.add(("Datastreams", failing))
+    journal = tmp_path / "journal.jsonl"
+    assert _run(frost, apply=True, journal=journal) == migrate.EXIT_FROST_FAILED
+    frost.fail_patch.clear()
+    assert _run(frost, apply=True, journal=journal) == migrate.EXIT_OK
+    saved = tmp_path / "apply.log"
+    saved.write_text(capsys.readouterr().out + migrate.JOURNAL_MARKER + '{"t": "knmi-sensor-id-mig', encoding="utf-8")
+    assert len(migrate.read_journal(saved)) == len(migrate.read_journal(journal)) == 16
+
+    assert _rollback(frost, saved, apply=True) == migrate.EXIT_OK
+    assert "cut-off last record skipped" in capsys.readouterr().out
+    assert _snapshot(frost) == before
+
+
+def test_rollback_refuses_a_journal_of_another_target(tmp_path, capsys):
+    frost = FakeFrost()
+    _production_like(frost)
+    journal = tmp_path / "journal.jsonl"
+    assert _run(frost, apply=True, journal=journal) == migrate.EXIT_OK
+    migrated = _snapshot(frost)
+    assert _rollback(frost, journal, apply=True, target="https://other.test/FROST-Server/v1.1") \
+        == migrate.EXIT_FROST_FAILED
+    assert _snapshot(frost) == migrated
+    assert "another FROST target" in capsys.readouterr().out
+
+
+def test_a_corrupt_journal_line_is_an_error(tmp_path):
+    journal = tmp_path / "journal.jsonl"
+    journal.write_text('{"t": "knmi-sensor-id-migration", "entity_set": "Things"}\n{}\n', encoding="utf-8")
+    with pytest.raises(migrate.JournalError, match="line 1"):
+        migrate.read_journal(journal)
+
+
+def test_main_rollback_needs_an_existing_journal(monkeypatch, tmp_path, capsys):
+    frost = FakeFrost()
+    _production_like(frost)
+    _configure(monkeypatch, frost)
+    saved = tmp_path / "locations.json"
+    saved.write_text(json.dumps(_locations_body(VLISSINGEN, VALKENBURG, IJMOND)), encoding="utf-8")
+    before = _snapshot(frost)
+    with pytest.raises(SystemExit):
+        migrate.main(["--rollback"])
+    with pytest.raises(SystemExit):
+        migrate.main(["--rollback", "--journal", str(tmp_path / "nope.jsonl")])
+    journal = tmp_path / "journal.jsonl"
+    assert migrate.main(["--locations-file", str(saved), "--apply", "--journal", str(journal)]) == migrate.EXIT_OK
+    assert migrate.main(["--rollback", "--journal", str(journal)]) == migrate.EXIT_OK
+    assert _snapshot(frost) != before
+    assert migrate.main(["--rollback", "--journal", str(journal), "--apply"]) == migrate.EXIT_OK
+    assert _snapshot(frost) == before
+    assert "Mode: ROLLBACK APPLY" in capsys.readouterr().out

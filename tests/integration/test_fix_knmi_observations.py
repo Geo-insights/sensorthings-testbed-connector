@@ -13,6 +13,7 @@ psql). Everything is removed afterwards (docker rm -f -v).
 
 from __future__ import annotations
 
+import os
 import re
 import socket
 import subprocess
@@ -35,6 +36,7 @@ pytestmark = pytest.mark.integration
 DB_IMAGE = "postgis/postgis:16-3.4-alpine"
 FROST_IMAGE = "fraunhoferiosb/frost-server:2.8"
 DB_USER = DB_NAME = "sensorthings"
+DOCKER_PREFIX = os.environ.get("KNMI_IT_DOCKER_PREFIX", "lnkh")  # container and network names start with it
 HTTP = requests.Session()
 
 STATIONS = {  # key -> (name, lon, lat, old position id)
@@ -188,7 +190,7 @@ def stack() -> Iterator[Stack]:
         _docker("version", timeout=30)
     except (FileNotFoundError, subprocess.SubprocessError):
         pytest.skip("Docker is not available")
-    name = f"lnkh-{uuid.uuid4().hex[:8]}"
+    name = f"{DOCKER_PREFIX}-{uuid.uuid4().hex[:8]}"
     db, frost, network = f"{name}-db", f"{name}-frost", f"{name}-net"
     port = _free_port()
     try:
@@ -468,6 +470,54 @@ def test_retire_deletes_only_empty_stale_datastreams(fresh: Stack, tmp_path: Pat
     _restore_retired(fresh)
 
 
+def test_retirement_holds_back_sources_and_rollback_restores_the_rest(
+        fresh: Stack, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """After the emptied stale datastreams are retired, the rollback still moves every other row back."""
+    before = _rows(fresh)
+    ids_file = tmp_path / "moves.csv"
+    assert _script(fresh, "--apply", "--ids-file", str(ids_file)) == 0
+    after = _rows(fresh)
+    recorded = fix.recorded_sources(fix.read_ids_file(ids_file))
+    fields = odata_fields_for("v1.1")
+    try:
+        # The IDs file names A's stale datastream as a source: it is held back. B's held no rows (nothing
+        # was moved out of it) and goes; C's keeps a TGV row.
+        assert fix.retire(_http(fresh), "/Things", "/Datastreams", "GEO_", fields, apply=True,
+                          recorded=recorded) == fix.EXIT_REFUSED
+        out = capsys.readouterr().out
+        assert "empty, but the source of 3 moves in the IDs file" in out, out
+        assert "1 with observations left alone; 1 empty but named as a source in the IDs file left alone" in out
+        assert fresh.ds["A.stale"] in _datastream_ids(fresh) and fresh.ds["B.stale"] not in _datastream_ids(fresh)
+        # Forced, they go: the point of no return for the three rows moved out of A's.
+        assert fix.retire(_http(fresh), "/Things", "/Datastreams", "GEO_", fields, apply=True,
+                          recorded=recorded, force=True) == fix.EXIT_REFUSED
+        assert "they can no longer be rolled back" in capsys.readouterr().out
+        assert not {fresh.ds["A.stale"], fresh.ds["B.stale"]} & _datastream_ids(fresh)
+        assert _rows(fresh) == after
+
+        # Rollback, all recorded rows in one batch: the five cross-station moves go back, the three
+        # rows of the deleted datastream stay, and nothing fails on the foreign key.
+        rollback = ["--rollback", "--ids-file", str(ids_file), "--batch-rows", "100"]
+        assert _script(fresh, *rollback) == 0
+        out = capsys.readouterr().out
+        assert re.search(r"where the move put them: to restore\s+5\n", out), out
+        assert re.search(r"where the move put them, source gone: they stay\s+3\n", out), out
+        assert _script(fresh, *rollback, "--apply") == 0
+        assert "except 3 whose source is gone" in capsys.readouterr().out
+        stale_rows = {fresh.ids[k] for k in ("a_gt_t0_stale", "a_gt_t1_stale", "b_gt_t2_in_a_stale")}
+        assert _rows(fresh) == {i: (after if i in stale_rows else before)[i] for i in before}
+        assert _ds_state(fresh) == _recomputed(fresh)
+        # A re-run finds nothing to restore and still succeeds.
+        assert _script(fresh, *rollback, "--apply") == 0
+        assert "Moved back 0 observations" in capsys.readouterr().out
+    finally:
+        _restore_retired(fresh)
+
+
+def _datastream_ids(stack: Stack) -> set[int]:
+    return {int(line) for line in _psql(stack.db, 'SELECT "ID" FROM "DATASTREAMS";\n')}
+
+
 def _restore_retired(stack: Stack) -> None:
     """Put the two deleted stale datastreams back under their ids, for the tests that follow."""
     for key in ("A.stale", "B.stale"):
@@ -482,5 +532,6 @@ SELECT {stack.ds[key]}, 'GEO_KNMI {name} sensor - Ground temperature', 'x',
        g."OBSERVATION_TYPE", g."SENSOR_ID",
        (SELECT "ID" FROM "OBS_PROPERTIES" WHERE "NAME" = 'Ground temperature'), g."THING_ID",
        g."UNIT_NAME", g."UNIT_SYMBOL", g."UNIT_DEFINITION"
-  FROM "DATASTREAMS" g WHERE g."ID" = {stack.ds[f"{station}.gst"]};
+  FROM "DATASTREAMS" g WHERE g."ID" = {stack.ds[f"{station}.gst"]}
+   AND NOT EXISTS (SELECT 1 FROM "DATASTREAMS" WHERE "ID" = {stack.ds[key]});
 """)
