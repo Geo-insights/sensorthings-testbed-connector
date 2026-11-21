@@ -5,6 +5,7 @@ from fastapi.responses import HTMLResponse
 
 from app.config import settings
 from app.services.health_monitor import health_monitor
+from app.services.sensorthings_client import client
 
 router = APIRouter(tags=["health"])
 
@@ -22,7 +23,14 @@ def health() -> dict:
     except FileNotFoundError:
         dlq_bytes = 0
     status = "degraded" if dlq_bytes > settings.failed_dlq_max_bytes * 0.9 else "ok"
-    return {"status": status, "dlq_bytes": dlq_bytes, "dlq_max_bytes": settings.failed_dlq_max_bytes}
+    return {
+        "status": status,
+        "dlq_bytes": dlq_bytes,
+        "dlq_max_bytes": settings.failed_dlq_max_bytes,
+        # The push path's route guard: whether the primary target's datastreams
+        # are listed (routes_loaded, route_count) and why the last listing failed.
+        "datastream_routes": client.route_status(),
+    }
 
 
 @router.get("/health/report")

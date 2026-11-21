@@ -3,10 +3,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from collections import Counter
+from collections.abc import Iterator, Mapping, MutableMapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -20,7 +24,7 @@ from app.frost.cache import EntityCache
 from app.frost.circuit_breaker import CircuitBreaker
 from app.frost.entity_manager import EntityManager
 from app.frost.http_client import FrostHTTPClient, is_retryable_status
-from app.frost.odata_fields import odata_fields_for
+from app.frost.odata_fields import FrostODataFields, odata_fields_for
 from app.frost.target_stack import TargetStack
 from app.models import (
     ConnectorPreview,
@@ -217,6 +221,194 @@ def _key_fits_route(key: str, route: _DatastreamRoute) -> bool:
     return not (route.properties and token and token not in route.properties)
 
 
+def _sensor_of_key(key: str) -> str | None:
+    """The sensor id of a ``sensor_id::observed_property`` key; None for a bare key."""
+    sensor_id, sep, _observed_property = key.rpartition("::")
+    return sensor_id if sep else None
+
+
+class _DatastreamIdMap(MutableMapping[str, str]):
+    """Datastream id per mapping key on the primary target, indexed by sensor.
+
+    Keys are ``sensor_id::observed_property`` plus the bare fallback keys (a
+    sensor id or a stream key). Registrations (each polling loop pushes and
+    registers from its own threadpool task) and the warm-up write while pushes
+    on other threads read: writers hold a lock, iteration runs over a copy, and
+    each sensor's datastream ids are published as a frozenset. A reader never
+    iterates something another thread is changing, and counting a sensor's
+    datastreams is one lookup instead of a scan of every key.
+    """
+
+    def __init__(self, *sources: Mapping[str, str]) -> None:
+        self._data: dict[str, str] = {}
+        self._keys_by_sensor: dict[str, set[str]] = {}
+        self._ids_by_sensor: dict[str, frozenset[str]] = {}
+        self._lock = threading.RLock()
+        for source in sources:
+            self.update(source)
+
+    def __getitem__(self, key: str) -> str:
+        return self._data[key]
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._data
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.snapshot())
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({self._data!r})"
+
+    def __setitem__(self, key: str, value: str) -> None:
+        with self._lock:
+            self._data[key] = value
+            sensor_id = _sensor_of_key(key)
+            if sensor_id is not None:
+                self._keys_by_sensor.setdefault(sensor_id, set()).add(key)
+                self._reindex(sensor_id)
+
+    def __delitem__(self, key: str) -> None:
+        with self._lock:
+            del self._data[key]
+            sensor_id = _sensor_of_key(key)
+            if sensor_id is not None:
+                self._keys_by_sensor.get(sensor_id, set()).discard(key)
+                self._reindex(sensor_id)
+
+    def _reindex(self, sensor_id: str) -> None:
+        keys = self._keys_by_sensor.get(sensor_id)
+        if keys:
+            self._ids_by_sensor[sensor_id] = frozenset(str(self._data[key]) for key in keys)
+        else:
+            self._keys_by_sensor.pop(sensor_id, None)
+            self._ids_by_sensor.pop(sensor_id, None)
+
+    def snapshot(self) -> dict[str, str]:
+        """A consistent copy of the mappings."""
+        with self._lock:
+            return dict(self._data)
+
+    def ids_of_sensor(self, sensor_id: str) -> frozenset[str]:
+        """Datastream ids of the sensor's ``sensor_id::observed_property`` keys."""
+        return self._ids_by_sensor.get(sensor_id, frozenset())
+
+
+# What push_observations reports for a reading that gets no datastream; the
+# DLQ/seeding side matches on it as well as on the "unresolved" flag.
+UNRESOLVED_MESSAGE = "No datastream mapping available for this sensor; dynamic lookup also failed."
+
+# Warm-up listing of the primary target's datastreams: one page per request,
+# continued by id (keyset) from the connector's own base URL.
+_LISTING_PAGE_SIZE = 1000
+_NEXT_LINK_KEYS = ("@iot.nextLink", "@nextLink")
+# A failed listing is retried from the push path (and the DLQ replay) after this
+# delay, doubling per failure up to the maximum, until one succeeds.
+_ROUTE_RETRY_INITIAL_SECONDS = 60.0
+_ROUTE_RETRY_MAX_SECONDS = 900.0
+
+
+def _listed_id(row: dict[str, Any], fields: FrostODataFields) -> Any:
+    """``@iot.id`` (v1.1) or ``id`` (v2.0) of a listed entity, or None."""
+    for name in (fields.id, "@iot.id", "id"):
+        value = row.get(name)
+        if value is not None:
+            return value
+    return None
+
+
+def _odata_id_literal(value: Any) -> str:
+    """An entity id as an OData literal: bare when numeric, quoted otherwise.
+
+    FROST compares a quoted literal as text: ``id gt '13000'`` returns ids 2, 3,
+    4, ... from an integer id column.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _ids_ascend(previous: Any, ids: list[Any]) -> bool:
+    """Whether a page's ids continue an ascending listing after ``previous``.
+
+    Integer ids are checked in full; other ids (compared by the server's
+    collation, not Python's) only for progress.
+    """
+    if not ids:
+        return False
+    sequence = ([previous] if previous is not None else []) + ids
+    if all(isinstance(value, int) and not isinstance(value, bool) for value in sequence):
+        return all(a < b for a, b in pairwise(sequence))
+    return bool(ids[-1] != previous)
+
+
+def _describe_error(exc: BaseException) -> str:
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        return f"HTTP {exc.response.status_code}"
+    return f"{type(exc).__name__}: {exc}"[:200]
+
+
+@dataclass
+class _RouteListing:
+    """State of the primary target's datastream listing (the route guard's input)."""
+
+    loaded: bool = False  # routes from at least one successful listing
+    complete: bool = False  # that listing reached the last datastream
+    loaded_at: str | None = None
+    last_error: str | None = None
+    failures: int = 0  # failed listings since the last success
+    retry_at: float | None = None  # time.monotonic() of the next retry while not loaded
+
+
+def _replay_label(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """The reading label a DLQ payload carries: v1.1 ``parameters``, v2.0 ``properties``."""
+    for field_name in ("parameters", "properties"):
+        label = payload.get(field_name)
+        if isinstance(label, dict) and label.get("sensor_id") and label.get("observed_property"):
+            return label
+    return None
+
+
+def _reading_from_label(label: dict[str, Any]) -> SensorReading:
+    """The reading a DLQ line was built from, as far as routing needs it."""
+
+    def text(name: str) -> str | None:
+        value = label.get(name)
+        return str(value) if value not in (None, "") else None
+
+    return SensorReading.model_construct(
+        sensor_id=str(label["sensor_id"]),
+        sensor_name=text("sensor_name") or "",
+        observed_property=str(label["observed_property"]),
+        unit=text("unit") or "",
+        value=0.0,
+        timestamp=datetime.now(UTC),
+        quality="good",
+        location=text("location") or "",
+        thing_name=text("thing_name") or "",
+        device_eui=text("device_eui"),
+        stream_key=text("stream_key"),
+        observed_property_name=None,
+    )
+
+
+def _payload_datastream_id(payload: dict[str, Any]) -> Any:
+    datastream = payload.get("Datastream")
+    if isinstance(datastream, dict):
+        for name in ("@iot.id", "id"):
+            if datastream.get(name) is not None:
+                return datastream[name]
+    return None
+
+
+def _set_payload_datastream_id(payload: dict[str, Any], datastream_id: str) -> None:
+    datastream = payload.get("Datastream")
+    name = "id" if isinstance(datastream, dict) and "id" in datastream and "@iot.id" not in datastream else "@iot.id"
+    payload["Datastream"] = {name: _coerce_iot_id(datastream_id)}
+
+
 # Per-target circuit breaker shared by push + replay paths.
 observation_breaker = CircuitBreaker(
     failure_threshold=settings.frost_cb_failure_threshold,
@@ -248,13 +440,17 @@ class SensorThingsClient:
 
         # Backward-compat property alias
         self._registered_entities = self._cache.all()
-        self._datastream_ids: dict[str, str] = dict(settings.datastream_ids)
-        self._datastream_ids.update(self._cache.collection("datastreams"))
+        self._datastream_ids = _DatastreamIdMap(settings.datastream_ids, self._cache.collection("datastreams"))
         # Datastream id -> what it observes on the primary target (sensor_id and
         # observed-property tokens from its properties), filled by
         # warm_datastream_cache(). The push path uses it to refuse a cached
         # mapping that points at a datastream of another property or sensor.
+        # Both dicts are replaced whole, never changed in place.
         self._datastream_routes: dict[str, _DatastreamRoute] = {}
+        self._route_ids_by_sensor: dict[str, frozenset[str]] = {}
+        self._route_listing = _RouteListing()
+        # Held while a listing runs; the push path's retry skips when it is taken.
+        self._warmup_lock = threading.Lock()
         self._rejected_routes_logged: set[tuple[str, str, str]] = set()
         # (base_url, "sensor_id::observed_property") already reported as unresolved.
         self._unresolved_reported: set[tuple[str, str]] = set()
@@ -1328,7 +1524,7 @@ class SensorThingsClient:
         return {
             "mode": "live",
             "site_results": site_results,
-            "datastream_ids": self._datastream_ids,
+            "datastream_ids": self._datastream_ids.snapshot(),
             "registered_entities": self._registered_entities,
         }
 
@@ -1350,7 +1546,7 @@ class SensorThingsClient:
             "mode": "live",
             "site_key": site_key,
             "site_results": site_results,
-            "datastream_ids": self._datastream_ids,
+            "datastream_ids": self._datastream_ids.snapshot(),
             "registered_entities": self._registered_entities,
         }
 
@@ -1788,6 +1984,50 @@ class SensorThingsClient:
             return None
         return len(value) > 0
 
+    def _check_replay_route(
+        self, base_url: str, payload: dict[str, Any], datastream_id: Any,
+    ) -> tuple[str, str | None, str | None]:
+        """Route check of a dead-lettered observation for the primary target.
+
+        Lines written before the routing fix can name the datastream that the
+        old routing chose: another property's or another sensor's. The line's
+        datastream is checked against the warm-up listing as push_observations
+        checks a cached mapping, using the reading's label (``parameters``, or
+        ``properties`` in a v2.0 payload). A refused line is resolved again
+        the way push_observations resolves a reading: a cached mapping that
+        passes the check, then the live lookup on the reading's own Thing.
+
+        Returns ``(outcome, datastream id, refusal)``. Outcomes: "unchecked"
+        (no sensor_id/observed_property label), "unknown" (the listing does not
+        know the datastream), "ok", "rewritten" (the payload now names the
+        reading's own datastream, whose id is returned) and "dropped" (the
+        reading has no datastream of its own).
+        """
+        label = _replay_label(payload)
+        if label is None:
+            return "unchecked", None, None
+        reading = _reading_from_label(label)
+        current = _payload_datastream_id(payload)
+        ds_id = str(current if current is not None else datastream_id)
+        if ds_id not in self._datastream_routes:
+            return "unknown", ds_id, None
+        datastream_ids = self._datastream_ids or dict(settings.datastream_ids)
+        refusal = self._route_refusal(ds_id, reading, "key", datastream_ids)
+        if refusal is None:
+            return "ok", ds_id, None
+        own_id, _refused = self._resolve_cached_datastream_id(datastream_ids, reading)
+        if not own_id:
+            # Unchecked, as in push_observations: it only finds datastreams of
+            # the reading's own Thing (Samen Meten readings carry another
+            # sensor_id than their datastreams, and resolve only this way).
+            own_id = self._resolve_datastream_id_live(base_url, reading)
+        if not own_id:
+            return "dropped", None, refusal
+        if str(own_id) == ds_id:
+            return "ok", ds_id, None
+        _set_payload_datastream_id(payload, str(own_id))
+        return "rewritten", str(own_id), refusal
+
     def replay_failed_observations(self, max_lines: int | None = None) -> dict[str, Any]:
         if not self._failed_observations_path.exists():
             return {
@@ -1808,6 +2048,9 @@ class SensorThingsClient:
         attempted = 0
         kept = 0
         expired = 0
+        primary_url = (self._primary_base_url() or "").rstrip("/")
+        route_counts: Counter[str] = Counter()
+        listing_retried = False
 
         with open(self._failed_observations_path, encoding="utf-8") as infile, \
              open(tmp_path, "w", encoding="utf-8") as outfile:
@@ -1856,6 +2099,31 @@ class SensorThingsClient:
                     kept += 1
                     continue
 
+                # Route check (primary target): never replay a reading into a
+                # datastream of another sensor or observed property.
+                note: dict[str, Any] = {}
+                counted = False
+                if base_url and base_url.rstrip("/") == primary_url:
+                    if not listing_retried:
+                        listing_retried = True
+                        self._retry_route_listing_if_due()
+                    outcome, routed_id, refusal = self._check_replay_route(base_url, payload, datastream_id)
+                    route_counts[outcome] += 1
+                    if outcome in ("rewritten", "dropped"):
+                        # Resolving again can cost lookups: count it against the pass limit.
+                        attempted += 1
+                        counted = True
+                    if outcome == "dropped":
+                        results.append(
+                            {"datastream_id": datastream_id, "ok": False, "status_code": None, "dropped": True, "route_refused": refusal}
+                        )
+                        continue
+                    if outcome == "rewritten" and routed_id:
+                        note = {"rerouted_from": str(datastream_id)}
+                        datastream_id = routed_id
+                        record["datastream_id"] = routed_id
+                        stripped = json.dumps(record, ensure_ascii=False)
+
                 headers = self._headers_for_url(base_url) if base_url else self._headers()
 
                 # Dedup probe: a write that timed out after the server committed it
@@ -1866,18 +2134,17 @@ class SensorThingsClient:
                 # falls through to a normal POST (never drop, so no data loss).
                 if settings.frost_replay_dedup_probe:
                     phenomenon_time = payload.get("phenomenonTime")
-                    ds_ref = None
-                    if isinstance(payload.get("Datastream"), dict):
-                        ds_ref = payload["Datastream"].get("@iot.id")
+                    ds_ref = _payload_datastream_id(payload)
                     if ds_ref is None:
                         ds_ref = datastream_id
                     replay_stack = self._target_stack_for_url(base_url) if base_url else None
                     replay_version = replay_stack.version if replay_stack else "1.1"
                     if phenomenon_time and self._observation_exists_at(endpoint, headers, ds_ref, str(phenomenon_time), version=replay_version) is True:
-                        results.append({"datastream_id": datastream_id, "ok": True, "status_code": 200, "duplicate": True})
+                        results.append({"datastream_id": datastream_id, "ok": True, "status_code": 200, "duplicate": True, **note})
                         continue
 
-                attempted += 1
+                if not counted:
+                    attempted += 1
                 try:
                     response = requests.post(endpoint, json=payload, headers=headers, timeout=self._request_timeout())
                 except requests.RequestException as exc:
@@ -1889,38 +2156,56 @@ class SensorThingsClient:
                             "ok": False,
                             "status_code": getattr(getattr(exc, "response", None), "status_code", None),
                             "error": str(exc),
+                            **note,
                         }
                     )
                     continue
 
                 if response.ok:
-                    results.append({"datastream_id": datastream_id, "ok": True, "status_code": response.status_code})
+                    results.append({"datastream_id": datastream_id, "ok": True, "status_code": response.status_code, **note})
                     continue
 
                 # 409 Conflict = duplicate observation (already delivered) — drop it.
                 if response.status_code == 409:
-                    results.append({"datastream_id": datastream_id, "ok": True, "status_code": response.status_code, "duplicate": True})
+                    results.append({"datastream_id": datastream_id, "ok": True, "status_code": response.status_code, "duplicate": True, **note})
                     continue
 
                 # Permanent client error (bad payload / unknown datastream) — drop it
                 # from the queue instead of retrying it on every replay pass forever.
                 if not is_retryable_status(response.status_code):
-                    results.append({"datastream_id": datastream_id, "ok": False, "status_code": response.status_code, "dropped": True})
+                    results.append({"datastream_id": datastream_id, "ok": False, "status_code": response.status_code, "dropped": True, **note})
                     continue
 
                 outfile.write(stripped + "\n")
                 kept += 1
-                results.append({"datastream_id": datastream_id, "ok": False, "status_code": response.status_code})
+                results.append({"datastream_id": datastream_id, "ok": False, "status_code": response.status_code, **note})
 
         os.replace(str(tmp_path), str(self._failed_observations_path))
         if expired:
             logger.info("DLQ replay: expired %d entries older than %dh", expired, settings.failed_dlq_max_age_hours)
+        if route_counts["rewritten"] or route_counts["dropped"] or route_counts["unchecked"] or (
+            route_counts and not self._route_listing.loaded
+        ):
+            logger.warning(
+                "DLQ replay route check on %s: %d line(s) named a datastream of another sensor or observed "
+                "property: %d rewritten to the reading's own datastream, %d dropped (none found); %d line(s) "
+                "without a sensor_id/observed_property label and %d naming a datastream the listing does not "
+                "know replayed unchecked; %d checked%s",
+                primary_url, route_counts["rewritten"] + route_counts["dropped"], route_counts["rewritten"],
+                route_counts["dropped"], route_counts["unchecked"], route_counts["unknown"], route_counts["ok"],
+                "" if self._route_listing.loaded else " (no datastream listing loaded: route guard off)",
+            )
         return {
             "mode": "live" if settings.sensorthings_base_url else "preview",
             "replayed": sum(1 for result in results if result["ok"]),
             "dropped": sum(1 for result in results if result.get("dropped")),
             "expired": expired,
             "remaining": kept,
+            "route_checked": route_counts["ok"],
+            "route_rewritten": route_counts["rewritten"],
+            "route_dropped": route_counts["dropped"],
+            "route_unchecked": route_counts["unchecked"],
+            "route_unknown": route_counts["unknown"],
             "results": results,
         }
 
@@ -2371,8 +2656,8 @@ class SensorThingsClient:
         The push and monitoring-forward paths resolve datastream ids from
         ``self._datastream_ids`` first, falling back to a per-reading serial
         live OData lookup. Fetching the datastreams once at startup avoids that
-        cold-cache walk on the first cycles after a (re)deploy. Best-effort:
-        logs and returns 0 on any failure, never raises.
+        cold-cache walk on the first cycles after a (re)deploy. Returns the
+        number of mapping keys added.
 
         Also purges stale cached entries whose IDs don't exist on the current
         server (e.g. carried over from a previously-configured FROST target),
@@ -2383,53 +2668,38 @@ class SensorThingsClient:
         listed datastream observes, so push_observations can refuse a mapping
         that would cross properties or sensors.
 
-        The listing is ordered by id. Unordered, FROST returns datastreams in
-        storage order, which its observation triggers keep changing (every
-        insert updates the datastream row), so ``$skip`` pages can overlap or
-        miss datastreams, and "the first datastream listed" is arbitrary.
-        Ordered, FROST pages by id (``$skipFilter``) instead.
+        The listing is ordered by id and paged by id (_list_datastreams).
+        Unordered, FROST returns datastreams in storage order, which its
+        observation triggers keep changing (every insert updates the datastream
+        row), so ``$skip`` pages can overlap or miss datastreams.
+
+        A failed listing (FROST down or timing out) changes nothing, is logged
+        as a warning and returns 0; until a listing succeeds, push_observations
+        and the DLQ replay retry it with backoff (_retry_route_listing_if_due),
+        and /health reports the state (route_status).
         """
         base_url = self._primary_base_url()
         if not base_url:
             return 0
-        stack = self._target_stack_for_url(base_url)
-        fields = stack.fields if stack else odata_fields_for("1.1")
-        endpoint = self._endpoint_for_base_url(base_url, settings.datastreams_path)
+        with self._warmup_lock:
+            return self._warm_datastream_cache(base_url, max_datastreams)
 
-        # Fetch all datastream IDs from the server (paginated).
-        server_ids: set[str] = set()
-        url: str | None = endpoint
-        page_params: dict[str, str] | None = {
-            "$select": f"{fields.id},name,properties",
-            "$orderby": "id",
-            "$top": str(min(max_datastreams, 1000)),
-        }
-        values: list[dict[str, Any]] = []
+    def _warm_datastream_cache(self, base_url: str, max_datastreams: int) -> int:
+        """warm_datastream_cache's work; the caller holds ``self._warmup_lock``."""
+        # What the listing is checked against. A key that a registration on
+        # another thread adds or changes while the listing runs can name a
+        # datastream created after its page was read: it is left alone.
+        before = self._datastream_ids.snapshot()
+        started = time.monotonic()
         try:
-            while url and len(server_ids) < max_datastreams:
-                resp = requests.get(
-                    url,
-                    params=page_params,
-                    headers=self._headers_for_url(base_url),
-                    timeout=self._request_timeout(),
-                )
-                resp.raise_for_status()
-                body = resp.json()
-                page = body.get("value", [])
-                for ds in page:
-                    ds_id = ds.get(fields.id) or ds.get("@iot.id") or ds.get("id")
-                    if ds_id:
-                        server_ids.add(str(ds_id))
-                values.extend(page)
-                url = body.get(fields.next_link) or body.get("@iot.nextLink")
-                page_params = None  # nextLink already contains params
-        except Exception:
-            logger.debug("Datastream cache warm-up fetch failed", exc_info=True)
+            listed, complete, pages = self._list_datastreams(base_url, max_datastreams)
+        except Exception as exc:
+            self._record_listing_failure(base_url, exc)
             return 0
+        server_ids = {ds_id for ds_id, _props in listed}
 
-        # The loop also stops at max_datastreams. The listing is then partial:
-        # an id missing from it proves nothing, and uniqueness can't be judged.
-        complete = not url
+        # The listing also stops at max_datastreams. It is then partial: an id
+        # missing from it proves nothing, and uniqueness can't be judged.
         if not complete:
             logger.warning(
                 "Datastream cache warm-up stopped at %d datastreams on %s: not purging "
@@ -2437,15 +2707,18 @@ class SensorThingsClient:
                 len(server_ids), base_url,
             )
 
-        listed: list[tuple[str, dict[str, Any]]] = []
-        for ds in values:
-            ds_id = ds.get(fields.id) or ds.get("@iot.id") or ds.get("id")
-            if not ds_id:
-                continue
-            props = ds.get("properties")
-            listed.append((str(ds_id), props if isinstance(props, dict) else {}))
         routes = {ds_id: _route_for(props) for ds_id, props in listed}
+        route_ids_by_sensor: dict[str, set[str]] = {}
+        for ds_id, listed_route in routes.items():
+            if listed_route.sensor_id:
+                route_ids_by_sensor.setdefault(listed_route.sensor_id, set()).add(ds_id)
         self._datastream_routes = routes
+        self._route_ids_by_sensor = {sensor_id: frozenset(ids) for sensor_id, ids in route_ids_by_sensor.items()}
+        state = self._route_listing
+        failures_before = state.failures
+        state.loaded, state.complete = True, complete
+        state.loaded_at = datetime.now(UTC).isoformat()
+        state.last_error, state.failures, state.retry_at = None, 0, None
 
         # Purge cached entries whose id is not on the server, or names a
         # datastream of another sensor or observed property. A complete but
@@ -2454,7 +2727,9 @@ class SensorThingsClient:
         # readings into whatever datastream later gets that id.
         stale: list[str] = []
         mismatched: list[str] = []
-        for key, cached_id in list(self._datastream_ids.items()):
+        for key, cached_id in before.items():
+            if self._datastream_ids.get(key) != cached_id:
+                continue
             ds_key = str(cached_id)
             if complete and ds_key not in server_ids:
                 stale.append(key)
@@ -2463,10 +2738,10 @@ class SensorThingsClient:
             if route is not None and not _key_fits_route(key, route):
                 mismatched.append(key)
         if stale or mismatched:
-            examples = [f"{key} -> {self._datastream_ids[key]}" for key in mismatched[:10]]
+            examples = [f"{key} -> {before[key]}" for key in mismatched[:10]]
             cached = self._cache.collection("datastreams")
             for key in stale + mismatched:
-                del self._datastream_ids[key]
+                self._datastream_ids.pop(key, None)
                 cached.pop(key, None)
             self._persist_registered_entities()  # once, not per dropped key
             if stale:
@@ -2509,15 +2784,140 @@ class SensorThingsClient:
                 if key not in self._datastream_ids:
                     self._datastream_ids[key] = ds_id
                     warmed += 1
-        if warmed or stale or mismatched:
-            logger.info(
-                "Datastream cache warm-up: %d added, %d stale and %d mismatched purged (%d server ids from %s)",
-                warmed, len(stale), len(mismatched), len(server_ids), base_url,
-            )
+        logger.info(
+            "Datastream cache warm-up listed %d datastreams on %s in %d request(s), %.1fs (%s%s): "
+            "%d added, %d stale and %d mismatched purged",
+            len(server_ids), base_url, pages, time.monotonic() - started,
+            "complete" if complete else "partial",
+            f", after {failures_before} failed attempt(s)" if failures_before else "",
+            warmed, len(stale), len(mismatched),
+        )
         return warmed
 
+    def _list_datastreams(
+        self, base_url: str, max_datastreams: int,
+    ) -> tuple[list[tuple[str, dict[str, Any]]], bool, int]:
+        """Every datastream on a target as ``(id, properties)``, in id order.
+
+        Pages by id: ``$orderby=id asc``, then ``$filter=id gt <last id>``,
+        each request built from the configured base URL. A server-supplied
+        next link is never requested: it names the server's own idea of its
+        root, and would be sent the credentials. A next link in either
+        convention (``@iot.nextLink``; ``@nextLink``, which FROST's /v2.0 path
+        answers even to a target declared as v1.1) or a full page means there
+        is more; the listing is complete only when a page is short and has no
+        next link.
+
+        Returns ``(datastreams, complete, requests)``. Stops early, as partial,
+        at ``max_datastreams`` or when the ids stop ascending (a server that
+        ignores ``$orderby`` would make id paging skip datastreams). Raises on
+        an HTTP or parse error.
+        """
+        stack = self._target_stack_for_url(base_url)
+        fields = stack.fields if stack else odata_fields_for("1.1")
+        endpoint = self._endpoint_for_base_url(base_url, settings.datastreams_path)
+        headers = self._headers_for_url(base_url)
+        page_size = max(1, min(max_datastreams, _LISTING_PAGE_SIZE))
+        next_link_keys = {fields.next_link, *_NEXT_LINK_KEYS}
+        listed: list[tuple[str, dict[str, Any]]] = []
+        last_id: Any = None
+        pages = 0
+        while True:
+            params = {"$select": f"{fields.id},name,properties", "$orderby": "id asc", "$top": str(page_size)}
+            if last_id is not None:
+                params["$filter"] = f"id gt {_odata_id_literal(last_id)}"
+            response = requests.get(endpoint, params=params, headers=headers, timeout=self._request_timeout())
+            response.raise_for_status()
+            body = response.json()
+            page = body.get("value") if isinstance(body, dict) else None
+            if not isinstance(page, list):
+                raise ValueError(f"the Datastreams listing of {base_url} has no 'value' list")
+            pages += 1
+            ids: list[Any] = []
+            for row in page:
+                ds_id = _listed_id(row, fields) if isinstance(row, dict) else None
+                if ds_id is None:
+                    continue
+                ids.append(ds_id)
+                props = row.get("properties")
+                listed.append((str(ds_id), props if isinstance(props, dict) else {}))
+            if not any(body.get(key) for key in next_link_keys) and len(page) < page_size:
+                return listed, True, pages
+            if len(listed) >= max_datastreams:
+                return listed, False, pages
+            if not _ids_ascend(last_id, ids):
+                logger.warning(
+                    "Datastream listing on %s is not in id order at page %d (%d datastreams): "
+                    "stopping, the listing counts as partial",
+                    base_url, pages, len(listed),
+                )
+                return listed, False, pages
+            last_id = ids[-1]
+
+    def _record_listing_failure(self, base_url: str, exc: BaseException) -> None:
+        """Log a failed listing and, while no routes are loaded, schedule its retry."""
+        state = self._route_listing
+        state.failures += 1
+        state.last_error = _describe_error(exc)
+        if state.loaded:
+            logger.warning(
+                "Datastream listing on %s failed (%s); the routes listed at %s stay in use",
+                base_url, state.last_error, state.loaded_at,
+            )
+            return
+        delay = min(_ROUTE_RETRY_INITIAL_SECONDS * 2 ** min(state.failures - 1, 10), _ROUTE_RETRY_MAX_SECONDS)
+        state.retry_at = time.monotonic() + delay
+        logger.warning(
+            "Datastream cache warm-up failed on %s (%s; attempt %d): cached datastream mappings are not "
+            "checked against the datastreams' sensor and observed property until a listing succeeds; "
+            "retrying from the push path in %.0fs",
+            base_url, state.last_error, state.failures, delay,
+        )
+
+    def _retry_route_listing_if_due(self) -> None:
+        """Retry a failed warm-up listing once its backoff has passed.
+
+        Called by push_observations and the DLQ replay on their own thread
+        (both run in the threadpool), only while no listing has succeeded.
+        Does not wait when another thread is listing, and leaves a target with
+        an open circuit to the breaker's cooldown.
+        """
+        state = self._route_listing
+        if state.loaded or state.retry_at is None or time.monotonic() < state.retry_at:
+            return
+        base_url = self._primary_base_url()
+        if not base_url or observation_breaker.snapshot().get(base_url.rstrip("/"), {}).get("open"):
+            return
+        if not self._warmup_lock.acquire(blocking=False):
+            return
+        try:
+            if state.loaded or state.retry_at is None or time.monotonic() < state.retry_at:
+                return
+            logger.info("Retrying the datastream listing on %s (%d failed attempt(s))", base_url, state.failures)
+            self._warm_datastream_cache(base_url, 100_000)
+        except Exception as exc:
+            self._record_listing_failure(base_url, exc)
+        finally:
+            self._warmup_lock.release()
+
+    def route_status(self) -> dict[str, Any]:
+        """State of the route guard's datastream listing, for /health."""
+        state = self._route_listing
+        retry_in = None
+        if not state.loaded and state.retry_at is not None:
+            retry_in = round(max(0.0, state.retry_at - time.monotonic()), 1)
+        return {
+            "routes_loaded": state.loaded,
+            "route_count": len(self._datastream_routes),
+            "complete": state.complete,
+            "last_error": state.last_error,
+            "failed_attempts": state.failures,
+            "loaded_at": state.loaded_at,
+            "next_retry_in_seconds": retry_in,
+        }
+
     def _resolve_cached_datastream_id(
-        self, datastream_ids: dict[str, str], reading: SensorReading,
+        self, datastream_ids: Mapping[str, str], reading: SensorReading,
     ) -> tuple[str | None, list[str]]:
         """Resolve a reading's datastream on the primary target from the id map.
 
@@ -2557,7 +2957,7 @@ class SensorThingsClient:
         return None, refused
 
     def _route_refusal(
-        self, ds_id: str, reading: SensorReading, kind: str, datastream_ids: dict[str, str],
+        self, ds_id: str, reading: SensorReading, kind: str, datastream_ids: Mapping[str, str],
     ) -> str | None:
         """Why ``reading`` may not go to datastream ``ds_id``; None when it may."""
         route = self._datastream_routes.get(ds_id)
@@ -2570,13 +2970,24 @@ class SensorThingsClient:
         if kind != "sensor_id":
             return None
         # Bare sensor id, datastream property unknown: only a sensor's sole datastream.
-        prefix = f"{reading.sensor_id}::"
-        known = {str(value) for key, value in datastream_ids.items() if key.startswith(prefix)}
-        known.update(other for other, r in self._datastream_routes.items() if r.sensor_id == reading.sensor_id)
+        known = self._known_datastreams_of(reading.sensor_id, datastream_ids)
         known.add(ds_id)
         if len(known) == 1:
             return None
         return f"sensor {reading.sensor_id} has {len(known)} datastreams and datastream {ds_id}'s observed property is unknown"
+
+    def _known_datastreams_of(self, sensor_id: str, datastream_ids: Mapping[str, str]) -> set[str]:
+        """Ids of a sensor's datastreams: its mapped full keys and its listed datastreams.
+
+        Uses the per-sensor indexes, so it neither scans every key per reading
+        nor iterates a map that a registration on another thread is changing.
+        """
+        if isinstance(datastream_ids, _DatastreamIdMap):
+            known = set(datastream_ids.ids_of_sensor(sensor_id))
+        else:  # a plain map (the settings fallback): iterate a copy
+            known = {str(value) for key, value in list(datastream_ids.items()) if _sensor_of_key(key) == sensor_id}
+        known.update(self._route_ids_by_sensor.get(sensor_id, ()))
+        return known
 
     def push_observations(
         self,
@@ -2593,6 +3004,9 @@ class SensorThingsClient:
                 "preview": preview.model_dump(mode="json"),
             }
 
+        # A failed startup listing leaves the route guard off: retry it here,
+        # once its backoff has passed, before this push resolves its readings.
+        self._retry_route_listing_if_due()
         datastream_ids = self._datastream_ids or dict(settings.datastream_ids)
 
         endpoint_results: list[dict[str, Any]] = []
@@ -2636,7 +3050,9 @@ class SensorThingsClient:
                         "sensor_id": reading.sensor_id,
                         "observed_property": reading.observed_property,
                         "ok": False,
-                        "message": "No datastream mapping available for this sensor; dynamic lookup also failed.",
+                        "message": UNRESOLVED_MESSAGE,
+                        # Not pushed and not dead-lettered: nothing of it reached FROST.
+                        "unresolved": True,
                     }
                     if refused:
                         entry["refused"] = refused
