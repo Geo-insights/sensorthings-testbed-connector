@@ -19,6 +19,14 @@ logger = logging.getLogger(__name__)
 # against the FROST server. Avoids an HTTP GET per entity on every registration.
 _VALIDATION_TTL_SECONDS = 600  # 10 minutes
 
+# How many matching Datastreams find_datastream_by_filter weighs (newest first).
+_DATASTREAM_LOOKUP_TOP = 20
+
+
+def _newest_first(entity_id: str) -> tuple[int, int]:
+    """Sort key: numeric ids from the highest down; other ids after them, in the server's order."""
+    return (0, -int(entity_id)) if entity_id.isdigit() else (1, 0)
+
 
 class EntityManager:
     """Idempotent entity CRUD using FrostHTTPClient + EntityCache."""
@@ -263,3 +271,59 @@ class EntityManager:
         except ValueError:
             return None
         return self._http.extract_first_iot_id(body, fields=self._fields)
+
+    def find_datastream_by_filter(self, endpoint: str, odata_filter: str, preferred_name: str = "") -> str | None:
+        """The id of the Datastream matching ``odata_filter``, picked the same way on every call.
+
+        Several Datastreams can match: a KNMI Thing has a stale '... - Ground
+        temperature' Datastream next to the current '... - Ground surface
+        temperature' one, and both carry the streamKey and observed_property
+        ground_temperature. Asked for one match without ``$orderby``,
+        FROST/PostgreSQL answers in physical row order, which changes as rows are
+        updated. So the matches come in id order (``$orderby=id desc``: the
+        property is ``id`` on v1.1 and v2.0 alike, also on FROST's /v2.0 path for
+        a target that declares no version) with their ObservedProperty's name,
+        and the pick is the highest id among
+
+        1. the Datastreams whose ObservedProperty is ``preferred_name`` or whose
+           name ends with ``" - <preferred_name>"`` (the connector names its
+           Datastreams "<sensor> - <display name>"), if any;
+        2. otherwise all matches: a Datastream registered after a rename
+           replaces the older one.
+
+        The ids are sorted here as well, so the pick does not depend on the
+        server honouring ``$orderby``. Returns None on any error or no match.
+        """
+        params = {
+            "$filter": odata_filter,
+            "$orderby": "id desc",
+            "$top": str(_DATASTREAM_LOOKUP_TOP),
+            "$expand": "ObservedProperty($select=name)",
+        }
+        try:
+            response = self._http.get(endpoint, params=params)
+        except Exception:
+            return None
+        if not response.ok:
+            return None
+        try:
+            body = response.json()
+        except ValueError:
+            return None
+        rows = body.get("value") if isinstance(body, dict) else None
+        if not isinstance(rows, list):
+            return None
+        matches: list[tuple[str, dict[str, Any]]] = []
+        for row in rows:
+            if isinstance(row, dict):
+                row_id = self._http.extract_iot_id_from_body(row, fields=self._fields)
+                if row_id is not None:
+                    matches.append((row_id, row))
+        matches.sort(key=lambda match: _newest_first(match[0]))
+        if preferred_name:
+            for row_id, row in matches:
+                observed_property = row.get("ObservedProperty")
+                op_name = observed_property.get("name") if isinstance(observed_property, dict) else None
+                if op_name == preferred_name or str(row.get("name") or "").endswith(f" - {preferred_name}"):
+                    return row_id
+        return matches[0][0] if matches else None
