@@ -2,9 +2,11 @@
 
 Runs the backfill's real SQL through its real transport (docker exec + psql) on a
 throwaway FROST stack, seeded through the FROST API with observations shaped like the
-connector's: the dry run, --apply, an interrupted batch, the re-run, and --rollback.
-Each run gets its own container and network names; the database publishes no port,
-FROST only on 127.0.0.1. Everything is removed afterwards.
+connector's: the dry run, --apply, an interrupted batch, the re-run, and --rollback,
+also after rows were moved between datastreams as scripts/fix_sc_misrouted_observations.py
+moves them. Each run gets its own container and network names (prefixed with
+$TEST_DOCKER_PREFIX when set); the database publishes no port, FROST only on 127.0.0.1.
+Everything is removed afterwards.
 
     python -m pytest tests/integration/test_sc_pressure_backfill.py -m integration
 """
@@ -12,6 +14,7 @@ FROST only on 127.0.0.1. Everything is removed afterwards.
 from __future__ import annotations
 
 import json
+import os
 import re
 import socket
 import subprocess
@@ -195,13 +198,15 @@ def _seed(url: str) -> tuple[dict[str, int], dict[str, int]]:
 
 
 SNAPSHOT_SQL = (
-    'CREATE TABLE sc_test_snapshot AS SELECT "ID", "RESULT_NUMBER", "RESULT_STRING" FROM "OBSERVATIONS";\n'
+    'CREATE TABLE sc_test_snapshot AS SELECT "ID", "DATASTREAM_ID", "RESULT_NUMBER", "RESULT_STRING" FROM "OBSERVATIONS";\n'
 )
 RESET_SQL = """
-UPDATE "OBSERVATIONS" o SET "RESULT_NUMBER" = s."RESULT_NUMBER", "RESULT_STRING" = s."RESULT_STRING"
+UPDATE "OBSERVATIONS" o
+   SET "DATASTREAM_ID" = s."DATASTREAM_ID", "RESULT_NUMBER" = s."RESULT_NUMBER", "RESULT_STRING" = s."RESULT_STRING"
   FROM sc_test_snapshot s
  WHERE o."ID" = s."ID"
-   AND (o."RESULT_NUMBER" IS DISTINCT FROM s."RESULT_NUMBER" OR o."RESULT_STRING" IS DISTINCT FROM s."RESULT_STRING");
+   AND (o."DATASTREAM_ID", o."RESULT_NUMBER", o."RESULT_STRING")
+       IS DISTINCT FROM (s."DATASTREAM_ID", s."RESULT_NUMBER", s."RESULT_STRING");
 """
 
 
@@ -211,7 +216,7 @@ def stack() -> Iterator[Stack]:
         _docker("version", timeout=30)
     except (FileNotFoundError, subprocess.SubprocessError):
         pytest.skip("Docker is not available")
-    name = f"scpressure-{uuid.uuid4().hex[:8]}"
+    name = f"{os.environ.get('TEST_DOCKER_PREFIX') or 'scpressure'}-{uuid.uuid4().hex[:8]}"
     db, frost, network = f"{name}-db", f"{name}-frost", f"{name}-net"
     port = _free_port()
     try:
@@ -239,7 +244,7 @@ def stack() -> Iterator[Stack]:
         _psql(db, SNAPSHOT_SQL)
         yield Stack(db, url, ids, datastreams)
     finally:
-        _docker("rm", "-f", frost, db, check=False)
+        _docker("rm", "-f", "-v", frost, db, check=False)  # -v: the PostGIS image's anonymous data volume too
         _docker("network", "rm", network, check=False)
 
 
@@ -363,7 +368,7 @@ def test_dry_run_apply_rerun_and_rollback(fresh: Stack, tmp_path: Path, capsys: 
     assert _script(fresh, "--rollback", "--apply", "--ids-file", str(ids_file), "--batch-rows", "5") == 0
     out = capsys.readouterr().out
     assert "Restored 19 observations (planned 19)." in out
-    assert "Verification: no recorded row holds the converted value any more." in out
+    assert "Verification: no recorded row holds the converted value any more, in any datastream." in out
     restored = _state(fresh)
     assert restored["b3"] == ("1001.5", "1001.5")
     assert {k: v for k, v in restored.items() if k != "b3"} == {k: v for k, v in seeded.items() if k != "b3"}
@@ -423,5 +428,70 @@ def test_interrupted_apply_leaves_no_converted_row_unrecorded(fresh: Stack, tmp_
     # The same command finishes the job; the rollback restores everything as seeded.
     assert _script(fresh, "--apply", "--ids-file", str(ids_file)) == 0
     assert {label: _state(fresh)[label] for label in CONVERTED} == CONVERTED
+    assert _script(fresh, "--rollback", "--apply", "--ids-file", str(ids_file)) == 0
+    assert _state(fresh) == seeded
+
+
+def _move(db: str, ds_id: int, *obs_ids: int) -> None:
+    """What scripts/fix_sc_misrouted_observations.py does to the result of a row: nothing; it gets another DATASTREAM_ID."""
+    _psql(db, f'UPDATE "OBSERVATIONS" SET "DATASTREAM_ID" = {ds_id} WHERE "ID" IN ({",".join(map(str, obs_ids))});\n')
+
+
+def test_rollback_alone_restores_rows_converted_before_or_after_a_move(
+    fresh: Stack, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The backfill (b), the moves (d), the backfill again (e): the rollback alone, by observation ID,
+    restores every converted row wherever it is now."""
+    seeded = _state(fresh)
+    ids_file = tmp_path / "ids.csv"
+    a, b, pm10 = fresh.datastreams["A"], fresh.datastreams["B"], fresh.datastreams["PM10"]
+
+    assert _script(fresh, "--apply", "--ids-file", str(ids_file), "--batch-rows", "5") == 0  # b
+    _move(fresh.db, b, fresh.ids["pa"])  # d: a converted row to another Air pressure datastream,
+    _move(fresh.db, pm10, fresh.ids["pa_decimals"])  # one out of them (as to a humidity datastream),
+    _move(fresh.db, a, fresh.ids["pm10_stream"])  # and a pressure reading in Pa into one
+    assert _script(fresh, "--apply", "--ids-file", str(ids_file)) == 0  # e
+    assert _state(fresh)["pm10_stream"] == ("25", "25")
+    capsys.readouterr()
+
+    assert _script(fresh, "--rollback", "--ids-file", str(ids_file)) == 0
+    out = capsys.readouterr().out
+    assert re.search(r"not found \(deleted\)\s+0\n", out)
+    assert re.search(r"in another datastream than recorded \(moved since\)\s+2\n", out)
+    assert re.search(r"holding the converted value: to restore\s+21\n", out)
+    assert re.search(r"of those in another datastream than recorded\s+2\n", out)
+
+    assert _script(fresh, "--rollback", "--apply", "--ids-file", str(ids_file), "--batch-rows", "5") == 0
+    out = capsys.readouterr().out
+    assert "Restored 21 observations (planned 21)." in out
+    assert "Verification: no recorded row holds the converted value any more, in any datastream." in out
+    assert _state(fresh) == seeded  # every value as seeded, also where the moves put it
+    where = dict(line.split("|") for line in _psql(fresh.db, 'SELECT "ID", "DATASTREAM_ID" FROM "OBSERVATIONS";\n'))
+    assert (where[str(fresh.ids["pa"])], where[str(fresh.ids["pa_decimals"])]) == (str(b), str(pm10))  # not moved back
+
+
+def test_rollback_after_an_interrupted_backfill_a_move_and_a_rerun(fresh: Stack, tmp_path: Path) -> None:
+    """b stops on a lock and is not re-run; d moves rows b recorded but did not convert; e converts them
+    and records them again under their new datastream. The rollback takes those records as one row."""
+    seeded = _state(fresh)
+    ids_file = tmp_path / "ids.csv"
+    a, b = fresh.datastreams["A"], fresh.datastreams["B"]
+    b_rows = [fresh.ids[f"b{k}"] for k in range(12)]
+    lock = _RowLock(fresh.db, b_rows[0])  # held past the lock_timeout: B's first batch fails
+    try:
+        assert _script(fresh, "--apply", "--ids-file", str(ids_file), "--batch-rows", "5") == 1
+    finally:
+        lock.release()
+    _wait_until_no_script_session(fresh.db)
+    assert set(b_rows) <= _recorded(ids_file)
+    assert {k: v for k, v in _state(fresh).items() if k.startswith("b")} == {
+        k: v for k, v in seeded.items() if k.startswith("b")
+    }
+
+    _move(fresh.db, a, *b_rows[:5])  # d: still in Pa
+    assert _script(fresh, "--apply", "--ids-file", str(ids_file)) == 0  # e
+    records = backfill.read_ids_file(ids_file)
+    assert {r.datastream_id for r in records if r.observation_id == b_rows[0]} == {a, b}
+
     assert _script(fresh, "--rollback", "--apply", "--ids-file", str(ids_file)) == 0
     assert _state(fresh) == seeded

@@ -715,22 +715,29 @@ class _FakeFrost:
         match = _JSON_ROWS.search(sql)
         assert match is not None
         records = json.loads(match[1].replace("''", "'"))
-        found = as_converted = as_recorded = 0
+        # As the statement joins: on the observation ID alone, or (an older form) only in the recorded datastream.
+        recorded_datastream_only = re.search(rf'o\."DATASTREAM_ID" = {ds}\b', sql) is not None
+        found = as_converted = as_recorded = elsewhere = elsewhere_converted = 0
         for record in records:
             row = self.rows.get(record["id"])
-            if row is None or row.ds != ds:
+            if row is None or (recorded_datastream_only and row.ds != ds):
                 continue
             found += 1
+            moved = row.ds != ds
+            elsewhere += moved
             original = float(record["num"])
             if row.result_type == 0 and row.number == float(_hpa_text(original)) and row.text == _hpa_text(original):
                 as_converted += 1
+                elsewhere_converted += moved
                 if tag == "restored":
                     row.number, row.text = original, record["str"]
             elif row.number == original and row.text == record["str"]:
                 as_recorded += 1
         if tag == "restored":
             return f"restored|{ds}|{len(records)}|{as_converted}|end"
-        return f"rbstate|{ds}|{len(records)}|{found}|{as_converted}|{as_recorded}|end"
+        if recorded_datastream_only:
+            return f"rbstate|{ds}|{len(records)}|{found}|{as_converted}|{as_recorded}|end"
+        return f"rbstate|{ds}|{len(records)}|{found}|{as_converted}|{as_recorded}|{elsewhere}|{elsewhere_converted}|end"
 
 
 def _rows() -> dict[int, _Row]:
@@ -811,6 +818,19 @@ def test_backfill_rollback_restores_only_rows_holding_the_converted_value() -> N
     assert '"RESULT_NUMBER" = v.num' in sql
     assert '"RESULT_STRING" = v.str' in sql
     assert """'[{"id":3,"num":"100199","str":"100199.0"}]'::json""" in sql
+
+
+def test_backfill_rollback_finds_rows_by_id_in_any_datastream() -> None:
+    """scripts/fix_sc_misrouted_observations.py moves rows, converted ones too: the rollback must
+    not look for a row only in the datastream it was recorded under. IS_CONVERTED proves the row."""
+    records = [backfill.Record(16, 3, "100199", "100199.0")]
+    restore, state = backfill.rollback_sql(16, records), backfill.rollback_state_sql(16, records)
+    assert 'o."DATASTREAM_ID" = 16' not in restore
+    assert 'WHERE o."ID" = v.id\n' in restore
+    assert backfill.IS_CONVERTED in restore
+    assert 'o."DATASTREAM_ID" = 16' not in state
+    assert 'LEFT JOIN "OBSERVATIONS" o ON o."ID" = v.id;' in state
+    assert 'count(o."ID") FILTER (WHERE o."DATASTREAM_ID" IS DISTINCT FROM 16)' in state
 
 
 def test_backfill_rollback_sql_quotes_any_recorded_text() -> None:
@@ -958,6 +978,19 @@ def test_backfill_read_ids_file_names_a_bad_line(tmp_path: Path) -> None:
     path.write_text(backfill.IDS_HEADER + "\n16,1,100391.86,\nnot,a,record\n", encoding="utf-8")
     with pytest.raises(backfill.IdsFileError, match="line 3"):
         backfill.read_ids_file(path)
+
+
+def test_backfill_group_records_takes_a_row_recorded_under_two_datastreams_as_one() -> None:
+    """An interrupted run records a row, the move script moves it, the re-run records it again
+    under its new datastream: the same values, so one row, not a conflict."""
+    first = backfill.Record(28, 7, "100391.86", "100391.86")
+    again = first._replace(datastream_id=16)
+    assert backfill.group_records([first, again]) == {28: [first]}
+    assert backfill.group_records([first, again], {16}) == {16: [again]}
+    assert backfill.group_records([first, again], {28}) == {28: [first]}
+    for different in (again._replace(result_number="100391.87"), again._replace(result_string="100391.860")):
+        with pytest.raises(backfill.IdsFileError, match="different values"):
+            backfill.group_records([first, different])
 
 
 def test_backfill_group_records_dedupes_and_refuses_conflicts() -> None:
@@ -1245,7 +1278,7 @@ def test_backfill_rollback_restores_the_recorded_values_exactly(
     assert _state(frost) == original  # RESULT_STRING too: '100199.0', '1.0E+5'
     out = capsys.readouterr().out
     assert "Restored 16 observations (planned 16)." in out
-    assert "Verification: no recorded row holds the converted value any more." in out
+    assert "Verification: no recorded row holds the converted value any more, in any datastream." in out
     assert sum(sql.count("SELECT 'restored'") for sql in _writes(frost)) == 4  # in batches of 5
     assert backfill.run(_rollback_args(tmp_path, "--apply"), frost) == 0  # again: nothing to do
     assert "Restored 0 observations (planned 0)." in capsys.readouterr().out
@@ -1272,6 +1305,52 @@ def test_backfill_rollback_can_be_limited_to_a_datastream(tmp_path: Path) -> Non
     assert backfill.run(_rollback_args(tmp_path, "--apply", "--datastream", "16"), frost) == 0
     after = _state(frost)
     assert all(after[i] == (original[i] if r.ds == 16 else converted[i]) for i, r in frost.rows.items())
+
+
+def test_backfill_rollback_restores_converted_rows_moved_to_another_datastream(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The backfill converts (b), the move script moves converted rows (d): the rollback alone restores them."""
+    frost = _FakeFrost(_rows())
+    original = _state(frost)
+    assert backfill.run(_apply_args(tmp_path), frost) == 0
+    frost.rows[1].ds = 28  # to another Air pressure datastream
+    frost.rows[2].ds = 77  # out of the Air pressure datastreams, e.g. back to a humidity one
+    capsys.readouterr()
+
+    assert backfill.run(_rollback_args(tmp_path), frost) == 0  # dry run
+    out = capsys.readouterr().out
+    assert re.search(r"not found \(deleted\)\s+0\n", out)
+    assert re.search(r"in another datastream than recorded \(moved since\)\s+2\n", out)
+    assert re.search(r"holding the converted value: to restore\s+16\n", out)
+    assert re.search(r"of those in another datastream than recorded\s+2\n", out)
+
+    assert backfill.run(_rollback_args(tmp_path, "--apply"), frost) == 0
+    assert _state(frost) == original
+    out = capsys.readouterr().out
+    assert "Restored 16 observations (planned 16)." in out
+    assert "Verification: no recorded row holds the converted value any more, in any datastream." in out
+
+
+def test_backfill_rollback_after_an_interrupted_run_a_move_and_a_rerun(tmp_path: Path) -> None:
+    """b stops after its first batch; the move script moves rows b recorded but did not convert; the
+    re-run converts them and records them again under their new datastream. One rollback undoes it all."""
+    frost = _FakeFrost(_rows())
+    original = _state(frost)
+    frost.crash_after_updates = 1  # datastream 16 converted; 28's rows recorded, not converted
+    with pytest.raises(backfill.PsqlError):
+        backfill.run(_apply_args(tmp_path, "--batch-rows", "5"), frost)
+    frost.crash_after_updates = None
+    for i in (100, 101, 102):  # still in Pa: moved from 28 to 16
+        frost.rows[i].ds = 16
+
+    assert backfill.run(_apply_args(tmp_path), frost) == 0
+    recorded = {(r.datastream_id, r.observation_id) for r in _recorded(tmp_path)}
+    assert {(28, 100), (16, 100)} <= recorded  # one row, recorded under both datastreams
+    assert {i: _state(frost)[i][1] for i in _CONVERTED} == _CONVERTED
+
+    assert backfill.run(_rollback_args(tmp_path, "--apply"), frost) == 0
+    assert _state(frost) == original
 
 
 def test_backfill_rollback_refuses_while_another_write_session_is_active(tmp_path: Path) -> None:

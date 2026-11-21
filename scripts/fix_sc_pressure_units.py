@@ -57,9 +57,18 @@ Rollback (--rollback)
 ---------------------
 Restores RESULT_NUMBER and RESULT_STRING exactly as recorded in the IDs
 file, for the listed rows whose current values are exactly what --apply wrote
-from the recorded ones. Rows never converted, or changed since, are left alone
-and counted. Dry run unless --apply is given; batched like the conversion,
-then verified.
+from the recorded ones, in whatever datastream each row is now: an observation
+is found by its ID alone (holding exactly the converted value of its recorded
+value proves it is the row that was converted). scripts/fix_sc_misrouted_observations.py
+moves rows between datastreams, also rows converted here, so a converted row
+can sit in another datastream than recorded; those are counted separately.
+A row recorded by an interrupted run, moved, and recorded again by a later
+run under its new datastream is one row (the records differ only in their
+datastream_id); records of one observation with different values are refused.
+Rows never converted, or changed since, are left alone and counted. Dry run
+unless --apply is given; batched like the conversion, then verified over all
+recorded rows. --datastream limits it to rows recorded under those
+datastreams, wherever they are now.
 
 Sessions, batches and timeouts
 ------------------------------
@@ -108,11 +117,28 @@ bypassing the mapper, until they are delivered or FAILED_DLQ_MAX_AGE_HOURS
    (48 h after the deploy at the latest), run the dry run again and, if it
    finds rows (replayed from the DLQ), --apply again with the same file.
 
+With the move of misrouted rows (scripts/fix_sc_misrouted_observations.py on
+fix/sc-datastream-routing), which brings Pa readings from other datastreams
+into Air pressure datastreams: this backfill (b), then the moves (d), then this
+backfill --apply again with the same file (e), which converts what the moves
+brought in. A pre-fix DLQ payload can also be replayed into a misrouted
+datastream after that; the move re-run then puts it in an Air pressure
+datastream, still in Pa. So once the queue has drained or expired, in this
+order: the move script's dry run and --apply (same IDs file), then this
+backfill --apply (same file), then this dry run, which must find 0 pressure
+readings to convert.
+
 If a run is interrupted, run the same command again. If it reports another
 write session as active, wait for it (each statement ends within the
 statement timeout) or end it with SELECT pg_terminate_backend(<pid>).
 To undo: --rollback --ids-file sc_pressure_ids.csv (a dry run), then the same
-with --apply.
+with --apply. It restores every converted row wherever it is now, also after
+the moves. To undo the moves as well, run the move script's rollback too
+(--rollback, then --rollback --apply, with its IDs file); the two rollbacks
+can run in either order: the move rollback puts rows back whatever their
+value (it reports rows converted after their move), this one restores values
+wherever the rows are. Undoing only the moves leaves the rows converted after
+their move (by e) in hPa in the datastreams they came from.
 
 Not covered: only this FROST database is repaired. Other FROST targets the
 connector pushed to keep their Pa values, and so do copies made from FROST
@@ -337,7 +363,9 @@ SELECT 'busy', pid, state, coalesce(to_char(now() - query_start, 'HH24:MI:SS'), 
 """
 
 
-# The rollback joins OBSERVATIONS o to the recorded rows v(id, num, str).
+# The rollback joins OBSERVATIONS o to the recorded rows v(id, num, str) on the observation
+# ID alone: a row holding exactly the converted value of its recorded value is the row the
+# backfill converted, in whatever datastream it is now (the move script moves rows).
 IS_CONVERTED = (
     f'o."RESULT_TYPE" = 0 AND o."RESULT_NUMBER" = {converted("v.num")}::double precision '
     f'AND o."RESULT_STRING" = {converted("v.num")}::text'
@@ -355,26 +383,35 @@ def _recorded_rows_sql(records: Sequence[Record]) -> str:
 
 
 def rollback_state_sql(ds_id: int, records: Sequence[Record]) -> str:
-    """How many recorded rows of one datastream exist, hold the converted value, or the recorded one."""
+    """How many rows recorded under one datastream exist, hold the converted value, or the recorded one.
+
+    Found by ID wherever they are now; the last two counts are of those in another datastream.
+    """
+    elsewhere = f'o."DATASTREAM_ID" IS DISTINCT FROM {int(ds_id)}'
     return f"""
 SELECT 'rbstate', {int(ds_id)}, count(*), count(o."ID"),
        count(*) FILTER (WHERE {IS_CONVERTED}),
        count(*) FILTER (WHERE {IS_RECORDED}),
+       count(o."ID") FILTER (WHERE {elsewhere}),
+       count(*) FILTER (WHERE {elsewhere} AND {IS_CONVERTED}),
        '{END}'
   FROM {_recorded_rows_sql(records)}
-  LEFT JOIN "OBSERVATIONS" o ON o."ID" = v.id AND o."DATASTREAM_ID" = {int(ds_id)};
+  LEFT JOIN "OBSERVATIONS" o ON o."ID" = v.id;
 """
 
 
 def rollback_sql(ds_id: int, records: Sequence[Record]) -> str:
-    """One batch: restore the recorded values of the rows that hold exactly the converted value."""
+    """One batch: restore the recorded values of the rows that hold exactly the converted value.
+
+    ``ds_id`` is the datastream the rows were recorded under; each row is restored wherever it is now.
+    """
     return f"""
 WITH restored AS (
     UPDATE "OBSERVATIONS" o
        SET "RESULT_NUMBER" = v.num,
            "RESULT_STRING" = v.str
       FROM {_recorded_rows_sql(records)}
-     WHERE o."DATASTREAM_ID" = {int(ds_id)} AND o."ID" = v.id
+     WHERE o."ID" = v.id
        AND {IS_CONVERTED}
     RETURNING o."ID"
 )
@@ -424,11 +461,13 @@ class Record(NamedTuple):
 
 @dataclass(frozen=True)
 class RollbackState:
-    datastream_id: int
+    datastream_id: int  # the datastream the rows were recorded under
     listed: int  # distinct recorded rows
-    found: int  # of those, still in this datastream
+    found: int  # of those, still in the database, in any datastream
     as_converted: int  # holding exactly what --apply wrote: restored by --rollback --apply
     as_recorded: int  # holding the recorded values: never converted, or restored already
+    elsewhere: int = 0  # of those found, in another datastream now (moved since)
+    elsewhere_converted: int = 0  # of those, holding the converted value: restored there
 
     @property
     def changed(self) -> int:
@@ -527,8 +566,8 @@ def parse_counts(lines: Sequence[str], tag: str) -> list[tuple[int, int, int]]:
 
 def parse_rollback_state(lines: Sequence[str]) -> list[RollbackState]:
     return [
-        RollbackState(int(f[0]), int(f[1]), int(f[2]), int(f[3]), int(f[4]))
-        for f in _tagged(lines, "rbstate", 6, ended=True)
+        RollbackState(int(f[0]), int(f[1]), int(f[2]), int(f[3]), int(f[4]), int(f[5]), int(f[6]))
+        for f in _tagged(lines, "rbstate", 8, ended=True)
     ]
 
 
@@ -638,15 +677,19 @@ def read_ids_file(path: Path) -> list[Record]:
 def group_records(records: Iterable[Record], datastreams: set[int] | None = None) -> dict[int, list[Record]]:
     """Distinct records per datastream, sorted by observation ID.
 
-    A row recorded twice (a re-run after an interruption) has the same values both
-    times; different values for one observation mean the file was edited or mixed up.
+    A row recorded twice has the same values both times: a re-run after an
+    interruption records it again, and when the move script moved it in between,
+    under its new datastream. Such records are one row, kept under the datastream
+    of the first one (the rollback finds a row by its ID wherever it is).
+    Different values for one observation mean the file was edited or mixed up.
     """
     seen: dict[int, Record] = {}
     conflicts = set()
     for record in records:
         if datastreams and record.datastream_id not in datastreams:
             continue
-        if seen.setdefault(record.observation_id, record) != record:
+        known = seen.setdefault(record.observation_id, record)
+        if (known.result_number, known.result_string) != (record.result_number, record.result_string):
             conflicts.add(record.observation_id)
     if conflicts:
         raise IdsFileError(
@@ -1021,7 +1064,8 @@ def rollback_scan(
             prev = state.get(s.datastream_id)
             if prev is not None:
                 s = RollbackState(s.datastream_id, prev.listed + s.listed, prev.found + s.found,
-                                  prev.as_converted + s.as_converted, prev.as_recorded + s.as_recorded)
+                                  prev.as_converted + s.as_converted, prev.as_recorded + s.as_recorded,
+                                  prev.elsewhere + s.elsewhere, prev.elsewhere_converted + s.elsewhere_converted)
             state[s.datastream_id] = s
         _progress(f"  checked {len(state)}/{len({ds_id for ds_id, _ in batches})} datastreams")
     return state
@@ -1049,11 +1093,13 @@ def print_rollback_state(state: dict[int, RollbackState]) -> None:
     def line(label: str, count: int) -> None:
         print(f"  {label:<52}{count:>12,}")
 
-    print("\nRecorded rows")
-    line("datastreams", len(values))
+    print("\nRecorded rows (found by observation ID, in whatever datastream they are now)")
+    line("datastreams recorded under", len(values))
     line("observations recorded", sum(s.listed for s in values))
-    line("  not found (deleted, or moved to another datastream)", sum(s.listed - s.found for s in values))
+    line("  not found (deleted)", sum(s.listed - s.found for s in values))
+    line("  in another datastream than recorded (moved since)", sum(s.elsewhere for s in values))
     line("  holding the converted value: to restore", sum(s.as_converted for s in values))
+    line("    of those in another datastream than recorded", sum(s.elsewhere_converted for s in values))
     line("  holding the recorded value: nothing to do", sum(s.as_recorded for s in values))
     line("  holding another value: changed since, left alone", sum(s.changed for s in values))
 
@@ -1061,12 +1107,14 @@ def print_rollback_state(state: dict[int, RollbackState]) -> None:
 def run_rollback(args: argparse.Namespace, run_sql: RunSql) -> int:
     mode = "APPLY: writes to OBSERVATIONS" if args.apply else "DRY RUN: read-only, nothing is written"
     print(f"Rollback of the Sensor.Community \"{OBS_PROPERTY_NAME}\" Pa -> hPa backfill from {args.ids_file} ({mode})")
-    print(f"Rows: those recorded whose values are exactly what --apply wrote: {IS_CONVERTED}")
+    print("Rows: those recorded whose values are exactly what --apply wrote, by observation ID in any datastream: "
+          f"{IS_CONVERTED}")
     print("Set:  RESULT_NUMBER and RESULT_STRING as recorded\n")
     records = read_ids_file(args.ids_file)
     by_ds = group_records(records, set(args.datastream or ()))
     print(f"{len(records):,} records in the file; {sum(len(r) for r in by_ds.values()):,} distinct observations "
-          f"over {len(by_ds):,} datastreams" + (f" (limited to {sorted(args.datastream)})" if args.datastream else ""))
+          f"recorded under {len(by_ds):,} datastreams"
+          + (f" (limited to rows recorded under {sorted(args.datastream)})" if args.datastream else ""))
     if not by_ds:
         return 0
     batches = _rollback_batches(by_ds, args.batch_rows)
@@ -1088,7 +1136,7 @@ def run_rollback(args: argparse.Namespace, run_sql: RunSql) -> int:
     if left:
         print(f"Verification: {left:,} recorded rows still hold the converted value. Re-run to restore them.")
         return 1
-    print("Verification: no recorded row holds the converted value any more.")
+    print("Verification: no recorded row holds the converted value any more, in any datastream.")
     return 0
 
 
