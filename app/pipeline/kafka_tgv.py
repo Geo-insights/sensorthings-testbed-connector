@@ -143,13 +143,17 @@ _FAILURES_BEFORE_DEFERRING = 3
 # before each next attempt.
 _RETRY_BASE_SECONDS = 30.0
 _RETRY_MAX_SECONDS = 300.0
+# A set still failing at its 4th attempt (about 3.5 min after the first) gets
+# its own alert: the failure is not a blip, and it holds every TGV batch.
+_PERSISTENT_FAILURES = 4
 _ALERT_EVENT = "kafka.tgv_registration"
+_UNROUTED_EVENT = "kafka.tgv_unrouted"
 
 _events = logging.getLogger("connector.events")
 
 
 class TGVRegistrationPending(RuntimeError):
-    """No TGV entity set is registered on the primary FROST target yet.
+    """A TGV entity set that readings of the batch belong to is not registered on the primary FROST target yet.
 
     Raised before the push, so the Kafka loop does not commit the batch: it
     rebuilds the consumer and Kafka delivers the batch again.
@@ -241,15 +245,23 @@ class TGVPrimaryRegistration:
     The Kafka loop passes every mapped batch through :meth:`prepare_push`
     before the push. It registers the sets not registered yet (all of them on
     the first batch after a start; later only those whose registration
-    failed, each after its retry delay) and returns the readings that have a
-    datastream in a registered set. ``register_entity_set`` finds the entities
-    of an earlier run in the entity cache or by name, so a restart creates
-    nothing twice.
+    failed, each after its retry delay) and returns the readings to push.
+    ``register_entity_set`` finds the entities of an earlier run in the
+    entity cache or by name, so a restart creates nothing twice.
 
-    While no set is registered, :meth:`prepare_push` raises
-    :class:`TGVRegistrationPending`, and the Kafka loop leaves the batch
-    uncommitted. Once some are, readings of the others are left out of the
-    push (there is no datastream for them) until their sets are registered.
+    While any reading of the batch belongs to a TGV set that is not
+    registered, :meth:`prepare_push` raises :class:`TGVRegistrationPending`
+    and the Kafka loop leaves the whole batch uncommitted, so Kafka delivers
+    it again; nothing of it is pushed, so nothing is pushed twice. A set that
+    keeps failing therefore holds every TGV batch, and alerts say so.
+
+    Readings that belong to no TGV set (a KAFKA_TGV_DEVICE_MAPPING_JSON stream
+    that entity_configs/tgv_*.yaml does not define) are dropped with an
+    alert. There is no datastream for them on the primary and nothing here
+    creates one, so holding them would stop the partition for good; the
+    dead-letter queue cannot keep them either, as its entries are
+    observations bound for a datastream id. The fix is a datastream for the
+    stream in the YAML (or a corrected mapping).
     """
 
     def __init__(
@@ -267,8 +279,10 @@ class TGVPrimaryRegistration:
         # Thing name -> canonical "sensor_id::observed_property" -> datastream id on the primary
         self._registered: dict[str, dict[str, str]] = {}
         self._failures: dict[str, int] = {}
+        self._problems: dict[str, str] = {}
         self._retry_at: dict[str, float] = {}
         self._reported: set[str] = set()
+        self._owners: dict[str, str] | None = None
         self._holding = False
 
     def _frost(self) -> SensorThingsClient:
@@ -291,11 +305,23 @@ class TGVPrimaryRegistration:
     def _routes(self) -> dict[str, str]:
         return {key: ds_id for ids in self._registered.values() for key, ds_id in ids.items()}
 
-    def prepare_push(self, readings: list[SensorReading]) -> list[SensorReading]:
-        """Register the pending TGV entity sets, then return the readings that have a registered datastream.
+    def _owner_of(self) -> dict[str, str]:
+        """Canonical ``sensor_id::observed_property`` -> the Thing name of the TGV set that defines it."""
+        if self._owners is None:
+            self._owners = {
+                key: _thing_name(entity_set)
+                for entity_set in self._sets()
+                for key in entity_set_datastream_keys(entity_set)
+            }
+        return self._owners
 
-        Raises :class:`TGVRegistrationPending` when there are readings and no
-        set is registered. Without a FROST target the readings pass unchanged
+    def prepare_push(self, readings: list[SensorReading]) -> list[SensorReading]:
+        """Register the pending TGV entity sets, then return the readings to push.
+
+        Raises :class:`TGVRegistrationPending` while any reading belongs to a
+        TGV set that is not registered (the batch must stay uncommitted).
+        Readings that belong to no TGV set are left out, with an alert.
+        Without a FROST target the readings pass unchanged
         (``push_observations`` only previews them).
         """
         frost = self._frost()
@@ -313,10 +339,16 @@ class TGVPrimaryRegistration:
             for key, ds_id in routes.items():
                 if pinned.get(key) != ds_id:
                     pinned[key] = ds_id
-            if not routes:
-                if readings:
-                    self._hold(base_url, len(readings))
+            if not readings:
                 return []
+            owners = self._owner_of()
+            waiting = Counter(
+                owners[key]
+                for key in (tgv_datastream_key(r.sensor_id, r.observed_property) for r in readings)
+                if key in owners and key not in routes
+            )
+            if waiting:
+                self._hold(base_url, len(readings), waiting)
             if self._holding:
                 self._holding = False
                 self._alert(
@@ -330,6 +362,7 @@ class TGVPrimaryRegistration:
         self._base_url = base_url
         self._registered.clear()
         self._failures.clear()
+        self._problems.clear()
         self._retry_at.clear()
         self._reported.clear()
 
@@ -381,6 +414,7 @@ class TGVPrimaryRegistration:
                 canonical: str(ids[reported]) for canonical, reported in entity_set_datastream_keys(entity_set).items()
             }
             self._failures.pop(name, None)
+            self._problems.pop(name, None)
             self._retry_at.pop(name, None)
             statuses = Counter(
                 str(entry.get("status")) for entry in result.get("datastream_results") or [] if isinstance(entry, dict)
@@ -395,65 +429,101 @@ class TGVPrimaryRegistration:
             )
             return True
         failures = self._failures[name] = self._failures.get(name, 0) + 1
+        self._problems[name] = problem
         delay = min(_RETRY_MAX_SECONDS, _RETRY_BASE_SECONDS * 2 ** (failures - 1))
         self._retry_at[name] = now + delay
         _events.warning(
             "TGV entity set %r not registered on %s (failure %d): %s; next attempt in %ds",
             frost._prefixed_name(name), base_url, failures, problem, int(delay),
         )
+        if failures == _PERSISTENT_FAILURES:
+            self._alert(
+                f"TGV entity set {frost._prefixed_name(name)!r} still not registered on {base_url} after "
+                f"{failures} attempts: {problem}. Every TGV Kafka batch with its readings stays uncommitted "
+                "until it is.",
+                level="critical",
+                dedup_key=f"{_ALERT_EVENT}.{name}",
+                context={"entity_set": name, "failures": failures, "problem": problem},
+            )
         return False
 
-    def _hold(self, base_url: str, count: int) -> None:
-        pending = sorted(_thing_name(entity_set) for entity_set in self._sets() if not self._is_registered(entity_set))
+    def _hold(self, base_url: str, count: int, waiting: Counter[str]) -> None:
+        """Log and alert that readings of unregistered sets hold the batch, then raise TGVRegistrationPending."""
+        sets = sorted(waiting)
+        details = [
+            f"{name} ({waiting[name]} readings; {self._problems.get(name, 'not attempted yet')})" for name in sets
+        ]
         _events.warning(
-            "TGV: no entity set registered on %s yet (pending: %s); %d readings left uncommitted for Kafka "
-            "to deliver again",
-            base_url, ", ".join(pending) or "none configured", count,
+            "TGV: entity set(s) not registered on %s yet: %s; all %d readings of the batch left uncommitted "
+            "for Kafka to deliver again",
+            base_url, "; ".join(details), count,
         )
         if not self._holding:
             self._holding = True
             self._alert(
-                f"TGV Kafka batches are held: no TGV entity set is registered on {base_url} yet "
-                f"({len(pending)} pending). Kafka keeps them until registration succeeds.",
+                f"TGV Kafka batches are held: entity set(s) {', '.join(sets)} not registered on {base_url} "
+                f"yet ({'; '.join(details)}). Kafka keeps the batches until registration succeeds.",
                 level="critical",
+                context={"pending": sets},
             )
         # Static text: the Kafka loop scans the message for auth errors.
         raise TGVRegistrationPending(
-            f"no TGV entity set registered on the primary FROST target yet ({len(pending)} pending); "
+            f"{len(sets)} TGV entity set(s) not registered on the primary FROST target yet; "
             f"{count} readings left uncommitted"
         )
 
     def _routable(self, base_url: str, readings: list[SensorReading], routes: dict[str, str]) -> list[SensorReading]:
+        """The readings with a registered datastream; the others (in no TGV set) are dropped, with an alert."""
         routable: list[SensorReading] = []
-        left_out: Counter[str] = Counter()
+        dropped: Counter[str] = Counter()
         for reading in readings:
             key = tgv_datastream_key(reading.sensor_id, reading.observed_property)
             if key in routes:
                 routable.append(reading)
             else:
-                left_out[key] += 1
-        if left_out:
-            new_keys = [key for key in sorted(left_out) if key not in self._reported]
+                dropped[key] += 1
+        if dropped:
+            new_keys = [key for key in sorted(dropped) if key not in self._reported]
             self._reported.update(new_keys)
-            owners = {key: _thing_name(s) for s in self._sets() for key in entity_set_datastream_keys(s)}
-            reasons = [
-                f"{key} (entity set {owners[key]!r} not registered yet)" if key in owners else f"{key} (in no TGV entity set)"
-                for key in sorted(left_out)[:10]
-            ]
+            keys = ", ".join(sorted(dropped)[:10])
             _events.log(
                 logging.WARNING if new_keys else logging.DEBUG,
-                "TGV: %d of %d readings not pushed to %s, no registered TGV datastream: %s",
-                sum(left_out.values()), len(readings), base_url, ", ".join(reasons),
+                "TGV: %d of %d readings dropped, no TGV entity set defines their stream on %s: %s",
+                sum(dropped.values()), len(readings), base_url, keys,
             )
+            if new_keys:
+                self._alert(
+                    f"TGV Kafka readings dropped: no TGV entity set (entity_configs/tgv_*.yaml) defines "
+                    f"{', '.join(new_keys[:10])}. Add a datastream for them or fix KAFKA_TGV_DEVICE_MAPPING_JSON.",
+                    level="warning",
+                    event=_UNROUTED_EVENT,
+                    context={"keys": new_keys},
+                )
         return routable
 
-    def _alert(self, message: str, *, level: str, force: bool = False) -> None:
+    def _alert(
+        self,
+        message: str,
+        *,
+        level: str,
+        event: str = _ALERT_EVENT,
+        dedup_key: str | None = None,
+        force: bool = False,
+        context: dict[str, Any] | None = None,
+    ) -> None:
         try:
             from app.services.alerting import send_alert
 
-            send_alert(_ALERT_EVENT, message, level=level, context={"target": self._base_url}, force=force)
+            send_alert(
+                event,
+                message,
+                level=level,
+                context={"target": self._base_url, **(context or {})},
+                dedup_key=dedup_key,
+                force=force,
+            )
         except Exception:
-            _events.debug("TGV: alert %s failed", _ALERT_EVENT, exc_info=True)
+            _events.debug("TGV: alert %s failed", event, exc_info=True)
 
 
 # Used by app/main.py's Kafka loop.

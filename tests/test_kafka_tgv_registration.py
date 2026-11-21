@@ -392,30 +392,34 @@ def test_registered_ids_are_pinned_over_any_other_mapping() -> None:
     assert {key: frost._datastream_ids[key] for key in routes} == routes
 
 
-def test_a_failed_set_is_retried_after_its_delay_and_its_readings_wait(caplog) -> None:
+def test_a_failed_set_is_retried_after_its_delay_and_its_readings_hold_the_batch(caplog) -> None:
     clock = _Clock()
     frost = _ScriptedFrost()
     frost.outcomes["Climate Davis"] = ["raise", "raise"]
     registration = TGVPrimaryRegistration(client=frost, clock=clock)  # type: ignore[arg-type]
-    davis = _keys_of("Climate Davis")
+    others = set().union(*(_keys_of(name) for name in THING_NAMES if name != "Climate Davis"))
 
     with caplog.at_level(logging.WARNING, logger="connector.events"):
-        first = registration.prepare_push(_readings(_record(0)))
-        second = registration.prepare_push(_readings(_record(1)))
+        for minutes in (0, 1):
+            with pytest.raises(TGVRegistrationPending) as held:
+                registration.prepare_push(_readings(_record(minutes)))
 
-    assert {_key(r) for r in first} == {_key(r) for r in second} == {_key(r) for r in _readings(_record())} - davis
+    assert "1 TGV entity set(s) not registered" in str(held.value)
+    assert set(registration.datastream_ids()) == others
     assert frost.registrations.count("Climate Davis") == 1  # no new attempt within 30 s
-    not_pushed = [r.getMessage() for r in caplog.records if "readings not pushed" in r.getMessage()]
-    assert len(not_pushed) == 1  # once per key, then at debug level
-    assert "entity set 'Climate Davis' not registered yet" in not_pushed[0]
+    holds = [r.getMessage() for r in caplog.records if "left uncommitted" in r.getMessage()]
+    assert len(holds) == 2  # every held batch
+    assert "Climate Davis (12 readings; ConnectionError: FROST down)" in holds[0]
     assert any("'GEO_Climate Davis' not registered" in r.getMessage() for r in caplog.records)
 
     clock.advance(30)
-    assert {_key(r) for r in registration.prepare_push(_readings(_record(2)))}.isdisjoint(davis)
+    with pytest.raises(TGVRegistrationPending):
+        registration.prepare_push(_readings(_record(2)))
     assert frost.registrations.count("Climate Davis") == 2  # failed again: next attempt after 60 s
 
     clock.advance(59)
-    registration.prepare_push(_readings(_record(3)))
+    with pytest.raises(TGVRegistrationPending):
+        registration.prepare_push(_readings(_record(3)))
     assert frost.registrations.count("Climate Davis") == 2
 
     clock.advance(1)
@@ -424,12 +428,48 @@ def test_a_failed_set_is_retried_after_its_delay_and_its_readings_wait(caplog) -
     assert frost.registrations.count("Hitteplein") == 1
 
 
+def test_a_batch_without_readings_of_the_failed_set_is_pushed() -> None:
+    frost = _ScriptedFrost()
+    frost.outcomes["Climate Davis"] = ["raise"]
+    registration = TGVPrimaryRegistration(client=frost, clock=_Clock())  # type: ignore[arg-type]
+    others = [r for r in _readings(_record()) if r.thing_name != "Climate Davis"]
+
+    assert registration.prepare_push(others) == others
+    assert len(others) == 5
+
+
+def test_a_set_that_keeps_failing_is_alerted_and_holds_every_batch(monkeypatch) -> None:
+    alerts: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        "app.services.alerting.send_alert",
+        lambda event, message, **kw: alerts.append((event, kw["level"], message)),
+    )
+    clock = _Clock()
+    frost = _ScriptedFrost()
+    frost.outcomes["Climate Davis"] = ["no-source"] * 10  # the Thing reads back without properties.source
+    registration = TGVPrimaryRegistration(client=frost, clock=clock)  # type: ignore[arg-type]
+
+    for minutes in range(20):
+        with pytest.raises(TGVRegistrationPending):
+            registration.prepare_push(_readings(_record(minutes)))
+        clock.advance(60)
+
+    assert frost.registrations.count("Climate Davis") >= 5
+    held = [a for a in alerts if a[0] == "kafka.tgv_registration" and "are held" in a[2]]
+    persistent = [a for a in alerts if a[0] == "kafka.tgv_registration" and "still not registered" in a[2]]
+    assert len(held) == 1 and held[0][1] == "critical"  # once per hold
+    assert "Climate Davis" in held[0][2] and "properties" in held[0][2]
+    assert len(persistent) == 1 and persistent[0][1] == "critical"  # at the 4th failed attempt
+    assert "'GEO_Climate Davis'" in persistent[0][2] and "after 4 attempts" in persistent[0][2]
+    assert not any(level == "info" for _event, level, _message in alerts)
+
+
 def test_the_retry_delay_doubles_up_to_five_minutes() -> None:
     clock = _Clock()
     frost = _ScriptedFrost()
     frost.outcomes["Hitteplein"] = ["raise"] * 8
     registration = TGVPrimaryRegistration(client=frost, clock=clock)  # type: ignore[arg-type]
-    registration.prepare_push(_readings(_record()))
+    registration.prepare_push([])
 
     delays = []
     for _ in range(7):
@@ -459,7 +499,7 @@ def test_a_batch_is_held_while_no_set_is_registered(monkeypatch) -> None:
         registration.prepare_push(readings)
     # Three failures in a row: the target is down, the fourth set waits for the next batch.
     assert frost.registrations == THING_NAMES[:3]
-    assert "4 pending" in str(held.value)
+    assert "4 TGV entity set(s) not registered" in str(held.value)
     assert frost._datastream_ids == {}
 
     with pytest.raises(TGVRegistrationPending):
@@ -530,11 +570,11 @@ def test_an_incomplete_registration_does_not_count(outcome: Any) -> None:
     frost.outcomes["Hitteplein"] = [outcome]
     registration = TGVPrimaryRegistration(client=frost)  # type: ignore[arg-type]
 
-    routable = registration.prepare_push(_readings(_record()))
+    with pytest.raises(TGVRegistrationPending):
+        registration.prepare_push(_readings(_record()))
 
-    assert not ({_key(r) for r in routable} & _keys_of("Hitteplein"))
     assert not (set(registration.datastream_ids()) & _keys_of("Hitteplein"))
-    assert len(routable) == 15
+    assert len(registration.datastream_ids()) == 17
 
 
 def test_registration_problem_reads_the_thing_back() -> None:
@@ -558,7 +598,12 @@ def test_without_a_frost_target_readings_pass_unchanged() -> None:
     assert frost.registrations == []
 
 
-def test_readings_no_tgv_entity_set_defines_are_left_out(caplog) -> None:
+def test_readings_no_tgv_entity_set_defines_are_dropped_with_an_alert(caplog, monkeypatch) -> None:
+    alerts: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        "app.services.alerting.send_alert",
+        lambda event, message, **kw: alerts.append((event, kw["level"], message)),
+    )
     frost = _ScriptedFrost()
     registration = TGVPrimaryRegistration(client=frost)  # type: ignore[arg-type]
     custom = {
@@ -568,13 +613,19 @@ def test_readings_no_tgv_entity_set_defines_are_left_out(caplog) -> None:
     }
 
     with caplog.at_level(logging.WARNING, logger="connector.events"):
-        routable = registration.prepare_push(_readings(_record(measurement_ids=_measurement_ids(custom)), mapping=custom))
+        batch = _readings(_record(measurement_ids=_measurement_ids(custom)), mapping=custom)
+        routable = registration.prepare_push(batch)
+        again = registration.prepare_push(batch)
 
-    assert [_key(r) for r in routable] == ["tgv-climate-davis-weather-station::air_temperature"]
-    message = next(r.getMessage() for r in caplog.records if "readings not pushed" in r.getMessage())
-    assert "2 of 3 readings" in message
-    assert "tgv-climate-davis-weather-station::soil_moisture (in no TGV entity set)" in message
-    assert "tgv-somewhere::temperature (in no TGV entity set)" in message
+    expected = ["tgv-climate-davis-weather-station::air_temperature"]
+    assert [_key(r) for r in routable] == [_key(r) for r in again] == expected
+    messages = [r.getMessage() for r in caplog.records if "readings dropped" in r.getMessage()]
+    assert len(messages) == 1  # warning for new keys, then debug
+    assert "2 of 3 readings dropped" in messages[0]
+    assert "tgv-climate-davis-weather-station::soil_moisture" in messages[0]
+    assert "tgv-somewhere::temperature" in messages[0]
+    assert [(event, level) for event, level, _ in alerts] == [("kafka.tgv_unrouted", "warning")]  # new keys only
+    assert "tgv-somewhere::temperature" in alerts[0][2]
 
 
 def test_a_new_primary_target_gets_the_entity_sets_registered_again() -> None:
@@ -859,21 +910,28 @@ def test_old_server_ids_never_receive_a_tgv_reading(world: _World, warm_up: bool
 
 
 @pytest.mark.parametrize("warm_up", [True, False], ids=["warm-up-listed", "warm-up-failed"])
-def test_readings_of_a_set_that_failed_to_register_go_nowhere(world: _World, warm_up: bool) -> None:
+def test_a_set_that_failed_to_register_holds_the_batch_until_it_registers(world: _World, warm_up: bool) -> None:
     client = world.start(env=STALE_ENV_MAPPING, warm_up=warm_up)
     world.frost.refuse.add("GEO_Climate Davis")
-    registration = TGVPrimaryRegistration(client=client)
+    clock = _Clock()
+    registration = TGVPrimaryRegistration(client=client, clock=clock)
     readings = _readings(_record())
 
+    with pytest.raises(TGVRegistrationPending):
+        world.push(client, registration, readings)
+
+    assert world.posts == []
+    assert len(registration.datastream_ids()) == 7  # the other three sets are registered
+    if not warm_up:
+        # The stale mappings are still there; nothing was pushed to reach them.
+        assert client._datastream_ids["tgv-climate-davis-weather-station::precipitation"] == "175"
+
+    world.frost.refuse.clear()
+    clock.advance(30)
     result = world.push(client, registration, readings)
 
-    davis = [r for r in readings if r.thing_name == "Climate Davis"]
-    others = [r for r in readings if r.thing_name != "Climate Davis"]
-    assert len(davis) == 12 and result["total_sent"] == 5
-    _assert_tgv_routing(world, registration, others)
-    if not warm_up:
-        # The stale mappings are still there; the readings never reach them.
-        assert client._datastream_ids["tgv-climate-davis-weather-station::precipitation"] == "175"
+    assert result["total_sent"] == 17
+    _assert_tgv_routing(world, registration, readings)
 
 
 def test_while_frost_is_down_nothing_is_pushed_and_the_batch_is_held(world: _World) -> None:
@@ -981,13 +1039,12 @@ def test_a_kafka_cycle_hands_the_registered_readings_to_the_frost_worker(kafka_c
     worker = SimpleNamespace(enqueue=lambda readings, _timeout: queued.append(readings) or True)
     monkeypatch.setattr("app.services.frost_worker.frost_worker", worker)
     monkeypatch.setattr(main, "settings", dataclasses.replace(main.settings, frost_async_push_enabled=True))
-    kafka_cycle.frost.outcomes["Hitteplein"] = ["raise"]
     kafka = _FakeKafka([_record(0)])
 
     summary = main._consume_and_push_once(kafka.Consumer())
 
     assert summary["pushed"] == "queued"
-    assert len(queued) == 1 and len(queued[0]) == 15  # Hitteplein's two streams wait for its registration
+    assert len(queued) == 1 and len(queued[0]) == 17
     assert kafka.events == [("commit", 1)]
 
 
@@ -1000,6 +1057,38 @@ def test_a_held_kafka_cycle_pushes_and_commits_nothing(kafka_cycle) -> None:
 
     assert kafka_cycle.pushes == []
     assert kafka.events == []
+
+
+@pytest.mark.parametrize("async_push", [False, True], ids=["inline", "frost-worker"])
+def test_a_kafka_cycle_commits_nothing_while_one_set_is_pending(kafka_cycle, monkeypatch, async_push: bool) -> None:
+    """Three sets registered, Climate Davis failing: no push, no commit; once it registers, all of it and a commit."""
+    queued: list[list[str]] = []
+
+    def enqueue(readings: list[SensorReading], _timeout: float) -> bool:
+        queued.append(sorted(_key(r) for r in readings))
+        return True
+
+    monkeypatch.setattr("app.services.frost_worker.frost_worker", SimpleNamespace(enqueue=enqueue))
+    monkeypatch.setattr(main, "settings", dataclasses.replace(main.settings, frost_async_push_enabled=async_push))
+    kafka_cycle.frost.outcomes["Climate Davis"] = ["raise", "no-source"]
+    kafka = _FakeKafka([_record(0), _record(1)])
+
+    for _attempt in range(2):
+        with pytest.raises(TGVRegistrationPending):
+            main._consume_and_push_once(kafka.Consumer())  # a new consumer per cycle, as the loop rebuilds it
+        kafka_cycle.clock.advance(60)
+
+    assert kafka.events == [] and kafka_cycle.pushes == [] and queued == []
+    assert len(kafka_cycle.registration.datastream_ids()) == 7
+
+    summary = main._consume_and_push_once(kafka.Consumer())
+
+    handed = queued if async_push else kafka_cycle.pushes
+    assert len(handed) == 1 and len(handed[0]) == 34
+    assert set(handed[0]) >= _keys_of("Climate Davis")
+    assert summary["mapped"] == 34
+    assert kafka.events == [("commit", 2)]
+    assert kafka_cycle.frost.registrations.count("Climate Davis") == 3
 
 
 class _Stop(BaseException):
@@ -1039,3 +1128,58 @@ def test_the_kafka_loop_redelivers_a_held_batch_once_frost_is_back(kafka_cycle, 
     assert [len(push) for push in kafka_cycle.pushes] == [51]
     assert sleeps[0] == 30  # the loop's backoff after a failed cycle
     assert sorted(kafka_cycle.frost.registrations) == sorted([*THING_NAMES[:3], *THING_NAMES])
+
+
+# ---------------------------------------------------------------------------
+# POST /connector/kafka-push: the manual cycle goes through the same registration
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def kafka_push_route(monkeypatch: pytest.MonkeyPatch):
+    """POST /connector/kafka-push with a fake consumer, the scripted client registering, and pushes recorded."""
+    from fastapi.testclient import TestClient
+
+    import app.routes.connector as connector_routes
+
+    frost = _ScriptedFrost()
+    clock = _Clock()
+    registration = TGVPrimaryRegistration(client=frost, clock=clock)  # type: ignore[arg-type]
+    kafka = _FakeKafka([_record(0)])
+    pushes: list[list[str]] = []
+
+    def push(readings: list[SensorReading], **_kwargs: Any) -> dict[str, Any]:
+        assert set(registration.datastream_ids()) >= {_key(r) for r in readings}  # registered first
+        pushes.append(sorted(_key(r) for r in readings))
+        return {"results": [{"ok": True} for _ in readings]}
+
+    monkeypatch.setattr(kafka_tgv, "tgv_primary", registration)
+    monkeypatch.setattr(connector_routes, "settings", dataclasses.replace(connector_routes.settings, kafka_tgv_enabled=True))
+    monkeypatch.setattr(connector_routes, "KafkaTGVConsumer", kafka.Consumer)
+    monkeypatch.setattr(connector_routes.client, "push_observations", push)
+    monkeypatch.setattr("app.services.alerting.send_alert", lambda *_a, **_kw: False)
+    return SimpleNamespace(http=TestClient(main.app), frost=frost, clock=clock, kafka=kafka, pushes=pushes)
+
+
+def test_kafka_push_route_answers_503_while_registration_is_pending(kafka_push_route) -> None:
+    kafka_push_route.frost.outcomes["Climate Davis"] = ["raise"]
+
+    response = kafka_push_route.http.post("/connector/kafka-push")
+
+    assert response.status_code == 503
+    assert "TGV registration pending" in response.json()["detail"]
+    assert kafka_push_route.pushes == []
+    assert ("commit", 1) not in kafka_push_route.kafka.events
+
+
+def test_kafka_push_route_pushes_only_into_registered_tgv_datastreams(kafka_push_route) -> None:
+    kafka_push_route.frost._datastream_ids.update(STALE_ENV_MAPPING)  # ids kept from the old server
+
+    response = kafka_push_route.http.post("/connector/kafka-push")
+
+    assert response.status_code == 200
+    assert response.json()["mapped"] == 17 and response.json()["pushed"] == 17
+    assert sorted(kafka_push_route.frost.registrations) == THING_NAMES
+    assert len(kafka_push_route.pushes) == 1 and len(kafka_push_route.pushes[0]) == 17
+    routes = kafka_tgv.tgv_primary.datastream_ids()
+    assert {key: kafka_push_route.frost._datastream_ids[key] for key in routes} == routes  # stale ids overridden
