@@ -90,6 +90,12 @@ also has a '... - Ground surface temperature' one. Deleting a Datastream in FROS
 deletes its observations, so each is checked empty ($count) right before its
 DELETE, and a datastream with observations is never deleted.
 
+The credentials need FROST's 'delete' role. The connector's own user usually
+has read/create/update only (FROST's default 'write' user does): FROST then
+answers 401/403 to the first DELETE, and the run stops there, deleting
+nothing, with a message to run it with admin credentials. The dry run makes no
+DELETE, so it cannot tell.
+
 Retirement is the point of no return for rolling back the moves out of those
 datastreams: a row can only go back to a datastream that exists. With --ids-file
 (the record of --apply) an empty stale datastream that the file names as the
@@ -1283,6 +1289,12 @@ def retire(http: Any, things_path: str, datastreams_path: str, prefix: str, fiel
         if response.ok:
             print(f"  {s.id:>8} {s.name!r}: deleted{note}")
             deleted += 1
+        elif response.status_code in (401, 403):
+            print(f"  {s.id:>8} {s.name!r}: DELETE refused with HTTP {response.status_code}: these credentials may "
+                  "not delete (FROST's 'delete' role; the connector's 'write' user usually lacks it). Stopping; run "
+                  "it again with admin credentials (SENSORTHINGS_AUTH_USERNAME / SENSORTHINGS_AUTH_PASSWORD).")
+            failed += 1
+            break
         else:
             print(f"  {s.id:>8} {s.name!r}: DELETE failed with HTTP {response.status_code}")
             failed += 1
