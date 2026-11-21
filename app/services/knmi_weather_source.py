@@ -5,6 +5,10 @@ API key from https://developer.dataplatform.knmi.nl — set ``KNMI_API_KEY``.
 
 Also supports the legacy Buienradar JSON feed for backward compatibility
 (auto-detected from the URL).
+
+Stations are keyed by their WIGOS id from the EDR response (see
+``app/sources/knmi_weather.py``), so a station's sensor id does not depend on
+which other stations report in a cycle.
 """
 
 from __future__ import annotations
@@ -18,8 +22,11 @@ from app.models import SensorReading
 from app.services.api_client import AsyncAPIClient
 from app.services.rest_polling_source import RestPollingSource
 from app.sources.knmi_weather import (
+    KNMILocation,
     build_entity_set,
+    coverages_without_station_id,
     parse_edr_locations,
+    parse_locations,
     parse_station_measurements,
 )
 
@@ -38,8 +45,11 @@ class KNMIWeatherPollingSource(RestPollingSource):
         if settings.knmi_api_key:
             headers["Authorization"] = settings.knmi_api_key
         self._client = AsyncAPIClient(headers=headers)
+        # Station id (WIGOS id; Buienradar station number on the legacy feed) -> metadata.
         self._discovered_stations: dict[str, dict[str, Any]] = {}
-        self._station_names: dict[str, str] = {}
+        # Stations from /locations. Loaded only when an /area response has a
+        # Coverage without its station id, to identify it by its coordinates.
+        self._known_locations: list[KNMILocation] = []
         self._is_buienradar = "buienradar" in settings.knmi_weather_api_url.lower()
 
     def is_enabled(self) -> bool:
@@ -139,7 +149,7 @@ class KNMIWeatherPollingSource(RestPollingSource):
         if settings.knmi_api_key:
             headers["Authorization"] = settings.knmi_api_key
 
-        def _do_request() -> dict:
+        def _do_request() -> Any:
             s = req.Session()
             prepared = req.Request("GET", raw_url, headers=headers).prepare()
             # Override the encoded URL with the raw one
@@ -148,17 +158,18 @@ class KNMIWeatherPollingSource(RestPollingSource):
             resp.raise_for_status()
             return resp.json()
 
-        data = await asyncio.get_event_loop().run_in_executor(None, _do_request)
+        data = await asyncio.get_running_loop().run_in_executor(None, _do_request)
 
         if not isinstance(data, dict):
             logger.warning("KNMI EDR response is not a dict (got %s)", type(data).__name__)
             return []
 
-        # Build station name map from /locations (cached after first call)
-        if not self._station_names:
-            await self._load_station_names()
+        # Every Coverage names its station (eumetnet:locationId). Only for one
+        # that does not is /locations needed, to identify it by its coordinates.
+        if not self._known_locations and coverages_without_station_id(data):
+            await self._load_known_locations()
 
-        stations, readings = parse_edr_locations(data, station_names=self._station_names)
+        stations, readings = parse_edr_locations(data, known_locations=self._known_locations)
 
         for st in stations:
             sid = st["id"]
@@ -171,18 +182,15 @@ class KNMIWeatherPollingSource(RestPollingSource):
 
         return readings
 
-    async def _load_station_names(self) -> None:
-        """Fetch station metadata from /locations for name mapping."""
+    async def _load_known_locations(self) -> None:
+        """Fetch the station list from /locations (WIGOS id and coordinates per station)."""
         base_url = settings.knmi_weather_api_url.rstrip("/")
         if base_url.endswith("/locations"):
             base_url = base_url[: -len("/locations")]
         try:
             data = await self._client.get(f"{base_url}/locations")
-            if isinstance(data, dict):
-                for feature in data.get("features", []):
-                    fid = feature.get("id", "")
-                    name = feature.get("properties", {}).get("name", str(fid))
-                    self._station_names[str(fid)] = str(name)
-                logger.info("KNMI: loaded %d station names", len(self._station_names))
         except Exception:
-            logger.warning("KNMI: could not load station names, using coordinates")
+            logger.warning("KNMI: could not load /locations; coverages without a station id are skipped")
+            return
+        self._known_locations = parse_locations(data)
+        logger.info("KNMI: loaded %d stations from /locations", len(self._known_locations))
