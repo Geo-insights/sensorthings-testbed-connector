@@ -110,10 +110,11 @@ Safety (the same pattern as scripts/fix_sc_pressure_units.py)
 
 Disk: a moved row gets a new row version in OBSERVATIONS and new entries in
 every index on it (DATASTREAM_ID changes, so no HOT update). Measured on FROST
-2.8 / PostgreSQL 16: 0.64 to 1.4 KB of WAL per moved row (the high end right
-after checkpoints, when the first change to a page writes the whole page), so
-1.5 to 3 GB of WAL for the ~2.3 million rows to move on production (dry run,
-2026-11-20), plus the dead row versions in the table and its indexes until
+2.8 / PostgreSQL 16: 0.64 to 1.4 KB of WAL per moved row in short runs, and
+2.9 KB per row in a long run (the 2026-11-21 rehearsal: 168,637 rows, 487 MB),
+where max_wal_size forces checkpoints during the run and the first change to
+each page after one writes the whole page again. So plan on 3 to 7 GB of WAL
+for the ~2.3 million rows to move on production (dry run, 2026-11-20), plus the dead row versions in the table and its indexes until
 (auto)vacuum reclaims them. Check free disk space on the FROST host before
 --apply, as for the pressure backfill, and move in parts (--datastream) if it
 is tight.
@@ -129,6 +130,13 @@ pressure' datastreams and skips rows labelled as another property:
 4. Run (or re-run) the pressure backfill with its same IDs file: it converts
    them; rows it converted earlier are below its Pa band and untouched. Running
    the backfill before this script too is harmless.
+4b. Then this --apply again (same IDs file), and the backfill --apply again
+   (same file). Step 3 leaves a Pa row in place when its target already holds
+   the same Pa reading; step 4 converts that copy to hPa, so the row is then
+   another reading than its copy and the cleanup script's --misrouted-leftovers
+   would leave it, misrouted and in Pa (the rehearsal: 342 of 168,637). The
+   re-run moves it; the backfill converts it; the two are then exact duplicates
+   for the cleanup script's --duplicates.
 5. After the connector's dead-letter queue has drained or expired: a pre-fix
    payload replayed into a misrouted datastream carries the datastream id it
    was resolved to, and a move re-run puts it in an 'Air pressure' datastream,
