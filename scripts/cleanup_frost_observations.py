@@ -212,7 +212,10 @@ def _app_name_of(session: str, default: str) -> str:
 
 
 # Write sessions of the repair scripts that change OBSERVATIONS through psql.
-WRITERS = (APP_NAME, pressure.WRITE_APP_NAME, _app_name_of(move.WRITE_SESSION, "fix_sc_misrouted_observations"))
+# fix_knmi_observations (fix/knmi-station-ids) names its write sessions by this
+# application_name; it already refuses while this script writes.
+KNMI_APP_NAME = "fix_knmi_observations"
+WRITERS = (APP_NAME, pressure.WRITE_APP_NAME, _app_name_of(move.WRITE_SESSION, "fix_sc_misrouted_observations"), KNMI_APP_NAME)
 
 # What two rows of one datastream and phenomenonTime must share to hold the same reading.
 READING_COLUMNS = ("PHENOMENON_TIME_END", "RESULT_TYPE", "RESULT_NUMBER", "RESULT_STRING", "RESULT_BOOLEAN", "RESULT_JSON")

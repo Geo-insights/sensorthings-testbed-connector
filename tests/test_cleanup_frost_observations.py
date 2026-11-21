@@ -201,7 +201,7 @@ def test_refuses_to_write_next_to_another_repair_script(tmp_path: Path, capsys: 
 
     assert not any("DELETE FROM" in sql for sql in db.sessions)
     assert "pid 4242: fix_sc_pressure_units" in capsys.readouterr().out
-    assert {"cleanup_frost_observations", "fix_sc_pressure_units", "fix_sc_misrouted_observations"} == set(cleanup.WRITERS)
+    assert {"cleanup_frost_observations", "fix_sc_pressure_units", "fix_sc_misrouted_observations", "fix_knmi_observations"} == set(cleanup.WRITERS)
 
 
 def test_refuses_to_delete_when_a_foreign_key_references_observations(tmp_path: Path) -> None:
