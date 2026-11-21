@@ -588,11 +588,16 @@ def test_deploy_then_migrate(env, capsys):
     refused = {key for key, _ds, _prop in new_image.client._rejected_routes_logged}
     assert refused == {f"{st.sensor_id}::{p}" for st in STATIONS for p in PROPERTIES}
     # Delivered by live lookups on Thing name and streamKey. S1 has two Datastreams with
-    # streamKey ground_temperature, and FROST's first match is the stale one (lower id);
-    # on production every KNMI Thing has such a pair.
-    assert _misplaced(env, new) == [
-        f"{S1.sensor_id} ground_temperature: in ['{_thing_name(env, S1)} sensor - Ground temperature']"
-    ]
+    # streamKey ground_temperature (on production every KNMI Thing has such a pair), and the
+    # lookup takes FROST's first match of a $top=1 query without $orderby. PostgreSQL returns
+    # those in physical row order, not by id: on a fresh database that is the stale one (lower
+    # id), but once earlier tests in this module have updated rows (their migrations PATCH
+    # Datastreams), the registered one can come first. Neither branch's code decides it; the
+    # integration release (fix/seeding-followups + fix/routing-followups) misplaces it too when
+    # this test runs alone on a fresh FROST. So S1's ground temperature is in one of its two
+    # ground temperature Datastreams, and every other reading is where it belongs.
+    stale = f"{_thing_name(env, S1)} sensor - Ground temperature"
+    assert _misplaced(env, new) in ([], [f"{S1.sensor_id} ground_temperature: in ['{stale}']"])
     assert _counts(env) == entities
 
     # Migrating now does not help the running process: its routes hold the old ids until a restart.
