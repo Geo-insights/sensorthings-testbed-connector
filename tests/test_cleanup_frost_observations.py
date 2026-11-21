@@ -104,6 +104,8 @@ class FakeDb:
                            last="2026-11-12T14:17:27.788+00:00", bytes=600) for ds in sorted(set(left.values()))]
             lines.append(_json(t="tgv", w=1, ds=TGV_DS, sid="tgv-officelab-climate", prop="humidity", foi=8,
                                **{"class": "protected"}, n=3, min_id=900, max_id=902, first="", last="", bytes=600))
+            lines.append(_json(t="tgv", w=1, ds=KNMI_DS, sid="tgv-levellog-abcd1234", prop="water_level", foi=9,
+                               **{"class": "other"}, n=2, min_id=910, max_id=911, first="", last="", bytes=400))
             return [*lines, _json(t="pages", w=1, pages=len(left))]
         if "'t', 'foi'" in sql:
             return [_json(t="foi", foi=7, n=len(self.rows), total=len(self.rows) + 5, generated=True)]
@@ -157,6 +159,7 @@ def test_dry_run_only_opens_read_only_sessions(tmp_path: Path, capsys: pytest.Ca
     out = capsys.readouterr().out
     assert "to delete: 5 in 2 datastreams" in out
     assert "left alone, in datastreams of TGV Things: 3" in out
+    assert "left alone, not a TGV Kafka label (a Levellog sensor, or location not 'tgv'): 2" in out
     assert "Dry run: nothing was written." in out
 
 
@@ -179,7 +182,7 @@ def test_apply_archives_every_page_before_deleting_it(tmp_path: Path, capsys: py
         assert "pg_try_advisory_lock" in sql
         assert 'md5(row_to_json(o)::text) = v.h' in sql  # only rows still exactly as archived
         assert cleanup.protected_ds('o."DATASTREAM_ID"') in sql  # never in a TGV datastream
-        assert "LIKE 'tgv-%'" in sql and 'od."PROPERTIES"->>\'sensor_id\'' in sql  # still selected
+        assert cleanup.tgv_label("o") in sql and 'od."PROPERTIES"->>\'sensor_id\'' in sql  # still selected
     lines = archive.read_text(encoding="utf-8").splitlines()
     assert json.loads(lines[0]) == {"archive": "cleanup_frost_observations", "version": 1}
     assert json.loads(lines[1])["selection"] == "tgv-misplaced"
@@ -414,10 +417,39 @@ def test_same_reading_compares_every_result_column_and_the_label_null_safe() -> 
                    "RESULT_JSON"):
         assert f'k."{column}" IS NOT DISTINCT FROM o."{column}"' in sql
         assert f'x."{column}"' in cleanup.reading_key("x")
-    for key in ("sensor_id", "observed_property"):
+    # sensor_name: co-located Sensor.Community sensors share a sensor_id (and a datastream); a missing
+    # sensor_name on both sides is equal (IS NOT DISTINCT FROM), one on one side only is not.
+    for key in ("sensor_id", "observed_property", "sensor_name"):
         assert f"""(k."PARAMETERS"->>'{key}') IS NOT DISTINCT FROM (o."PARAMETERS"->>'{key}')""" in sql
         assert f"""(x."PARAMETERS"->>'{key}')""" in cleanup.reading_key("x")
     assert " = " not in sql  # NULL-safe throughout
+    assert cleanup.same_reading("k", "o") in cleanup.dup_recheck()
+    assert cleanup.same_reading("x", "o") in cleanup._twin_in("v.target")
+
+
+def test_same_reading_by_station_takes_a_knmi_rows_thing_name() -> None:
+    sql = cleanup.same_reading("x", "o", by_station=True)
+    assert f"{cleanup.station('x')} IS NOT DISTINCT FROM {cleanup.station('o')}" in sql
+    assert """(x."PARAMETERS"->>'sensor_id') IS NOT DISTINCT FROM""" not in sql
+    for key in ("observed_property", "sensor_name"):
+        assert f"""(x."PARAMETERS"->>'{key}') IS NOT DISTINCT FROM (o."PARAMETERS"->>'{key}')""" in sql
+    assert cleanup.station("o") == (
+        """(CASE WHEN (o."PARAMETERS"->>'sensor_id') LIKE 'knmi-%' """
+        """THEN coalesce('knmi:' || (o."PARAMETERS"->>'thing_name'), (o."PARAMETERS"->>'sensor_id')) """
+        """ELSE (o."PARAMETERS"->>'sensor_id') END)"""
+    )
+
+
+def test_tgv_label_needs_location_tgv_and_excludes_levellog() -> None:
+    sql = cleanup.tgv_label("o")
+    assert """(o."PARAMETERS"->>'sensor_id') LIKE 'tgv-%'""" in sql
+    assert """(o."PARAMETERS"->>'sensor_id') NOT LIKE 'tgv-levellog-%'""" in sql
+    assert """coalesce((o."PARAMETERS"->>'location') = 'tgv', false)""" in sql
+    assert sql in cleanup.tgv_read_sql('o."ID" <= 10', 0, 100)
+    assert cleanup.TgvSelection.recheck(None).startswith(sql)  # type: ignore[arg-type]
+    scan = cleanup.tgv_scan_sql('o."ID" <= 10', 1)
+    assert f"WHEN NOT {sql} THEN 'other'" in scan  # every 'tgv-' label is scanned and counted, not only TGV ones
+    assert scan.index("THEN 'protected'") < scan.index("THEN 'other'")
 
 
 def test_tgv_things_are_protected_by_either_contract_property() -> None:
@@ -484,8 +516,62 @@ def test_read_ids_file_plain_and_csv(tmp_path: Path) -> None:
             cleanup.read_ids_file(bad)
 
 
+def _ids_db(classes: dict[str, int]) -> Any:
+    """A fake psql for an --ids-file dry run: the catalogue, and the scan's counts per class."""
+    sessions: list[str] = []
+
+    def run_sql(sql: str) -> list[str]:
+        sessions.append(sql)
+        if "'t', 'bounds'" in sql:
+            return [_json(t="ds", id=KNMI_DS, name="GEO_KNMI 06344 sensor - relative_humidity", thing="GEO_KNMI 06344",
+                          source="knmi_weather", sensor_id="knmi-06344", protected=False),
+                    _json(t="bounds", min=1, max=1000), *(_json(t="col", name=c) for c in COLUMNS)]
+        if "'t', 'ids'" in sql:
+            return [_json(t="ids", ds=KNMI_DS, foi=7, n=n, bytes=600 * n, pages=1, **{"class": c})
+                    for c, n in classes.items()]
+        if "'t', 'foi'" in sql:
+            return [_json(t="foi", foi=7, n=classes.get("delete", 0), total=100, generated=True)]
+        return []
+
+    run_sql.sessions = sessions  # type: ignore[attr-defined]
+    return run_sql
+
+
+def test_require_twin_rechecks_each_listed_row(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    ids_file = tmp_path / "knmi_twins.csv"
+    ids_file.write_text("observation_id,datastream_id\n101,20\n102,20\n103,20\n", encoding="utf-8")
+
+    plain = cleanup.IdsSelection(None, _args("--ids-file", str(ids_file)))  # type: ignore[arg-type]
+    assert plain.recheck() == "true" and plain.twin is None
+    assert "'no-twin'" not in cleanup.ids_read_sql(plain.batches[0], set())
+
+    args = _args("--ids-file", str(ids_file), "--require-twin", "--prefix", "GEO_")
+    sel = cleanup.IdsSelection(None, args)  # type: ignore[arg-type]
+    twin = cleanup.twin_sql("o", "GEO_")
+    assert sel.recheck() == twin  # each DELETE checks again that the copy is still there
+    for sql in (cleanup.ids_scan_sql(sel.batches[0], set(), twin), cleanup.ids_read_sql(sel.batches[0], set(), twin)):
+        assert f"WHEN NOT {twin} THEN 'no-twin'" in sql
+    delete = cleanup.delete_sql(20, [cleanup.Candidate(20, 101, "0" * 32, None, "{}", 7)], sel.recheck())
+    assert twin in delete
+    # the definition of --duplicates, a KNMI row's station by thing_name; own datastream (a lower ID: one copy of
+    # rows listed together stays) or another datastream of its Thing or of the Thing its thing_name label names
+    assert cleanup.same_reading("x", "o", by_station=True) in twin
+    assert 'x."PHENOMENON_TIME_START" = o."PHENOMENON_TIME_START"' in twin
+    assert '(x."DATASTREAM_ID" <> o."DATASTREAM_ID" OR x."ID" < o."ID")' in twin
+    assert 'WHERE sd."ID" = o."DATASTREAM_ID"' in twin
+    assert """tt."NAME" = 'GEO_' || (o."PARAMETERS"->>'thing_name')""" in twin
+
+    db = _ids_db({"delete": 2, "no-twin": 1})
+    assert cleanup.run_cleanup(args, db) == 0
+    out = capsys.readouterr().out
+    assert "to delete: 2" in out
+    assert "left alone, no other row holds the same reading (--require-twin): 1" in out
+    assert any(twin in sql for sql in db.sessions)
+
+
 def test_command_line_rules(tmp_path: Path) -> None:
     for argv in (["--tgv-misplaced", "--apply"],  # no archive
+                 ["--duplicates", "--require-twin"],  # only with --ids-file
                  ["--restore"],
                  ["--restore", "--archive", str(tmp_path / "missing.jsonl")],
                  ["--tgv-misplaced", "--duplicates"],
