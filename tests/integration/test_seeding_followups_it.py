@@ -347,10 +347,13 @@ def test_a_restart_posts_nothing_again_for_samen_meten_and_ohnics(connector: _Co
         assert _stored(root, prefix, f"ohnics-de-{k}") == {
             "pm25": [("10:00", f"ohnics-de-{k}")], "air_temperature": [("10:00", f"ohnics-de-{k}")]
         }
-    # The restart's seeds paged through the 1,100 fillers and marked the readings' own keys.
+    # The restart's seeds paged through the 1,100 fillers and marked the readings' own keys (sm-<id>).
+    # The rows are the Datastreams' own Things', so their keys (sm-<name>) are marked too: 4 + 4
+    # marks. No Samen Meten reading has a sm-<name> key, so those are never read (nothing posted).
     restart_samen_meten = connector.seed_lines[-2]
-    assert restart_samen_meten.startswith("Seeded 4 timestamps from FROST for samen_meten (1104 datastreams in 3 page(s); ")
+    assert restart_samen_meten.startswith("Seeded 8 timestamps from FROST for samen_meten (1104 datastreams in 3 page(s); ")
     assert "labelled with the datastream's key: 0, with another key: 4, unlabelled: 0, none: 1100;" in restart_samen_meten
+    assert "the datastream's Thing and property under an older sensor id: 4;" in restart_samen_meten
     assert connector.seed_lines[-1].startswith("Seeded 6 timestamps from FROST for ohnics (6 datastreams in 1 page(s); "
                                                "newest Observation labelled with the datastream's key: 6, ")
 
@@ -378,6 +381,7 @@ def test_a_foreign_newest_row_drops_no_reading(connector: _Connector) -> None:
         ("10:50", "ohnics-de-1"), ("10:55", "ohnics-de-1"), ("10:57", "tgv-weatherstation-1"),
     ]
     assert "with another key: 1," in connector.seed_lines[-1]
+    assert "the datastream's Thing and property under an older sensor id: 0;" in connector.seed_lines[-1]
 
 
 def _station(prefix: str, number: str, *, refused: bool = False) -> dict[str, Any]:
