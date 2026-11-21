@@ -423,7 +423,7 @@ def test_same_reading_compares_every_result_column_and_the_label_null_safe() -> 
         assert f"""(k."PARAMETERS"->>'{key}') IS NOT DISTINCT FROM (o."PARAMETERS"->>'{key}')""" in sql
         assert f"""(x."PARAMETERS"->>'{key}')""" in cleanup.reading_key("x")
     assert " = " not in sql  # NULL-safe throughout
-    assert cleanup.same_reading("k", "o") in cleanup.dup_recheck()
+    assert cleanup.same_reading("k", "o", by_station=True) in cleanup.dup_recheck()
     assert cleanup.same_reading("x", "o") in cleanup._twin_in("v.target")
 
 
@@ -460,11 +460,14 @@ def test_tgv_things_are_protected_by_either_contract_property() -> None:
 
 def test_duplicate_deletes_need_a_lower_twin_and_no_other_reading_at_that_time() -> None:
     recheck = cleanup.dup_recheck()
-    assert 'k."ID" < o."ID"' in recheck and cleanup.same_reading("k", "o") in recheck
-    assert "NOT EXISTS" in recheck and f"NOT ({cleanup.same_reading('k', 'o')})" in recheck
+    same = cleanup.same_reading("k", "o", by_station=True)  # KNMI rows: their station, not their sensor_id
+    assert 'k."ID" < o."ID"' in recheck and same in recheck
+    assert "NOT EXISTS" in recheck and f"NOT ({same})" in recheck
     read = cleanup.dup_read_sql(1, 50, 0, 1000)
     assert '"DATASTREAM_ID" BETWEEN 1 AND 50' in read and "HAVING count(*) > 1" in read
     assert cleanup.DELETABLE_DUP in read and "row_number() OVER" in read
+    assert cleanup.reading_key("x", by_station=True) in read and cleanup.station("x") in read
+    assert cleanup.reading_key("x", by_station=True) in cleanup.dup_scan_sql(1, 50)
 
 
 def test_leftovers_need_the_same_reading_in_their_target() -> None:
