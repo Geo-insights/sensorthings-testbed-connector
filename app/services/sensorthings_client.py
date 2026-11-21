@@ -681,13 +681,16 @@ class SensorThingsClient:
     def _extract_first_iot_id(self, body: Any) -> str | None:
         return FrostHTTPClient.extract_first_iot_id(body)
 
-    def _fetch_datastream_id_by_filter(self, datastreams_endpoint: str, odata_filter: str, base_url: str | None = None) -> str | None:
+    def _fetch_datastream_id_by_filter(
+        self, datastreams_endpoint: str, odata_filter: str, base_url: str | None = None, preferred_name: str = "",
+    ) -> str | None:
+        """The matching Datastream, picked deterministically (EntityManager.find_datastream_by_filter)."""
         em = self._entity_manager
         if base_url:
             stack = self._target_stack_for_url(base_url)
             if stack:
                 em = stack.entity_manager
-        return em.find_by_filter(datastreams_endpoint, odata_filter)
+        return em.find_datastream_by_filter(datastreams_endpoint, odata_filter, preferred_name)
 
     def _resolve_datastream_id_live(self, base_url: str, reading: SensorReading) -> str | None:
         datastreams_endpoint = self._endpoint_for_base_url(base_url, settings.datastreams_path)
@@ -695,6 +698,9 @@ class SensorThingsClient:
         observed_property_name = (reading.observed_property_name or self._observed_property_names.get(reading.observed_property, "")).strip()
         thing_name = self._prefixed_name(reading.thing_name)
         device_eui = (reading.device_eui or "").strip()
+        # When several Datastreams match, the one of the canonical display name wins, else the newest.
+        canonical = resolve(reading.observed_property)
+        preferred_name = canonical.meta.display_name if canonical is not None else observed_property_name
 
         cache_keys = [
             f"{base_url}::deviceEui::{device_eui}::streamKey::{stream_key}" if device_eui and stream_key else "",
@@ -757,7 +763,7 @@ class SensorThingsClient:
             )
 
         for cache_key, query_filter in candidates:
-            datastream_id = self._fetch_datastream_id_by_filter(datastreams_endpoint, query_filter, base_url)
+            datastream_id = self._fetch_datastream_id_by_filter(datastreams_endpoint, query_filter, base_url, preferred_name)
             if not datastream_id:
                 continue
             if cache_key:

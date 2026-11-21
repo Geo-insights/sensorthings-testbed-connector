@@ -31,6 +31,10 @@ from typing import Any
 import pytest
 import requests
 
+from app.frost.cache import EntityCache
+from app.frost.entity_manager import EntityManager
+from app.frost.http_client import FrostHTTPClient
+from app.frost.odata_fields import odata_fields_for
 from app.models import SensorReading
 from app.services import monitoring_mqtt_bridge as bridge
 from app.services import sensorthings_client as stc
@@ -825,3 +829,112 @@ def test_resolved_readings_carry_no_unresolved_flag(client_for, monkeypatch, no_
 
     assert "unresolved" not in result["results"][0]
 
+
+# ---------------------------------------------------------------------------
+# The live lookup picks the same Datastream every time
+# ---------------------------------------------------------------------------
+
+KNMI_THING = "GEO_KNMI KNMI-52.36-3.34"
+
+
+def _knmi_ds(ds_id: int, suffix: str, op_name: str | None, id_key: str = "@iot.id") -> dict[str, Any]:
+    row: dict[str, Any] = {id_key: ds_id, "name": f"{KNMI_THING} sensor - {suffix}"}
+    if op_name is not None:
+        row["ObservedProperty"] = {"name": op_name}
+    return row
+
+
+class _LookupHttp:
+    """FrostHTTPClient.get for a Datastreams query: answers ``rows`` in the given (physical) order."""
+
+    def __init__(self, rows: list[dict[str, Any]], status_code: int = 200) -> None:
+        self.rows = rows
+        self.status_code = status_code
+        self.params: list[dict[str, str]] = []
+
+    def get(self, url: str, params: dict[str, str] | None = None) -> _Response:
+        self.params.append(dict(params or {}))
+        return _Response({"value": list(self.rows)}, self.status_code)
+
+    extract_iot_id_from_body = staticmethod(FrostHTTPClient.extract_iot_id_from_body)
+
+
+def _manager(http: _LookupHttp, version: str, tmp_path: Path) -> EntityManager:
+    return EntityManager(http, EntityCache(tmp_path / "c.json"), fields=odata_fields_for(version))  # type: ignore[arg-type]
+
+
+STALE = _knmi_ds(5, "Ground temperature", "Ground temperature")
+CURRENT = _knmi_ds(9, "Ground surface temperature", "Ground surface temperature")
+
+
+@pytest.mark.parametrize("rows", [[STALE, CURRENT], [CURRENT, STALE]], ids=["stale-first", "current-first"])
+def test_live_lookup_prefers_the_canonical_display_name(rows: list[dict[str, Any]], tmp_path: Path) -> None:
+    http = _LookupHttp(rows)
+    manager = _manager(http, "v1.1", tmp_path)
+    assert manager.find_datastream_by_filter(f"{V2_BASE}/Datastreams", "x", "Ground surface temperature") == "9"
+    # The query asks for the matches in id order, newest first, with their ObservedProperty's name.
+    assert http.params == [{"$filter": "x", "$orderby": "id desc", "$top": "20",
+                            "$expand": "ObservedProperty($select=name)"}]
+
+
+def test_live_lookup_prefers_the_display_name_over_a_newer_id(tmp_path: Path) -> None:
+    newer_stale = _knmi_ds(12, "Ground temperature", "Ground temperature")
+    assert _manager(_LookupHttp([newer_stale, CURRENT]), "v1.1", tmp_path).find_datastream_by_filter(
+        "e", "x", "Ground surface temperature") == "9"
+    # By the Datastream's name when the ObservedProperty is not expanded.
+    no_op = [_knmi_ds(12, "Ground temperature", None), _knmi_ds(9, "Ground surface temperature", None)]
+    assert _manager(_LookupHttp(no_op), "v1.1", tmp_path).find_datastream_by_filter(
+        "e", "x", "Ground surface temperature") == "9"
+
+
+@pytest.mark.parametrize("preferred", ["", "Soil moisture"])
+def test_live_lookup_without_a_preferred_match_takes_the_highest_id(preferred: str, tmp_path: Path) -> None:
+    rows = [_knmi_ds(9, "a", "A"), _knmi_ds(12, "b", "B"), _knmi_ds(10, "c", "C")]  # the server ignored $orderby
+    assert _manager(_LookupHttp(rows), "v1.1", tmp_path).find_datastream_by_filter("e", "x", preferred) == "12"
+
+
+@pytest.mark.parametrize("version", ["v1.1", "v2.0"])
+def test_live_lookup_reads_ids_in_either_convention(version: str, tmp_path: Path) -> None:
+    for id_key in ("@iot.id", "id"):  # FROST's /v2.0 path answers "id", whatever the target declares
+        rows = [_knmi_ds(5, "Ground temperature", "Ground temperature", id_key),
+                _knmi_ds(9, "Ground surface temperature", "Ground surface temperature", id_key)]
+        manager = _manager(_LookupHttp(rows), version, tmp_path)
+        assert manager.find_datastream_by_filter("e", "x", "Ground surface temperature") == "9"
+        assert manager.find_datastream_by_filter("e", "x") == "9"
+
+
+def test_live_lookup_finds_nothing_on_errors(tmp_path: Path) -> None:
+    assert _manager(_LookupHttp([STALE], status_code=500), "v1.1", tmp_path).find_datastream_by_filter("e", "x") is None
+    assert _manager(_LookupHttp([]), "v1.1", tmp_path).find_datastream_by_filter("e", "x") is None
+
+
+def test_resolve_live_asks_for_the_canonical_display_name(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(stc, "settings", _settings(tmp_path))
+    client = SensorThingsClient()
+    asked: list[tuple[str, str]] = []
+
+    def fetch(endpoint: str, query_filter: str, base_url: str | None = None, preferred_name: str = "") -> str:
+        asked.append((query_filter, preferred_name))
+        return "9"
+
+    monkeypatch.setattr(client, "_fetch_datastream_id_by_filter", fetch)
+    reading = SensorReading(sensor_id="knmi-0-20000-0-06310", sensor_name="KNMI KNMI-52.36-3.34 sensor",
+                            observed_property="ground_temperature", unit="Cel", value=3.0,
+                            timestamp="2026-11-20T12:00:00Z", thing_name="KNMI KNMI-52.36-3.34",
+                            observed_property_name="Ground temperature")
+    assert client._resolve_datastream_id_live("https://example.test/v1.1", reading) == "9"
+    assert asked == [(f"Thing/name eq '{KNMI_THING}' and properties/streamKey eq 'ground_temperature'",
+                      "Ground surface temperature")]
+
+
+def test_resolve_live_picks_the_current_ground_temperature_end_to_end(monkeypatch, tmp_path) -> None:
+    """Through the client's own entity manager: the stale Datastream, listed first, is not taken."""
+    monkeypatch.setattr(stc, "settings", _settings(tmp_path))
+    client = SensorThingsClient()
+    http = _LookupHttp([STALE, CURRENT])
+    monkeypatch.setattr(client._entity_manager, "_http", http)
+    reading = SensorReading(sensor_id="knmi-0-20000-0-06310", sensor_name="KNMI KNMI-52.36-3.34 sensor",
+                            observed_property="ground_temperature", unit="Cel", value=3.0,
+                            timestamp="2026-11-20T12:00:00Z", thing_name="KNMI KNMI-52.36-3.34")
+    assert client._resolve_datastream_id_live("https://example.test/v1.1", reading) == "9"
+    assert http.params[0]["$orderby"] == "id desc"

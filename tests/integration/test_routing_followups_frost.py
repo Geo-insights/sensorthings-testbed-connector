@@ -14,7 +14,10 @@ more than 2,500 datastreams, so the listing takes several pages. The tests:
   and purges only what is stale or crosses properties;
 * a reading beyond the first page is pushed into its own datastream;
 * a dead-lettered line naming another property's datastream is replayed into
-  the reading's own one.
+  the reading's own one;
+* the live lookup picks the same datastream whatever FROST's row order: the one
+  of the canonical display name (a KNMI Thing's 'Ground surface temperature'
+  over its stale 'Ground temperature'), else the highest id.
 
 FROST comes from ``ROUTING_FROST_URL`` (a service root such as
 ``http://127.0.0.1:8080/FROST-Server``, Basic auth write/write), or else from
@@ -289,3 +292,55 @@ def test_push_and_replay_beyond_the_first_page(frost_root, seeded, make_client, 
     assert (summary["replayed"], summary["route_rewritten"], summary["remaining"]) == (1, 1, 0)
     assert (marker + 0.5, "pm2_5") in _results(frost_root, pm2_5)
     assert (marker + 0.5, "pm2_5") not in _results(frost_root, pm10)
+
+
+def _datastream(name: str, sensor: int, observed_property: int, prop: str) -> dict[str, Any]:
+    return {
+        "name": name, "description": prop,
+        "observationType": "http://www.opengis.net/def/observationType/OGC-OM/2.0/OM_Measurement",
+        "unitOfMeasurement": {"name": "x", "symbol": "x", "definition": "ucum"},
+        "Sensor": {"@iot.id": sensor}, "ObservedProperty": {"@iot.id": observed_property},
+        "properties": {"observed_property": prop, "streamKey": prop},
+    }
+
+
+@pytest.mark.parametrize("path", ["v2.0", "v1.1"], ids=["v2.0-undeclared", "v1.1"])
+def test_live_lookup_picks_the_same_datastream_whatever_the_row_order(frost_root, seeded, make_client, path) -> None:
+    client, _bad, _gets = make_client(path)
+    v11 = f"{frost_root}/v1.1"
+    base = f"{seeded['prefix']} {path} {uuid.uuid4().hex[:6]}"
+    sensor = _post(f"{v11}/Sensors", {"name": f"{base} sensor", "description": "x", "encodingType": "text/plain",
+                                      "metadata": ""})
+    stale_op = _post(f"{v11}/ObservedProperties", {"name": "Ground temperature", "definition": "urn:x", "description": "x"})
+    current_op = _post(f"{v11}/ObservedProperties", {"name": "Ground surface temperature", "definition": "urn:x",
+                                                     "description": "x"})
+    knmi = f"{base} KNMI"
+    _post(f"{v11}/Things", {"name": knmi, "description": "x"})
+    thing = HTTP.get(f"{v11}/Things", params={"$filter": f"name eq '{knmi}'"}, timeout=60).json()["value"][0]["@iot.id"]
+    # As on production: the stale datastream first (the lower id), the current one next to it.
+    stale = _post(f"{v11}/Datastreams", {**_datastream(f"{knmi} sensor - Ground temperature", sensor, stale_op,
+                                                       "ground_temperature"), "Thing": {"@iot.id": thing}})
+    current = _post(f"{v11}/Datastreams", {**_datastream(f"{knmi} sensor - Ground surface temperature", sensor,
+                                                         current_op, "ground_temperature"), "Thing": {"@iot.id": thing}})
+    other = f"{base} Other"
+    _post(f"{v11}/Things", {"name": other, "description": "x"})
+    other_thing = HTTP.get(f"{v11}/Things", params={"$filter": f"name eq '{other}'"}, timeout=60).json()["value"][0]["@iot.id"]
+    older = _post(f"{v11}/Datastreams", {**_datastream(f"{other} sensor - old name", sensor, stale_op, "pm10"),
+                                         "Thing": {"@iot.id": other_thing}})
+    newer = _post(f"{v11}/Datastreams", {**_datastream(f"{other} sensor - new name", sensor, stale_op, "pm10"),
+                                         "Thing": {"@iot.id": other_thing}})
+    assert stale < current and older < newer
+
+    def lookup(thing_name: str, prop: str) -> str | None:
+        client._live_datastream_lookup_cache.clear()
+        reading = SensorReading(sensor_id=f"{base}-s", sensor_name="s", observed_property=prop, unit="x", value=1.0,
+                                timestamp=datetime(2026, 11, 20, 12, tzinfo=UTC), thing_name=thing_name)
+        return client._resolve_datastream_id_live(f"{frost_root}/{path}", reading)
+
+    for _ in range(2):
+        assert lookup(knmi, "ground_temperature") == str(current)
+        assert lookup(other, "pm10") == str(newer)  # no datastream of PM10's display name: the highest id
+        # Updating rows moves them in PostgreSQL's heap, so FROST's unordered answer changes; the pick does not.
+        for ds_id in (current, newer, stale, older):
+            response = HTTP.patch(f"{v11}/Datastreams({ds_id})", json={"description": uuid.uuid4().hex}, timeout=60)
+            assert response.status_code == 200, response.text

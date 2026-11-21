@@ -369,7 +369,7 @@ def test_resolve_datastream_id_live_queries_by_device_eui_and_stream_key(monkeyp
 
     captured_filters: list[str] = []
 
-    def fake_fetch(endpoint, query_filter, base_url=None):
+    def fake_fetch(endpoint, query_filter, base_url=None, preferred_name=""):
         captured_filters.append(query_filter)
         return "777"
 
