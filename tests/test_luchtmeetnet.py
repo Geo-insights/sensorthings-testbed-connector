@@ -3,6 +3,9 @@
 Covers:
 - parse_measurements() with valid data produces correct canonical names / units
 - parse_measurements() with an unknown formula is skipped
+- FORMULA_UNITS: every pushed formula declares the unit the API serves it in;
+  where that differs from the canonical unit (CO: µg/m³ vs mg/m³) a declared
+  scale converts it exactly, and formulas without a declared unit are dropped
 - build_entity_set() produces a valid entity-set dict
 - LuchtmeetnetPollingSource is a RestPollingSource subclass with
   uses_dynamic_discovery = True
@@ -14,13 +17,19 @@ Covers:
   fetch afterwards reads back over the held-back cycles
 - the 3 h look-back applies from the first cycle; with the ingest loop's
   seeded high-water marks a restart fills the gap without duplicates
+- each station's window starts 3 h before the end of its last successful
+  fetch (at most 24 h back), so failed fetches (5xx, transport errors,
+  malformed bodies, a rate limit that stops the cycle) lose no hours
 - entity sets carry one Datastream per canonical component, and registering
   them where the Thing already exists adds the missing Datastreams
 - readings for registered components are pushable into the right Datastream
 - scripts/repair_luchtmeetnet_locations.py plans and applies Location and
   generated FeatureOfInterest PATCHes (dry run by default) on SensorThings
   v1.1 and v2.0, tells Luchtmeetnet API failures apart from missing
-  coordinates, and refuses --apply once Observations exist
+  coordinates, refuses --apply once Observations exist while there is
+  something to move (exit 0 when nothing is), reports observedAreas left at
+  the placeholder, and --print-sql prints the observedArea SQL contacting
+  nothing
 """
 from __future__ import annotations
 
@@ -32,6 +41,7 @@ import logging
 import re
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any, ClassVar
 from urllib.parse import urlsplit
@@ -49,13 +59,16 @@ from app.services.luchtmeetnet_source import LuchtmeetnetPollingSource
 from app.services.rest_polling_source import RestPollingSource
 from app.services.sensorthings_client import SensorThingsClient
 from app.sources.luchtmeetnet import (
+    FORMULA_UNITS,
     StationDetail,
     build_entity_set,
     canonical_components,
+    formula_unit,
     parse_measurements,
     parse_station_detail,
 )
-from app.sta.canonical import CanonicalDatastream
+from app.sta import canonical as canonical_module
+from app.sta.canonical import CanonicalDatastream, resolve
 from scripts import repair_luchtmeetnet_locations as repair
 
 # ---------------------------------------------------------------------------
@@ -117,12 +130,29 @@ class TestParseMeasurements:
         assert len(readings) == 1
         assert readings[0].observed_property == "so2"
 
-    def test_co_maps_to_canonical(self):
-        data = [_make_entry("CO", 0.25)]
-        readings = parse_measurements(data, "NL49007", "Test")
+    def test_co_is_converted_from_the_api_ug_m3_to_canonical_mg_m3(self):
+        """GET /measurements serves CO in µg/m³ (NL49007 at 22:00 on 2026-11-20: 559.3); canonical CO is mg/m³."""
+        data = [_make_entry("CO", 559.3, "2026-11-20T22:00:00+00:00")]
+        readings = parse_measurements(data, "NL49007", "Amsterdam-Einsteinweg")
         assert len(readings) == 1
         assert readings[0].observed_property == "co"
         assert readings[0].unit == "mg/m3"
+        assert readings[0].value == 0.5593
+
+    @pytest.mark.parametrize(
+        ("api_value", "pushed"),
+        # Live values (µg/m³) from the six CO stations, Nov 2026; 226.2 * 0.001 is
+        # 0.22619999999999998 in binary floating point.
+        [(207.6, 0.2076), (226.2, 0.2262), (645.9, 0.6459), (843.0, 0.843), (0.0, 0.0), (-1.5, -0.0015)],
+    )
+    def test_co_conversion_is_exact(self, api_value, pushed):
+        (reading,) = parse_measurements([_make_entry("CO", api_value)], "NL49553", "Wijk aan Zee-De Banjaert")
+        assert reading.value == pushed
+
+    def test_other_components_keep_their_api_value(self):
+        data = [_make_entry(formula, 32.1) for formula in ("NO2", "O3", "PM10", "PM25", "SO2", "NH3", "C6H6")]
+        readings = parse_measurements(data, "NL49007", "Test")
+        assert [(r.value, r.unit) for r in readings] == [(32.1, "ug/m3")] * 7
 
     def test_nh3_maps_to_canonical(self):
         data = [_make_entry("NH3", 7.4)]
@@ -180,6 +210,66 @@ class TestParseMeasurements:
         data = [_make_entry("NO2", 5.0)]
         readings = parse_measurements(data, "NL49007", "Test")
         assert readings[0].quality == "good"
+
+
+# ---------------------------------------------------------------------------
+# FORMULA_UNITS: the API unit of every pushed formula next to its canonical unit
+# ---------------------------------------------------------------------------
+
+# Conversions between mass concentration units: value in the second unit = value
+# in the first unit * factor.
+_KNOWN_SCALES = {("ug/m3", "mg/m3"): Decimal("0.001"), ("mg/m3", "ug/m3"): Decimal(1000)}
+# Every formula GET /components lists (Nov 2026), the spellings station records
+# use, and every canonical name and alias, i.e. whatever canonical.resolve() maps.
+_LIVE_FORMULAS = [
+    "BCWB", "C10H8", "C6H6", "C7H8", "C8H10", "CO", "FN", "H2S", "NH3", "NO", "NO2", "NOx", "O3", "PM10",
+    "PM25", "PM2.5", "PS", "SO2",
+]
+_CANDIDATE_FORMULAS = sorted({*_LIVE_FORMULAS, *(member.value for member in CanonicalDatastream), *canonical_module._ALIASES})
+
+
+class TestFormulaUnits:
+    @pytest.mark.parametrize("formula", sorted(FORMULA_UNITS))
+    def test_api_unit_differs_from_canonical_only_with_a_declared_scale(self, formula):
+        declared = FORMULA_UNITS[formula]
+        canonical_unit = declared.canonical.meta.unit
+        if declared.api_unit == canonical_unit:
+            assert declared.scale == 1, f"{formula}: served in its canonical unit, yet scaled by {declared.scale}"
+        else:
+            assert (declared.api_unit, canonical_unit) in _KNOWN_SCALES, (
+                f"{formula}: no known conversion from {declared.api_unit} to {canonical_unit}"
+            )
+            assert declared.scale == _KNOWN_SCALES[(declared.api_unit, canonical_unit)], (
+                f"{formula}: served in {declared.api_unit}, pushed as {canonical_unit}, without the declared scale"
+            )
+
+    @pytest.mark.parametrize("formula", sorted(FORMULA_UNITS))
+    def test_table_agrees_with_canonical_resolve(self, formula):
+        assert resolve(formula) is FORMULA_UNITS[formula].canonical
+
+    def test_api_units_as_the_live_components_endpoint_gives_them(self):
+        """GET /components/{formula}, Nov 2026: every pushed formula is served in µg/m³."""
+        assert {formula: declared.api_unit for formula, declared in FORMULA_UNITS.items()} == dict.fromkeys(
+            ["NO2", "O3", "PM10", "PM25", "PM2.5", "SO2", "CO", "NH3", "C6H6"], "ug/m3"
+        )
+        # Canonical CO stays mg/m3: Samen Meten maps onto the same datastream.
+        assert FORMULA_UNITS["CO"].canonical.meta.unit == "mg/m3"
+
+    def test_every_emitted_formula_has_a_declared_api_unit(self):
+        """Whatever becomes a reading or a Datastream is in FORMULA_UNITS and arrives in its canonical unit."""
+        for formula in _CANDIDATE_FORMULAS:
+            readings = parse_measurements([_make_entry(formula, 250.5)], "NL49007", "Test")
+            declared = formula_unit(formula)
+            if declared is None:
+                assert readings == [], f"{formula} is emitted without a declared API unit"
+                assert canonical_components([formula]) == [], f"{formula} gets a Datastream without a declared API unit"
+                continue
+            assert len(readings) == 1, formula
+            reading = readings[0]
+            assert reading.observed_property == declared.canonical.value, formula
+            assert reading.unit == declared.canonical.meta.unit, formula
+            assert reading.value == float(Decimal("250.5") * declared.scale), formula
+            assert canonical_components([formula]) == [declared.canonical.value], formula
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +512,8 @@ class _FakeLuchtmeetnetAPI:
         list_status: dict[int, int] | None = None,
         list_bodies: dict[int, Any] | None = None,
         measurement_status: dict[str, int] | None = None,
+        measurement_bodies: dict[str, Any] | None = None,
+        measurement_errors: set[str] | None = None,
         filter_window: bool = False,
         delay: float = 0.0,
     ) -> None:
@@ -434,6 +526,10 @@ class _FakeLuchtmeetnetAPI:
         # 200 bodies served instead of the real page (empty or malformed lists)
         self.list_bodies = list_bodies or {}
         self.measurement_status = measurement_status or {}
+        # 200 bodies served instead of the measurements (malformed answers)
+        self.measurement_bodies = measurement_bodies or {}
+        # stations whose measurement requests fail at the transport level
+        self.measurement_errors = measurement_errors or set()
         # Serve only measurements inside the requested start/end, like the live API
         self.filter_window = filter_window
         self.delay = delay
@@ -488,9 +584,13 @@ class _FakeLuchtmeetnetAPI:
             return httpx.Response(200, json={"data": self.details[number]})
         if path == "/measurements":
             number = params.get("station_number", "")
+            if number in self.measurement_errors:
+                raise httpx.ConnectError("connection refused", request=request)
             status = self.measurement_status.get(number, 200)
             if status != 200:
                 return httpx.Response(status, json={"message": "Too Many Requests"})
+            if number in self.measurement_bodies:
+                return httpx.Response(200, json=self.measurement_bodies[number])
             data = self.measurements.get(number, [])
             if self.filter_window:
                 start = datetime.fromisoformat(params["start"])
@@ -1081,10 +1181,11 @@ class TestReadingsArePushable:
         _run(src._do_fetch_readings())
         assert {(p["start"], p["end"]) for p in api.measurement_params()} == {(_iso(t0 - timedelta(hours=3)), _iso(t0))}
 
+        # Afterwards: three hours before the end of the station's last successful fetch.
         clock.now = t0 + timedelta(hours=1)
         _run(src._do_fetch_readings())
         last = api.measurement_params()[-1]
-        assert (last["start"], last["end"]) == (_iso(t0 - timedelta(hours=2)), _iso(t0 + timedelta(hours=1)))
+        assert (last["start"], last["end"]) == (_iso(t0 - timedelta(hours=3)), _iso(t0 + timedelta(hours=1)))
 
     def test_restart_fills_the_gap_without_pushing_anything_twice(self, install_api, clock):
         """The ingest loop's seeded high-water marks drop what the previous process already pushed."""
@@ -1124,10 +1225,11 @@ class TestReadingsArePushable:
         released = api.measurement_params()
         assert {(p["start"], p["end"]) for p in released} == {(_iso(t0 - timedelta(hours=3)), _iso(clock.now))}
 
-        clock.now = t0 + timedelta(hours=3, minutes=3)  # back to the plain look-back
+        released_at = clock.now
+        clock.now = t0 + timedelta(hours=3, minutes=3)  # back to the look-back before the last fetch
         _run(src._do_fetch_readings())
         last = api.measurement_params()[-1]
-        assert (last["start"], last["end"]) == (_iso(clock.now - timedelta(hours=3)), _iso(clock.now))
+        assert (last["start"], last["end"]) == (_iso(released_at - timedelta(hours=3)), _iso(clock.now))
 
     def test_catch_up_after_holding_back_is_bounded(self, install_api, monkeypatch, clock):
         monkeypatch.setattr(asyncio, "sleep", _no_sleep)
@@ -1156,6 +1258,38 @@ class TestReadingsArePushable:
         _run(src._do_fetch_readings())
         last = api.measurement_params()[-1]
         assert (last["start"], last["end"]) == (_iso(t0 - timedelta(hours=3)), _iso(clock.now))
+
+    def test_co_is_registered_and_pushed_in_mg_m3(self, install_api, monkeypatch, tmp_path):
+        """Live NL49007 (Nov 2026): its CO Datastream is in mg/m³, and so are the values pushed into it."""
+        station = {"number": "NL49007", "location": "Amsterdam-Einsteinweg"}
+        detail = _detail(4.845233, 52.381331, ["PM25", "NO", "CO", "FN", "PM10", "NO2"])
+        measurements = {
+            "NL49007": [  # as served: µg/m³
+                _measurement("NL49007", "CO", 559.3, "2026-11-20T22:00:00+00:00"),
+                _measurement("NL49007", "CO", 757.9, "2026-11-20T21:00:00+00:00"),
+                _measurement("NL49007", "NO2", 32.1, "2026-11-20T22:00:00+00:00"),
+                _measurement("NL49007", "FN", 1.58, "2026-11-20T22:00:00+00:00"),
+            ]
+        }
+        install_api(_FakeLuchtmeetnetAPI([station], {"NL49007": detail}, measurements))
+        src = _make_source()
+        readings = _run(src._do_fetch_readings())
+
+        frost = _FakeFrost()
+        client = _client_on(frost, monkeypatch, tmp_path)
+        for entity_set in src.entity_sets():
+            client.register_entity_set(entity_set)
+        client.push_observations(readings, source="luchtmeetnet")
+
+        by_property = {ds["properties"]["observed_property"]: ds for ds in frost.entities["Datastreams"].values()}
+        assert sorted(by_property) == ["co", "no2", "pm10", "pm2_5"]
+        assert by_property["co"]["unitOfMeasurement"]["symbol"] == "mg/m3"
+        assert by_property["no2"]["unitOfMeasurement"]["symbol"] == "ug/m3"
+        pushed: dict[str, list[float]] = {}
+        for obs in frost.posted("Observations"):
+            datastream = frost.entities["Datastreams"][obs["Datastream"]["@iot.id"]]
+            pushed.setdefault(datastream["properties"]["observed_property"], []).append(obs["result"])
+        assert pushed == {"co": [0.7579, 0.5593], "no2": [32.1]}
 
     def test_only_registered_components_are_emitted_oldest_first(self, install_api):
         install_api(_FakeLuchtmeetnetAPI(_STATIONS, _DETAILS, _MEASUREMENTS))
@@ -1201,6 +1335,124 @@ class TestReadingsArePushable:
             ds = datastreams[obs["Datastream"]["@iot.id"]]
             assert ds["properties"]["sensor_id"] == obs["parameters"]["sensor_id"]
             assert ds["properties"]["observed_property"] == obs["parameters"]["observed_property"]
+
+
+# ---------------------------------------------------------------------------
+# Catch-up after failed measurement fetches
+# ---------------------------------------------------------------------------
+
+
+def _windows_of_next_cycle(api: _FakeLuchtmeetnetAPI, src: LuchtmeetnetPollingSource) -> dict[str, tuple[str, str]]:
+    """Run one cycle; ``{station: (start, end)}`` of its measurement requests."""
+    before = len(api.measurement_params())
+    _run(src._do_fetch_readings())
+    return {p["station_number"]: (p["start"], p["end"]) for p in api.measurement_params()[before:]}
+
+
+class TestCatchUpAfterFailedFetches:
+    def test_hours_of_failed_cycles_are_read_on_the_next_successful_fetch(self, install_api, monkeypatch, clock):
+        """HTTP 503 from 11:17 to 15:17: a 3 h window from each poll lost hours 11, 12 and 13."""
+        monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+        hours = [datetime(2026, 11, 20, hour, 0, tzinfo=UTC) for hour in range(24)]
+        measurements = {"NL10450": [_measurement("NL10450", "NO2", float(h.hour), _iso(h)) for h in hours]}
+        api = install_api(
+            _FakeLuchtmeetnetAPI(
+                [_STATIONS[1]], {"NL10450": _detail(4.318551, 52.062537, ["NO2"])}, measurements, filter_window=True
+            )
+        )
+        src = _make_source()
+        start = datetime(2026, 11, 20, 10, 17, tzinfo=UTC)
+        returned: set[int] = set()
+        for step in range(7):
+            clock.now = start + timedelta(hours=step)
+            api.measurement_status = {"NL10450": 503} if 1 <= step <= 5 else {}
+            returned |= {reading.timestamp.hour for reading in _run(src._do_fetch_readings())}
+
+        assert sorted(returned) == list(range(8, 17))
+        last = api.measurement_params()[-1]
+        assert (last["start"], last["end"]) == (_iso(start - timedelta(hours=3)), _iso(clock.now))
+
+    @pytest.mark.parametrize("failure", ["http-503", "transport-error", "body-not-a-dict", "data-not-a-list"])
+    def test_a_failed_fetch_leaves_the_station_window_where_it_was(self, install_api, monkeypatch, clock, failure):
+        monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+        api = install_api(_FakeLuchtmeetnetAPI(_STATIONS, _DETAILS, _MEASUREMENTS))
+        src = _make_source()
+        t0 = clock.now
+        _run(src._do_fetch_readings())  # every station fetched up to t0
+
+        clock.now = t0 + timedelta(hours=1)
+        if failure == "http-503":
+            api.measurement_status = {"NL10450": 503}
+        elif failure == "transport-error":
+            api.measurement_errors = {"NL10450"}
+        elif failure == "body-not-a-dict":
+            api.measurement_bodies = {"NL10450": [{"formula": "NO2"}]}
+        else:
+            api.measurement_bodies = {"NL10450": {"pagination": {"last_page": 1}, "data": "unavailable"}}
+        assert {r.sensor_id for r in _run(src._do_fetch_readings())} == {"luchtmeetnet-NL49565"}
+
+        api.measurement_status, api.measurement_errors, api.measurement_bodies = {}, set(), {}
+        clock.now = t0 + timedelta(hours=2)
+        windows = _windows_of_next_cycle(api, src)
+        assert windows["NL10450"] == (_iso(t0 - timedelta(hours=3)), _iso(clock.now))  # back over the failed cycle
+        assert windows["NL49565"] == (_iso(t0 - timedelta(hours=2)), _iso(clock.now))  # fetched an hour later
+        assert windows["NL50002"] == windows["NL49565"]
+
+    def test_stations_left_after_a_rate_limit_stop_read_back_over_that_cycle(self, install_api, monkeypatch, clock):
+        monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+        api = install_api(_FakeLuchtmeetnetAPI(_STATIONS, _DETAILS, _MEASUREMENTS))
+        src = _make_source()
+        t0 = clock.now
+        _run(src._do_fetch_readings())
+
+        clock.now = t0 + timedelta(hours=1)
+        api.measurement_status = {"NL49565": 429}  # the first station: the cycle stops there
+        assert set(_windows_of_next_cycle(api, src)) == {"NL49565"}
+
+        api.measurement_status = {}
+        clock.now = t0 + timedelta(hours=2)
+        windows = _windows_of_next_cycle(api, src)
+        assert windows == {number: (_iso(t0 - timedelta(hours=3)), _iso(clock.now)) for number in ("NL49565", "NL10450", "NL50002")}
+
+    def test_station_without_a_successful_fetch_reads_back_to_its_first_window(self, install_api, monkeypatch, clock):
+        monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+        api = install_api(_FakeLuchtmeetnetAPI(_STATIONS, _DETAILS, _MEASUREMENTS, measurement_status={"NL10450": 503}))
+        src = _make_source()
+        t0 = clock.now
+        _run(src._do_fetch_readings())  # NL10450 fails from the first cycle on
+        clock.now = t0 + timedelta(hours=1)
+        _run(src._do_fetch_readings())
+
+        api.measurement_status = {}
+        clock.now = t0 + timedelta(hours=2)
+        windows = _windows_of_next_cycle(api, src)
+        assert windows["NL10450"] == (_iso(t0 - timedelta(hours=3)), _iso(clock.now))
+        assert windows["NL49565"] == (_iso(t0 - timedelta(hours=2)), _iso(clock.now))
+
+    def test_catch_up_after_failed_fetches_is_bounded(self, install_api, monkeypatch, clock):
+        """At most 24 h: about 250 values for a station with every component, under the 1000-value cap."""
+        monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+        api = install_api(_FakeLuchtmeetnetAPI(_STATIONS, _DETAILS, _MEASUREMENTS))
+        src = _make_source()
+        t0 = clock.now
+        _run(src._do_fetch_readings())
+
+        api.measurement_status = {"NL10450": 503}
+        for hours in (1, 12, 29):
+            clock.now = t0 + timedelta(hours=hours)
+            _run(src._do_fetch_readings())
+
+        api.measurement_status = {}
+        clock.now = t0 + timedelta(hours=30)
+        windows = _windows_of_next_cycle(api, src)
+        assert windows["NL10450"] == (_iso(clock.now - timedelta(hours=24)), _iso(clock.now))
+        assert windows["NL49565"] == (_iso(t0 + timedelta(hours=29) - timedelta(hours=3)), _iso(clock.now))
+
+    def test_a_restart_starts_with_the_three_hour_look_back(self, install_api, monkeypatch, clock):
+        """The process before the restart is unknown: three hours back, as before, not 24."""
+        api = install_api(_FakeLuchtmeetnetAPI(_STATIONS, _DETAILS, _MEASUREMENTS))
+        windows = _windows_of_next_cycle(api, _make_source())
+        assert set(windows.values()) == {(_iso(clock.now - timedelta(hours=3)), _iso(clock.now))}
 
 
 # ---------------------------------------------------------------------------
@@ -1506,6 +1758,71 @@ class TestRepairLuchtmeetnetLocations:
         assert http.patches == []
         assert "Nothing was written." in capsys.readouterr().out
 
+    def test_check_after_a_repair_with_observations_exits_0(self, capsys):
+        """After --apply --allow-observations nothing is left to move: no refusal, exit 0."""
+        things = [
+            _frost_thing(
+                195, "NL49565", "Oude Meer-Aalsmeerderdijk", location_id=108, coordinates=[4.77082, 52.28013],
+                datastreams=[(7, None), (8, (80, 31, [4.77082, 52.28013]))],
+            ),
+            _frost_thing(199, "NL50002", "Geleen-Vouershof", location_id=111, coordinates=[5.81071, 50.96309]),
+        ]
+        http = _FakeFrostHTTP(things)
+        assert _run_repair(http, apply=False) == repair.EXIT_OK
+        out = capsys.readouterr().out
+        assert "--apply is refused" not in out
+        assert "1 Luchtmeetnet Datastreams on 1 Things have Observations; nothing is left to move" in out
+
+        assert _run_repair(http, apply=True) == repair.EXIT_OK
+        assert http.patches == []
+
+    def test_observations_and_nothing_movable_give_the_status_of_what_is_left(self, capsys):
+        """Stations left at the placeholder for an API failure: exit 2 (re-run), not the refusal."""
+        things = [
+            _frost_thing(195, "NL49565", "Oude Meer-Aalsmeerderdijk", location_id=108, datastreams=[(8, (80, 31, _PLACEHOLDER))])
+        ]
+        get = _api_get_from(_DETAILS, failures={"NL49565": repair.SERVER_ERROR})
+        assert _run_repair(_FakeFrostHTTP(things), apply=True, get=get) == repair.EXIT_API_FAILED
+        assert "--apply is refused" not in capsys.readouterr().out
+
+    def test_observed_areas_at_the_placeholder_are_reported(self, capsys):
+        station = [4.77082, 52.28013]
+        thing = _frost_thing(
+            195, "NL49565", "Oude Meer-Aalsmeerderdijk", location_id=108, coordinates=station,
+            datastreams=[(7, (70, 31, station)), (8, (80, 31, station)), (9, (90, 31, station))],
+        )
+        thing["Datastreams"][0]["observedArea"] = {"type": "Point", "coordinates": _PLACEHOLDER}
+        # Two FeaturesOfInterest, one of them at the placeholder: their convex hull.
+        thing["Datastreams"][1]["observedArea"] = {"type": "LineString", "coordinates": [_PLACEHOLDER, station]}
+        thing["Datastreams"][2]["observedArea"] = {"type": "Point", "coordinates": station}
+        http = _FakeFrostHTTP([thing])
+
+        assert _run_repair(http, apply=False) == repair.EXIT_OK  # nothing the API can move
+        out = capsys.readouterr().out
+        assert (
+            "2 Luchtmeetnet Datastreams have an observedArea with a corner at POINT(5 52): "
+            "Datastream 7 of 'GEO_Luchtmeetnet Oude Meer-Aalsmeerderdijk', "
+            "Datastream 8 of 'GEO_Luchtmeetnet Oude Meer-Aalsmeerderdijk'."
+        ) in out
+        assert "--print-sql" in out
+
+    @pytest.mark.parametrize(
+        ("geometry", "touches"),
+        [
+            ({"type": "Point", "coordinates": [5.0, 52.0]}, True),
+            ({"type": "Point", "coordinates": [5, 52]}, True),
+            ({"type": "Polygon", "coordinates": [[[4.0, 51.0], [5.0, 52.0], [4.5, 52.5], [4.0, 51.0]]]}, True),
+            ({"type": "MultiPoint", "coordinates": [[4.3, 52.0], [5.0, 52.0]]}, True),
+            ({"type": "GeometryCollection", "geometries": [{"type": "Point", "coordinates": [5.0, 52.0]}]}, True),
+            ({"type": "Point", "coordinates": [4.77082, 52.28013]}, False),
+            ({"type": "Polygon", "coordinates": [[[4.0, 51.0], [6.0, 51.0], [5.0, 53.0], [4.0, 51.0]]]}, False),
+            (None, False),
+            ({"type": "Point", "coordinates": [True, 52.0]}, False),
+        ],
+    )
+    def test_touches_placeholder(self, geometry, touches):
+        assert repair.touches_placeholder(geometry) is touches
+
     def test_allow_observations_also_moves_the_generated_feature_of_interest(self):
         things = [
             _frost_thing(
@@ -1546,7 +1863,7 @@ class TestRepairLuchtmeetnetLocations:
 
         key = "id" if v2 else "@iot.id"
         assert http.gets[0]["$expand"] == (
-            f"Locations,Datastreams($select={key};$expand=Observations($top=1;$select={key};"
+            f"Locations,Datastreams($select={key},observedArea;$expand=Observations($top=1;$select={key};"
             f"$expand=FeatureOfInterest($select={key},feature)))"
         )
 
@@ -1610,6 +1927,10 @@ class TestRepairApiGet:
             repair.api_get("https://lmn.test", "/stations/NL1", http_get=http_get, sleep=lambda _s: None)
         assert exc_info.value.category == category
         assert len(http_get.urls) == 1
+
+
+def _fail_if_called(*_args: Any, **_kwargs: Any) -> Any:
+    raise AssertionError("must not be called")
 
 
 class _ClientRecorder:
@@ -1683,6 +2004,29 @@ class TestRepairMain:
         (call,) = recorded
         assert call["fields"] == _V1
         assert "note:" not in capsys.readouterr().out
+
+    def test_print_sql_contacts_nothing_and_ends_in_rollback_unless_apply(self, monkeypatch, recorded, capsys):
+        self._configure(monkeypatch)  # no FROST target: anything that needed one would exit
+        monkeypatch.setattr(repair, "api_get", _fail_if_called)
+
+        assert repair.main(["--print-sql"]) == repair.EXIT_OK
+        sql = capsys.readouterr().out
+        assert """WHERE starts_with(t."NAME", 'GEO_Luchtmeetnet ');""" in sql
+        assert re.findall(r"^(COMMIT|ROLLBACK);$", sql, re.MULTILINE) == ["ROLLBACK"]
+        assert sql.startswith("-- Recompute OBSERVED_AREA")
+        assert "\\set ON_ERROR_STOP on\nBEGIN;\n" in sql
+
+        assert repair.main(["--print-sql", "--apply", "--prefix", "IT'X_"]) == repair.EXIT_OK
+        sql = capsys.readouterr().out
+        assert """WHERE starts_with(t."NAME", 'IT''X_Luchtmeetnet ');""" in sql
+        assert re.findall(r"^(COMMIT|ROLLBACK);$", sql, re.MULTILINE) == ["COMMIT"]
+        assert _ClientRecorder.instances == []
+        assert recorded == []
+
+    def test_print_sql_refuses_a_prefix_with_a_line_break(self, monkeypatch, recorded):
+        self._configure(monkeypatch)
+        with pytest.raises(SystemExit, match="line break"):
+            repair.main(["--print-sql", "--prefix", "GEO_\nDROP TABLE x; --"])
 
     def test_unconfigured_target_url_is_refused(self, monkeypatch, recorded):
         self._configure(monkeypatch, FrostTarget(url="https://frost.example/FROST-Server/v2.0", version="v2.0"))

@@ -8,11 +8,21 @@ run main() through one endpoint, configured the way the connector is
 configured (SENSORTHINGS_BASE_URLS JSON with per-target Basic auth), and read
 the result back through the other endpoint.
 
+The observedArea SQL that ``--print-sql`` prints runs through psql in the
+database container, as an operator runs it, and is checked against what FROST's
+own insert trigger computes for the same Observations.
+
 FROST comes from ``LMN_REPAIR_FROST_URL`` (a service root such as
 ``http://frost:8080/FROST-Server`` with Basic auth write/write and no anonymous
-reads) or, when that is unset, from docker compose: fraunhoferiosb/frost-server:2.8
-(``LMN_REPAIR_FROST_IMAGE`` overrides) and PostGIS under a unique project name,
-removed afterwards. Luchtmeetnet is a local fake HTTP server.
+reads; the SQL test also needs ``LMN_REPAIR_FROST_DB_CONTAINER``, the database
+container for ``docker exec ... psql``) or, when that is unset, from Docker:
+fraunhoferiosb/frost-server:2.8 (``LMN_REPAIR_FROST_IMAGE`` overrides) and
+postgis/postgis:16-3.4-alpine, as containers and a network named
+``<LMN_REPAIR_DOCKER_PREFIX, default lmn-repair-it>-<random>-*``. The database
+lives in a tmpfs; everything is removed afterwards. FROST listens on 127.0.0.1
+only. Luchtmeetnet is a local fake HTTP server.
+
+    python -m pytest tests/integration/test_repair_luchtmeetnet_locations.py -m integration
 """
 
 from __future__ import annotations
@@ -24,7 +34,8 @@ import subprocess
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, ClassVar
 
@@ -44,36 +55,27 @@ _STATIONS = {  # number: (name, [lon, lat]) as Luchtmeetnet serves them
     "NL50002": ("Geleen-Vouershof", [5.81071, 50.96309]),
     "NL01491": ("Rotterdam-Ridderkerk", [4.4307, 51.93858]),
 }
-_COMPOSE = """
-services:
-  db:
-    image: postgis/postgis:16-3.4-alpine
-    environment: {POSTGRES_DB: sensorthings, POSTGRES_USER: sensorthings, POSTGRES_PASSWORD: sensorthings}
-    healthcheck: {test: ["CMD-SHELL", "pg_isready -U sensorthings"], interval: 3s, timeout: 3s, retries: 30}
-  frost:
-    image: IMAGE
-    depends_on: {db: {condition: service_healthy}}
-    environment:
-      serviceRootUrl: http://localhost:PORT/FROST-Server
-      persistence_db_driver: org.postgresql.Driver
-      persistence_db_url: jdbc:postgresql://db:5432/sensorthings
-      persistence_db_username: sensorthings
-      persistence_db_password: sensorthings
-      persistence_autoUpdateDatabase: "true"
-      plugins_projects_enable: "true"
-      plugins_projects_enableDefaultRules: "true"
-      plugins_actuation_enable: "true"
-      plugins_openCitySense_enable: "true"
-      plugins_modelLoader_enable: "true"
-      auth_provider: de.fraunhofer.iosb.ilt.frostserver.auth.basic.BasicAuthProvider
-      auth_db_driver: org.postgresql.Driver
-      auth_db_url: jdbc:postgresql://db:5432/sensorthings
-      auth_db_username: sensorthings
-      auth_db_password: sensorthings
-      auth_autoUpdateDatabase: "true"
-      auth_allowAnonymousRead: "false"
-    ports: ["127.0.0.1:PORT:8080"]
-"""
+_DB = "sensorthings"  # database, user and password of the throwaway PostGIS
+# FROST as configured in production: Basic auth, no anonymous reads, plugins on.
+_FROST_ENV = {
+    "persistence_db_driver": "org.postgresql.Driver",
+    "persistence_db_url": "jdbc:postgresql://{db}:5432/sensorthings",
+    "persistence_db_username": _DB,
+    "persistence_db_password": _DB,
+    "persistence_autoUpdateDatabase": "true",
+    "plugins_projects_enable": "true",
+    "plugins_projects_enableDefaultRules": "true",
+    "plugins_actuation_enable": "true",
+    "plugins_openCitySense_enable": "true",
+    "plugins_modelLoader_enable": "true",
+    "auth_provider": "de.fraunhofer.iosb.ilt.frostserver.auth.basic.BasicAuthProvider",
+    "auth_db_driver": "org.postgresql.Driver",
+    "auth_db_url": "jdbc:postgresql://{db}:5432/sensorthings",
+    "auth_db_username": _DB,
+    "auth_db_password": _DB,
+    "auth_autoUpdateDatabase": "true",
+    "auth_allowAnonymousRead": "false",
+}
 
 
 def _free_port() -> int:
@@ -100,28 +102,78 @@ def _wait_until_ready(root: str, timeout: float = 240.0) -> None:
     raise TimeoutError(f"FROST at {root} did not serve v1.1 and v2.0 within {timeout:.0f}s")
 
 
+@dataclass(frozen=True)
+class _Stack:
+    root: str  # FROST service root
+    db: str | None  # database container for psql, None when unknown
+
+
+def _docker(*args: str, input: str | None = None, check: bool = True, timeout: float = 600) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["docker", *args], input=input, capture_output=True, text=True, encoding="utf-8", timeout=timeout, check=check
+    )
+
+
+def _wait_for(what: str, ready: Callable[[], bool], timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if ready():
+            return
+        time.sleep(1)
+    raise TimeoutError(f"{what} not ready within {timeout:.0f}s")
+
+
 @pytest.fixture(scope="module")
-def frost_root() -> Iterator[str]:
+def frost_stack() -> Iterator[_Stack]:
     configured = os.environ.get("LMN_REPAIR_FROST_URL", "").strip().rstrip("/")
     if configured:
         _wait_until_ready(configured)
-        yield configured
+        yield _Stack(configured, os.environ.get("LMN_REPAIR_FROST_DB_CONTAINER", "").strip() or None)
         return
     try:
-        subprocess.run(["docker", "compose", "version"], check=True, capture_output=True, timeout=20)
-    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        pytest.skip("neither LMN_REPAIR_FROST_URL nor docker compose is available")
+        _docker("version", timeout=30)
+    except (FileNotFoundError, subprocess.SubprocessError):
+        pytest.skip("neither LMN_REPAIR_FROST_URL nor Docker is available")
+    name = f"{os.environ.get('LMN_REPAIR_DOCKER_PREFIX', 'lmn-repair-it')}-{uuid.uuid4().hex[:8]}"
+    db, frost, network = f"{name}-db", f"{name}-frost", f"{name}-net"
     port = _free_port()
-    image = os.environ.get("LMN_REPAIR_FROST_IMAGE", "fraunhoferiosb/frost-server:2.8")
-    compose = _COMPOSE.replace("IMAGE", image).replace("PORT", str(port))
-    project = ["docker", "compose", "-p", f"lmn-repair-it-{uuid.uuid4().hex[:8]}", "-f", "-"]
     try:
-        subprocess.run([*project, "up", "-d"], input=compose, text=True, check=True, capture_output=True, timeout=600)
+        _docker("network", "create", network)
+        _docker(
+            "run", "-d", "--name", db, "--network", network, "--tmpfs", "/var/lib/postgresql/data",
+            "-e", f"POSTGRES_DB={_DB}", "-e", f"POSTGRES_USER={_DB}", "-e", f"POSTGRES_PASSWORD={_DB}",
+            "postgis/postgis:16-3.4-alpine",
+        )
+        # Over TCP: the image's init phase runs a socket-only server first.
+        _wait_for(
+            "PostGIS",
+            lambda: _docker("exec", db, "pg_isready", "-h", "127.0.0.1", "-U", _DB, check=False).returncode == 0,
+            120,
+        )
+        env = [arg for key, value in _FROST_ENV.items() for arg in ("-e", f"{key}={value.format(db=db)}")]
+        _docker(
+            "run", "-d", "--name", frost, "--network", network, "-p", f"127.0.0.1:{port}:8080",
+            "-e", f"serviceRootUrl=http://127.0.0.1:{port}/FROST-Server", *env,
+            os.environ.get("LMN_REPAIR_FROST_IMAGE", "fraunhoferiosb/frost-server:2.8"),
+        )
         root = f"http://127.0.0.1:{port}/FROST-Server"  # the port is bound to IPv4 only
         _wait_until_ready(root)
-        yield root
+        yield _Stack(root, db)
     finally:
-        subprocess.run([*project, "down", "-v", "--remove-orphans"], input=compose, text=True, capture_output=True, timeout=180)
+        _docker("rm", "-f", "-v", frost, db, check=False, timeout=180)
+        _docker("network", "rm", network, check=False, timeout=60)
+
+
+@pytest.fixture(scope="module")
+def frost_root(frost_stack: _Stack) -> str:
+    return frost_stack.root
+
+
+@pytest.fixture(scope="module")
+def frost_db(frost_stack: _Stack) -> str:
+    if frost_stack.db is None:
+        pytest.skip("set LMN_REPAIR_FROST_DB_CONTAINER (the FROST database container) with LMN_REPAIR_FROST_URL")
+    return frost_stack.db
 
 
 class _FakeLuchtmeetnet(BaseHTTPRequestHandler):
@@ -237,12 +289,15 @@ def _create_station(endpoint: str, prefix: str, number: str, *, coordinates: lis
     return ids
 
 
-def _observe(endpoint: str, datastream_id: int, hour: int) -> int:
-    """An Observation without FeatureOfInterest, as the connector pushes them (FROST generates the FoI)."""
-    return _post(endpoint, "Observations", {
+def _observe(endpoint: str, datastream_id: int, hour: int, feature: int | None = None) -> int:
+    """An Observation; without *feature* as the connector pushes them (FROST generates the FoI)."""
+    body: dict[str, Any] = {
         "phenomenonTime": f"2026-11-20T{hour:02d}:00:00Z", "result": 12.5, "resultQuality": ["good"],
         "parameters": {"sensor_id": "luchtmeetnet"}, "Datastream": {"@iot.id": datastream_id},
-    })
+    }
+    if feature is not None:
+        body["FeatureOfInterest"] = {"@iot.id": feature}
+    return _post(endpoint, "Observations", body)
 
 
 def _get(endpoint: str, path: str, params: dict[str, str] | None = None) -> dict[str, Any]:
@@ -390,3 +445,133 @@ def test_wrong_credentials_stop_before_anything_is_planned(frost_root, api_url, 
     assert "HTTP 401" in str(exc_info.value)
     assert "not-the-password" not in str(exc_info.value)
     assert _FakeLuchtmeetnet.paths == []
+
+
+# ---------------------------------------------------------------------------
+# observedArea: the SQL that --print-sql prints, run with psql
+# ---------------------------------------------------------------------------
+
+
+def _query(db: str, sql: str) -> list[str]:
+    """Rows of a query in the database container, ``|``-separated."""
+    command = ["exec", "-i", db, "psql", "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-U", _DB, "-d", _DB]
+    return _docker(*command, input=sql, timeout=120).stdout.splitlines()
+
+
+def _run_sql_script(db: str, script: str) -> str:
+    """Run a psql script as an operator does (command tags printed); its output."""
+    proc = _docker("exec", "-i", db, "psql", "-X", "-U", _DB, "-d", _DB, input=script, check=False, timeout=120)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return proc.stdout
+
+
+def _datastream_rows(db: str) -> dict[int, tuple[str, str]]:
+    """``{id: (OBSERVED_AREA as WKT, LAST_FOI_ID)}`` of every Datastream in the database."""
+    rows = _query(
+        db,
+        'SELECT "ID", coalesce(ST_AsText("OBSERVED_AREA"), \'NULL\'), coalesce("LAST_FOI_ID"::text, \'NULL\') '
+        'FROM "DATASTREAMS";\n',
+    )
+    return {int(row.split("|")[0]): (row.split("|")[1], row.split("|")[2]) for row in rows}
+
+
+def _same_as_trigger(db: str, datastream: int, reference: int) -> bool:
+    """Whether two Datastreams have the same LAST_FOI_ID and the same OBSERVED_AREA (type, SRID, geometry)."""
+    (row,) = _query(
+        db,
+        'SELECT a."LAST_FOI_ID" = b."LAST_FOI_ID" AND GeometryType(a."OBSERVED_AREA") = GeometryType(b."OBSERVED_AREA") '
+        'AND ST_SRID(a."OBSERVED_AREA") = ST_SRID(b."OBSERVED_AREA") '
+        'AND ST_AsText(ST_Normalize(a."OBSERVED_AREA")) = ST_AsText(ST_Normalize(b."OBSERVED_AREA")) '
+        f'FROM "DATASTREAMS" a, "DATASTREAMS" b WHERE a."ID" = {int(datastream)} AND b."ID" = {int(reference)};\n',
+    )
+    return row == "t"
+
+
+def _observed_area(endpoint: str, datastream_id: int) -> Any:
+    return _get(endpoint, f"Datastreams({datastream_id})", {"$select": "observedArea"})["observedArea"]
+
+
+def _point(coordinates: list[float]) -> dict[str, Any]:
+    return {"type": "Point", "coordinates": coordinates}
+
+
+def _printed_sql(capsys: pytest.CaptureFixture[str], *args: str) -> str:
+    assert repair.main(["--print-sql", *args]) == repair.EXIT_OK
+    return capsys.readouterr().out
+
+
+def test_observed_area_sql_recomputes_what_the_api_cannot_move(frost_root, frost_db, api_url, configure, capsys):
+    prefix = _prefix()
+    write, read = f"{frost_root}/v2.0", f"{frost_root}/v1.1"
+    station, elsewhere = _STATIONS["NL10450"][1], [4.4, 52.1]
+    ids = _create_station(write, prefix, "NL10450", coordinates=_PLACEHOLDER)
+    # Observations before the repair: FROST generates their FeatureOfInterest from the placeholder
+    # Location, and its insert trigger sets each Datastream's observedArea from it.
+    _observe(write, ids["ds0"], 7)
+    generated, point = _feature_point(read, _observe(write, ids["ds0"], 8))
+    assert point == _PLACEHOLDER
+    _observe(write, ids["ds1"], 7)
+    other = _post(write, "FeaturesOfInterest", {
+        "name": f"{prefix}elsewhere", "description": "another FoI", "encodingType": "application/geo+json",
+        "feature": _point(elsewhere),
+    })
+    _observe(write, ids["ds1"], 8, feature=other)
+    hull = _observed_area(read, ids["ds1"])
+    assert hull["type"] == "LineString" and sorted(hull["coordinates"]) == sorted([_PLACEHOLDER, elsewhere])
+    # A Luchtmeetnet Datastream without Observations, and a stale Datastream of another Thing.
+    _create_station(write, prefix, "NL01491", coordinates=_PLACEHOLDER, datastreams=1)
+    stranger = _create_station(write, f"{prefix}x", "NL50002", coordinates=_PLACEHOLDER, datastreams=1)
+    stranger_feature, _ = _feature_point(read, _observe(write, stranger["ds0"], 7))
+    response = requests.patch(
+        f"{write}/FeaturesOfInterest({stranger_feature})", json={"feature": _point(elsewhere)}, auth=_AUTH, timeout=15
+    )
+    assert response.status_code == 200, response.text
+    configure(_target(frost_root, "v2.0", None), prefix)
+
+    assert repair.main(["--api-url", api_url, "--apply", "--allow-observations"]) == repair.EXIT_OK
+    capsys.readouterr()
+    assert _feature_point(read, _observe(write, ids["ds0"], 9)) == (generated, station)  # moved, and reused
+    # FROST leaves observedArea where it was, and ignores it in a PATCH: the API cannot fix it.
+    assert _observed_area(read, ids["ds0"]) == _point(_PLACEHOLDER)
+    response = requests.patch(f"{write}/Datastreams({ids['ds0']})", json={"observedArea": _point(station)}, auth=_AUTH, timeout=15)
+    assert response.status_code == 200, response.text
+    assert _observed_area(read, ids["ds0"]) == _point(_PLACEHOLDER)
+
+    # The check after the repair: nothing left to move, so exit 0; the observedAreas are reported.
+    assert repair.main(["--api-url", api_url]) == repair.EXIT_OK
+    out = capsys.readouterr().out
+    assert "--apply is refused" not in out
+    assert "2 Luchtmeetnet Datastreams have an observedArea with a corner at POINT(5 52)" in out
+
+    before = _datastream_rows(frost_db)
+    preview = _run_sql_script(frost_db, _printed_sql(capsys))
+    assert "UPDATE 2" in preview and preview.rstrip().endswith("ROLLBACK")
+    assert _datastream_rows(frost_db) == before  # the preview writes nothing
+
+    applied = _run_sql_script(frost_db, _printed_sql(capsys, "--apply"))
+    assert "UPDATE 2" in applied and applied.rstrip().endswith("COMMIT")
+    after = _datastream_rows(frost_db)
+    assert {ds for ds in after if after[ds] != before[ds]} == {ids["ds0"], ids["ds1"]}  # nothing else, other prefixes included
+    for endpoint in (read, write):
+        assert _observed_area(endpoint, ids["ds0"]) == _point(station)
+        assert _observed_area(endpoint, ids["ds1"])["type"] == "LineString"
+    assert after[ids["ds0"]][1] == str(generated)
+    assert after[ids["ds1"]][1] == str(other)
+    assert after[stranger["ds0"]] == before[stranger["ds0"]] == ("POINT(5 52)", str(stranger_feature))
+
+    # What FROST's insert trigger computes for the same Observations, with the FeaturesOfInterest
+    # where they are now, on Datastreams of a Thing the SQL does not touch.
+    reference = _create_station(write, f"{prefix}ref", "NL49565", coordinates=station)
+    for hour in (7, 8, 9):
+        _observe(write, reference["ds0"], hour, feature=generated)
+    _observe(write, reference["ds1"], 7, feature=generated)
+    _observe(write, reference["ds1"], 8, feature=other)
+    assert _same_as_trigger(frost_db, ids["ds0"], reference["ds0"])
+    assert _same_as_trigger(frost_db, ids["ds1"], reference["ds1"])
+
+    # Later Observations keep it right, and running the SQL again writes nothing.
+    _observe(write, ids["ds0"], 10)
+    assert _datastream_rows(frost_db)[ids["ds0"]] == after[ids["ds0"]]
+    assert "UPDATE 0" in _run_sql_script(frost_db, _printed_sql(capsys, "--apply"))
+    assert repair.main(["--api-url", api_url]) == repair.EXIT_OK
+    assert "observedArea with a corner" not in capsys.readouterr().out

@@ -3,6 +3,10 @@
 Luchtmeetnet is the Dutch national air quality monitoring network operated by
 RIVM. Stations measure NO2, O3, PM10, PM2.5, SO2, CO, NH3, and benzene (C6H6).
 API: https://api.luchtmeetnet.nl/open_api
+
+Values are pushed in the unit of their canonical datastream: ``FORMULA_UNITS``
+lists the unit the API serves each formula in next to that datastream, with
+the scale between the two (CO: µg/m³ from the API, mg/m³ canonical).
 """
 
 from __future__ import annotations
@@ -10,19 +14,71 @@ from __future__ import annotations
 import logging
 import math
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any, NamedTuple
 
 from app.models import SensorReading
-from app.sta.canonical import resolve
+from app.sta.canonical import CanonicalDatastream
 
 logger = logging.getLogger(__name__)
 
-# Luchtmeetnet formulas that resolve to a canonical datastream. Stations also
-# report formulas outside this list (NO, NOx, FN, C7H8, ...); those are dropped
-# at the source boundary. GET /measurements honours only the FIRST formula of a
-# comma-separated ``formula`` filter, so measurements are requested per station
-# without a formula filter and narrowed to the station's canonical components.
-SUPPORTED_FORMULAS = ["NO2", "O3", "PM10", "PM25", "SO2", "CO", "NH3", "C6H6"]
+
+class FormulaUnit(NamedTuple):
+    """How the values of one Luchtmeetnet formula map onto its canonical datastream."""
+
+    canonical: CanonicalDatastream
+    api_unit: str  # the unit GET /measurements serves the formula's values in
+    scale: Decimal = Decimal(1)  # canonical value = API value * scale
+
+
+UG_M3 = "ug/m3"  # spelled as canonical.py spells it
+UG_M3_TO_MG_M3 = Decimal("0.001")
+
+# The Luchtmeetnet formulas that are pushed: the canonical datastream of each,
+# next to the unit the API serves it in. canonical.py owns units and canonical
+# always wins (see CLAUDE.md), so a formula whose API unit differs from its
+# datastream's unit carries the scale that converts it, applied at the source
+# boundary in parse_measurements(). Formulas outside this table (NO, NOx, FN, PS,
+# BCWB, H2S, C7H8, C8H10, ...) are dropped, including any that
+# canonical.resolve() would map but whose API unit is not declared here.
+#
+# API units from GET /components/{formula} (checked Nov 2026): the descriptions
+# give NO2, O3, SO2, C6H6 and CO in µg/m³ (CO: "normally around 300 (μg/m3)",
+# live values 206-843). PM10 and PM2.5 are mass concentrations in µg/m³ (EU
+# directive 2008/50/EC). The NH3 description names no unit; the network reports
+# it in µg/m³ (live values 0.4-20). Canonical CO is mg/m³, which Samen Meten
+# maps onto as well, so Luchtmeetnet CO is scaled by 0.001.
+#
+# GET /measurements honours only the FIRST formula of a comma-separated
+# ``formula`` filter, so measurements are requested per station without a
+# formula filter and narrowed to the station's canonical components.
+FORMULA_UNITS: dict[str, FormulaUnit] = {
+    "NO2": FormulaUnit(CanonicalDatastream.NO2, UG_M3),
+    "O3": FormulaUnit(CanonicalDatastream.O3, UG_M3),
+    "PM10": FormulaUnit(CanonicalDatastream.PM10, UG_M3),
+    "PM25": FormulaUnit(CanonicalDatastream.PM2_5, UG_M3),
+    "PM2.5": FormulaUnit(CanonicalDatastream.PM2_5, UG_M3),  # some station records list both spellings
+    "SO2": FormulaUnit(CanonicalDatastream.SO2, UG_M3),
+    "CO": FormulaUnit(CanonicalDatastream.CO, UG_M3, UG_M3_TO_MG_M3),
+    "NH3": FormulaUnit(CanonicalDatastream.NH3, UG_M3),
+    "C6H6": FormulaUnit(CanonicalDatastream.BENZENE, UG_M3),
+}
+
+SUPPORTED_FORMULAS = list(FORMULA_UNITS)
+
+
+def formula_unit(formula: str) -> FormulaUnit | None:
+    """The ``FORMULA_UNITS`` entry of a formula (case and surrounding space ignored), or ``None``."""
+    return FORMULA_UNITS.get(formula.strip().upper())
+
+
+def to_canonical_unit(entry: FormulaUnit, value: float) -> float:
+    """Convert an API value of *entry*'s formula into the unit of its canonical datastream."""
+    if entry.scale == 1:
+        return value
+    # Exact decimal arithmetic: in binary floating point 226.2 * 0.001 is
+    # 0.22619999999999998, which FROST would store and serve verbatim.
+    return float(Decimal(repr(value)) * entry.scale)
 
 
 class StationDetail(NamedTuple):
@@ -95,18 +151,18 @@ def _parse_components(raw: Any) -> list[str]:
 
 
 def canonical_components(components: list[str]) -> list[str]:
-    """Resolve Luchtmeetnet formulas to canonical datastream names.
+    """Map Luchtmeetnet formulas to canonical datastream names.
 
-    Unknown formulas are dropped and the result is de-duplicated in order
-    (``PM25`` and ``PM2.5`` both map to ``pm2_5``). A station gets exactly one
-    Datastream per entry, so this is also the set of observed properties whose
-    readings can be pushed for that station.
+    Formulas without an entry in ``FORMULA_UNITS`` are dropped and the result
+    is de-duplicated in order (``PM25`` and ``PM2.5`` both map to ``pm2_5``). A
+    station gets exactly one Datastream per entry, so this is also the set of
+    observed properties whose readings can be pushed for that station.
     """
     canonical_props: list[str] = []
     for formula in components:
-        canonical = resolve(formula)
-        if canonical is not None and canonical.value not in canonical_props:
-            canonical_props.append(canonical.value)
+        entry = formula_unit(formula)
+        if entry is not None and entry.canonical.value not in canonical_props:
+            canonical_props.append(entry.canonical.value)
     return canonical_props
 
 # Source-specific descriptions per canonical observed property.
@@ -137,9 +193,9 @@ def build_entity_set(
     :param lon: WGS-84 longitude.
     :param components: List of formula strings reported by this station.
     """
-    # Resolve each formula to canonical; drop unknowns.
+    # Map each formula to canonical; drop formulas without a declared unit.
     canonical_props = canonical_components(components)
-    unknown = [formula for formula in components if resolve(formula) is None]
+    unknown = [formula for formula in components if formula_unit(formula) is None]
     if unknown:
         logger.debug(
             "Luchtmeetnet build_entity_set: unknown formulas %s for station %s — skipped",
@@ -200,6 +256,9 @@ def parse_measurements(
 ) -> list[SensorReading]:
     """Parse Luchtmeetnet measurements API response into SensorReadings.
 
+    Only formulas listed in ``FORMULA_UNITS`` are kept; their values are
+    converted from the API unit into the canonical unit (CO: µg/m³ to mg/m³).
+
     :param data: The ``data`` array from the API response, i.e. a list of
         ``{"formula": "NO2", "value": 23.5, "timestamp_measured": "..."}`` dicts.
     :param station_number: RIVM station identifier used as the sensor_id base.
@@ -218,10 +277,10 @@ def parse_measurements(
         if not formula:
             continue
 
-        canonical = resolve(formula)
-        if canonical is None:
+        declared = formula_unit(formula)
+        if declared is None:
             logger.debug(
-                "Luchtmeetnet: unknown formula %r from station %s — skipped",
+                "Luchtmeetnet: formula %r from station %s has no declared unit — skipped",
                 formula,
                 station_number,
             )
@@ -250,14 +309,14 @@ def parse_measurements(
         else:
             ts = datetime.now(UTC)
 
-        meta = canonical.meta
+        meta = declared.canonical.meta
         readings.append(
             SensorReading(
                 sensor_id=sensor_id,
                 sensor_name=sensor_name,
-                observed_property=canonical.value,
+                observed_property=declared.canonical.value,
                 unit=meta.unit,
-                value=value,
+                value=to_canonical_unit(declared, value),
                 timestamp=ts,
                 quality="good",
                 location="luchtmeetnet",
