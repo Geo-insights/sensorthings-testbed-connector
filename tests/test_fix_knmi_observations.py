@@ -709,6 +709,24 @@ def test_retire_never_deletes_when_the_count_fails(frost: FakeFrost) -> None:
     assert frost.deleted == ["5"]
 
 
+@pytest.mark.parametrize("status", [401, 403])
+def test_retire_stops_at_the_first_refused_delete(frost: FakeFrost, monkeypatch: pytest.MonkeyPatch, status: int,
+                                                   capsys: pytest.CaptureFixture[str]) -> None:
+    """Without FROST's delete role (the connector's 'write' user) the first DELETE is refused: stop, ask for admin."""
+    frost.counts["5"] = 0
+    attempts: list[str] = []
+
+    def refused(http: Any, endpoint: str, timeout: float) -> FakeResponse:
+        attempts.append(endpoint)
+        return FakeResponse(status)
+
+    monkeypatch.setattr(fix, "delete_datastream", refused)
+    assert fix.retire(frost, "/Things", "/Datastreams", PREFIX, odata_fields_for("v1.1"), apply=True)         == fix.EXIT_ERROR
+    assert len(attempts) == 1  # not once per datastream
+    out = capsys.readouterr().out
+    assert f"DELETE refused with HTTP {status}" in out and "admin credentials" in out
+
+
 @pytest.mark.parametrize("body", [{"value": []}, {"@iot.count": "0", "value": []}, {"@iot.count": 0}, []])
 def test_observation_count_needs_a_count_and_a_list(body: Any) -> None:
     class Http:
