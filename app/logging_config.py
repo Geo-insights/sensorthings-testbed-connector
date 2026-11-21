@@ -1,7 +1,7 @@
 """Structured multi-channel logging configuration.
 
 Three channels:
-  - connector:        WARNING to console, INFO to rotating file
+  - connector:        WARNING to console, INFO to rotating file (app.* module loggers too)
   - connector.events: INFO to stdout (lifecycle events)
   - connector.debug:  DEBUG to file (only when DEBUG=true)
 """
@@ -49,6 +49,15 @@ def setup_logging(debug: bool | None = None) -> None:
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
     main_logger.addHandler(file_handler)
+
+    # -- Module loggers: app.* (logging.getLogger(__name__)) -----------------
+    # Same handlers as the main channel. Without them app.* had no handler:
+    # INFO was dropped (the datastream warm-up summary among it) and WARNINGs
+    # reached stderr unformatted, through logging's last-resort handler.
+    app_logger = logging.getLogger("app")
+    app_logger.setLevel(logging.INFO)
+    app_logger.addHandler(console_handler)
+    app_logger.addHandler(file_handler)
 
     # -- Events channel: connector.events ----------------------------------
     events_logger = logging.getLogger("connector.events")
