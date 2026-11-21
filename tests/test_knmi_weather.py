@@ -439,7 +439,12 @@ class TestBuildEntitySet:
 
 
 def _make_coverage(lon: float, lat: float, timestamps: list[str], **ranges: list) -> dict:
-    """Build a CoverageJSON Coverage for testing."""
+    """Build a CoverageJSON Coverage for testing.
+
+    Like the EDR API's, it names its station (``eumetnet:locationId``); the
+    WIGOS-style id here is derived from the coordinates, so coverages at
+    different coordinates are different stations.
+    """
     cov: dict = {
         "type": "Coverage",
         "domain": {
@@ -452,6 +457,7 @@ def _make_coverage(lon: float, lat: float, timestamps: list[str], **ranges: list
             },
         },
         "ranges": {},
+        "eumetnet:locationId": f"0-20000-0-{round(lat * 100)}{round(lon * 100)}",
     }
     for param, values in ranges.items():
         cov["ranges"][param] = {

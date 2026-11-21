@@ -3,9 +3,21 @@
 Data sourced from the KNMI Data Platform EDR API (CC-BY-4.0).  Requires a
 free API key from https://developer.dataplatform.knmi.nl — set ``KNMI_API_KEY``.
 
-The EDR API returns GeoJSON for the ``/locations`` endpoint. Each Feature
-contains a ``properties`` dict with the latest 10-minute observations keyed
-by KNMI parameter codes (``ta``, ``ff``, ``dd``, etc.).
+The source reads the EDR ``/area`` query: a CoverageJSON ``CoverageCollection``
+with one Coverage per station and its latest 10-minute observations, keyed by
+KNMI parameter codes (``ta``, ``ff``, ``dd``, etc.). ``/locations`` is the
+station list (GeoJSON).
+
+Station identity: the EDR API names each station by its WIGOS station
+identifier, e.g. ``0-20000-0-06260`` (De Bilt), as ``eumetnet:locationId`` on
+every Coverage and as the Feature ``id`` in ``/locations``. The connector's
+sensor id is ``knmi-<WIGOS id>``, so it stays the same across polls, restarts
+and changes in which stations report. Until 2026-11 the parser used the
+Coverage's position in the response instead (``knmi-0`` ... ``knmi-56``), which
+shifted whenever a station appeared in or dropped out of a response;
+``scripts/migrate_knmi_sensor_ids.py`` moves the existing FROST entities to the
+stable ids. Thing, Location and Sensor names stay coordinate based
+(``KNMI-52.36-3.34``) as before, so registration keeps finding them.
 
 KNMI parameter code reference (10-minute observations):
   ta  = air temperature (0.1 °C)
@@ -24,6 +36,9 @@ KNMI parameter code reference (10-minute observations):
 from __future__ import annotations
 
 import logging
+import math
+from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -31,6 +46,112 @@ from app.models import SensorReading
 from app.sources.normalizers import KNMIWeatherNormalizer
 
 logger = logging.getLogger(__name__)
+
+# Member of an EDR Coverage that names its station: the WIGOS station identifier.
+EDR_LOCATION_ID = "eumetnet:locationId"
+# A /locations station identifies a Coverage without EDR_LOCATION_ID when it is
+# the only station within this many degrees of the Coverage's lon and lat (about
+# 50 m); the API serves the same coordinates on both endpoints.
+LOCATION_MATCH_TOLERANCE_DEG = 0.0005
+
+
+@dataclass(frozen=True)
+class KNMILocation:
+    """A station from the EDR ``/locations`` FeatureCollection."""
+
+    station_id: str  # WIGOS station identifier, e.g. "0-20000-0-06260"
+    lon: float
+    lat: float
+    name: str = ""
+
+
+def station_name_for(lat: float, lon: float) -> str:
+    """The coordinate-based station name used in Thing, Location and Sensor names.
+
+    Unchanged since the source was added: registration finds the existing
+    entities by these names.
+    """
+    return f"KNMI-{lat:.2f}-{lon:.2f}"
+
+
+def sensor_id_for(station_id: str) -> str:
+    """The connector's sensor id for a KNMI station (WIGOS id), e.g. ``knmi-0-20000-0-06260``."""
+    return f"knmi-{station_id}"
+
+
+def _station_id_value(raw: Any) -> str | None:
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return str(raw)
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
+def parse_locations(data: Any) -> list[KNMILocation]:
+    """Stations of an EDR ``/locations`` GeoJSON FeatureCollection.
+
+    Features without an id or without a Point geometry are skipped.
+    """
+    features = data.get("features") if isinstance(data, dict) else None
+    locations: list[KNMILocation] = []
+    for feature in features if isinstance(features, list) else []:
+        if not isinstance(feature, dict):
+            continue
+        station_id = _station_id_value(feature.get("id"))
+        geometry = feature.get("geometry")
+        coordinates = geometry.get("coordinates") if isinstance(geometry, dict) else None
+        if station_id is None or not isinstance(coordinates, list) or len(coordinates) < 2:
+            continue
+        try:
+            lon, lat = float(coordinates[0]), float(coordinates[1])
+        except (TypeError, ValueError):
+            continue
+        if not (math.isfinite(lon) and math.isfinite(lat)):
+            continue
+        properties = feature.get("properties")
+        name = str(properties.get("name") or "") if isinstance(properties, dict) else ""
+        locations.append(KNMILocation(station_id, lon, lat, name))
+    return locations
+
+
+def match_location(
+    lon: float,
+    lat: float,
+    locations: Sequence[KNMILocation],
+    tolerance: float = LOCATION_MATCH_TOLERANCE_DEG,
+) -> KNMILocation | None:
+    """The station at ``(lon, lat)``: the one station within ``tolerance`` degrees, else None."""
+    close = [loc for loc in locations if abs(loc.lon - lon) <= tolerance and abs(loc.lat - lat) <= tolerance]
+    if len({loc.station_id for loc in close}) != 1:
+        return None
+    return close[0]
+
+
+def coverage_station_id(
+    coverage: dict[str, Any],
+    lon: float,
+    lat: float,
+    locations: Sequence[KNMILocation] = (),
+) -> str | None:
+    """A Coverage's WIGOS station id: its ``eumetnet:locationId``, else the
+    ``/locations`` station at its coordinates; None when neither identifies it."""
+    station_id = _station_id_value(coverage.get(EDR_LOCATION_ID))
+    if station_id:
+        return station_id
+    match = match_location(lon, lat, locations)
+    return match.station_id if match else None
+
+
+def coverages_without_station_id(data: Any) -> int:
+    """How many Coverages of an EDR response carry no ``eumetnet:locationId``."""
+    coverages = data.get("coverages") if isinstance(data, dict) else None
+    if not isinstance(coverages, list):
+        return 0
+    return sum(
+        1 for cov in coverages if isinstance(cov, dict) and _station_id_value(cov.get(EDR_LOCATION_ID)) is None
+    )
 
 # Source-specific descriptions per canonical observed property.
 _DESCRIPTIONS: dict[str, str] = {
@@ -86,7 +207,12 @@ def build_entity_set(
     lat: float,
     lon: float,
 ) -> dict[str, Any]:
-    """Build a CLIMATE_ADAPTATION_ENTITY_SETS-format dict for one KNMI station."""
+    """Build a CLIMATE_ADAPTATION_ENTITY_SETS-format dict for one KNMI station.
+
+    ``station_id`` is the station's WIGOS id for the EDR API (the Buienradar
+    station number on the legacy feed); ``station_name`` names the Thing,
+    Location and Sensor.
+    """
     sid = str(station_id)
     return {
         "site_key": "nl",
@@ -111,7 +237,7 @@ def build_entity_set(
         },
         "sensors": [
             {
-                "sensor_id": f"knmi-{sid}",
+                "sensor_id": sensor_id_for(sid),
                 "name": f"KNMI {station_name} sensor",
                 "description": f"KNMI official weather sensor at {station_name}.",
                 "encodingType": "application/json",
@@ -126,20 +252,29 @@ def build_entity_set(
 
 def parse_edr_locations(
     data: dict[str, Any],
-    station_names: dict[str, str] | None = None,
+    known_locations: Sequence[KNMILocation] = (),
 ) -> tuple[list[dict[str, Any]], list[SensorReading]]:
     """Parse a KNMI EDR CoverageJSON area/position response.
 
     The EDR ``/area`` endpoint returns a ``CoverageCollection`` with one
     ``Coverage`` per station.  Each coverage has:
 
+    - ``eumetnet:locationId`` — the station's WIGOS id
     - ``domain.axes.x/y`` — lon/lat
     - ``domain.axes.t`` — list of ISO timestamps
     - ``ranges`` — dict of parameter code → NdArray with ``values``
 
+    Each station is identified by its WIGOS id (see :func:`coverage_station_id`;
+    ``known_locations`` from ``/locations`` identify a Coverage without one by
+    its coordinates), never by its position in the response. A Coverage that
+    neither identifies is skipped, as is a second Coverage of the same station,
+    so a station's readings never carry another id and two stations never share
+    one.
+
     Returns:
-        (stations, readings) — station metadata dicts for entity registration
-        and SensorReadings from the latest observations per station.
+        (stations, readings) — station metadata dicts (``id`` is the WIGOS id)
+        for entity registration and SensorReadings from the latest
+        observations per station.
     """
     coverages = data.get("coverages", [])
     if not isinstance(coverages, list):
@@ -147,9 +282,11 @@ def parse_edr_locations(
 
     stations: list[dict[str, Any]] = []
     all_readings: list[SensorReading] = []
-    names = station_names or {}
+    seen: set[str] = set()
+    unidentified: list[str] = []
+    duplicates: list[str] = []
 
-    for i, cov in enumerate(coverages):
+    for cov in coverages:
         if not isinstance(cov, dict):
             continue
 
@@ -167,13 +304,19 @@ def parse_edr_locations(
         lon = float(x_vals[0])
         lat = float(y_vals[0])
 
-        # Station ID: derive from coordinates (EDR area response has no station ID)
-        station_id = str(i)
-        station_name = names.get(station_id, f"KNMI-{lat:.2f}-{lon:.2f}")
+        station_id = coverage_station_id(cov, lon, lat, known_locations)
+        if station_id is None:
+            unidentified.append(f"({lat}, {lon})")
+            continue
+        if station_id in seen:
+            duplicates.append(station_id)
+            continue
+        seen.add(station_id)
+        name = station_name_for(lat, lon)
 
         stations.append({
             "id": station_id,
-            "name": station_name,
+            "name": name,
             "lat": lat,
             "lon": lon,
         })
@@ -209,15 +352,26 @@ def parse_edr_locations(
 
         normalizer = KNMIWeatherNormalizer.model_validate(payload)
         readings = normalizer.to_readings(
-            sensor_id=f"knmi-{station_id}",
-            sensor_name=f"KNMI {station_name} sensor",
-            thing_name=f"KNMI {station_name}",
+            sensor_id=sensor_id_for(station_id),
+            sensor_name=f"KNMI {name} sensor",
+            thing_name=f"KNMI {name}",
             timestamp=ts,
             location="nl",
             quality="good",
         )
         all_readings.extend(readings)
 
+    if unidentified:
+        logger.warning(
+            "KNMI EDR: skipped %d coverage(s) without a station id (no %s and no /locations station at "
+            "their coordinates) at (lat, lon) %s",
+            len(unidentified), EDR_LOCATION_ID, ", ".join(unidentified[:10]),
+        )
+    if duplicates:
+        logger.warning(
+            "KNMI EDR: skipped %d further coverage(s) of station(s) already in the response: %s",
+            len(duplicates), ", ".join(sorted(set(duplicates))[:10]),
+        )
     return stations, all_readings
 
 
