@@ -26,7 +26,10 @@ Selections (one per run; each is a dry run unless --apply is given)
     kept. sensor_name because co-located Sensor.Community sensors share a
     sensor_id, and so a datastream: only sensor_name tells their readings apart.
     Rows that differ in sensor_name are never duplicates (a missing sensor_name on
-    both sides counts as equal).
+    both sides counts as equal). For KNMI rows (sensor_id 'knmi-%') the
+    station (PARAMETERS thing_name) stands in for sensor_id: until 2026-11 their
+    sensor_id was the station's place in the EDR response, so a restart re-post
+    after that place shifted carries another sensor_id for the same reading.
     RESULT_BOOLEAN and RESULT_JSON are compared too, so a boolean or JSON result
     is never taken for a duplicate of a different one. Rows that share a
     datastream and phenomenonTime but differ in value or label are conflicts:
@@ -169,8 +172,10 @@ Runbook (production)
    scripts/fix_knmi_observations.py: their conflict groups keep --duplicates
    away from those times.
 7. --duplicates last: canary, then everything.
-8. Consider VACUUM (ANALYZE) "OBSERVATIONS" in a session with statement_timeout = 0:
-   the dead rows stay below autovacuum's threshold (20% of the table).
+8. Consider VACUUM (ANALYZE, PARALLEL 0) "OBSERVATIONS" in a session with
+   statement_timeout = 0: the dead rows stay below autovacuum's threshold (20% of
+   the table). PARALLEL 0: a parallel vacuum's shared memory does not fit
+   docker's default 64 MB /dev/shm ("could not resize shared memory segment").
 If a run is interrupted, run the same command again. To undo: --restore
 --archive FILE (a dry run), then the same with --apply.
 
@@ -322,9 +327,11 @@ def same_reading(a: str, b: str, *, by_station: bool = False) -> str:
     return " AND ".join(parts)
 
 
-def reading_key(x: str) -> str:
-    """The same columns as a PARTITION BY list (NULLs share a partition, as with IS NOT DISTINCT FROM)."""
-    return ", ".join([*(f'{x}."{c}"' for c in READING_COLUMNS), *(label(x, k) for k in LABEL_KEYS)])
+def reading_key(x: str, *, by_station: bool = False) -> str:
+    """The same columns as a PARTITION BY list (NULLs share a partition, as with IS NOT DISTINCT FROM).
+    With by_station, a KNMI row's sensor_id is its station (see station()), as in same_reading()."""
+    labels = (station(x) if by_station and k == "sensor_id" else label(x, k) for k in LABEL_KEYS)
+    return ", ".join([*(f'{x}."{c}"' for c in READING_COLUMNS), *labels])
 
 
 def tgv_prefix(o: str) -> str:
@@ -980,7 +987,8 @@ WITH g AS MATERIALIZED (
      GROUP BY 1, 2
     HAVING count(*) > 1
 ), r AS (
-    SELECT x.*, row_number() OVER (PARTITION BY x."DATASTREAM_ID", x."PHENOMENON_TIME_START", {reading_key("x")}
+    SELECT x.*, row_number() OVER (PARTITION BY x."DATASTREAM_ID", x."PHENOMENON_TIME_START",
+                                                    {reading_key("x", by_station=True)}
                                    ORDER BY x."ID") AS k
       FROM g CROSS JOIN LATERAL (SELECT {cols}{extra} FROM "OBSERVATIONS" y
                                   WHERE y."DATASTREAM_ID" = g.ds AND y."PHENOMENON_TIME_START" = g.t) x
@@ -1027,16 +1035,18 @@ def dup_recheck() -> str:
     """A copy with a lower ID still exists, and no other reading is at that time."""
     same_time = ('k."DATASTREAM_ID" = o."DATASTREAM_ID" AND k."PHENOMENON_TIME_START" = o."PHENOMENON_TIME_START"')
     return (
-        f'EXISTS (SELECT 1 FROM "OBSERVATIONS" k WHERE {same_time} AND k."ID" < o."ID" AND {same_reading("k", "o")})'
-        f' AND NOT EXISTS (SELECT 1 FROM "OBSERVATIONS" k WHERE {same_time} AND NOT ({same_reading("k", "o")}))'
+        f'EXISTS (SELECT 1 FROM "OBSERVATIONS" k WHERE {same_time} AND k."ID" < o."ID" '
+        f'AND {same_reading("k", "o", by_station=True)})'
+        f' AND NOT EXISTS (SELECT 1 FROM "OBSERVATIONS" k WHERE {same_time} '
+        f'AND NOT ({same_reading("k", "o", by_station=True)}))'
     )
 
 
 class DuplicateSelection(Selection):
     name = DUPLICATES
     summary = ("exact duplicates within a datastream: same DATASTREAM_ID, PHENOMENON_TIME_START/END, "
-               "RESULT_TYPE/NUMBER/STRING/BOOLEAN/JSON and label (sensor_id, observed_property, sensor_name); "
-               "the lowest ID stays")
+               "RESULT_TYPE/NUMBER/STRING/BOOLEAN/JSON and label (sensor_id, observed_property, sensor_name; "
+               "a KNMI row's station for its sensor_id); the lowest ID stays")
 
     def __init__(self, catalogue: Catalogue, args: argparse.Namespace) -> None:
         super().__init__(catalogue, args)

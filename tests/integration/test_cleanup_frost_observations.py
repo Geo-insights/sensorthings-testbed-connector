@@ -102,6 +102,12 @@ SEED: dict[str, tuple[str, int, str, tuple[str, str, str] | None]] = {
     "noname_b": ("sc.pressure", 49, "1020.0", (SC, "pressure", "SensorCommunity 93182")),
     "knmi_dup_a": ("knmi.relative_humidity", 30, "90", (KNMI, "relative_humidity", "KNMI 06344")),
     "knmi_dup_b": ("knmi.relative_humidity", 30, "90", (KNMI, "relative_humidity", "KNMI 06344")),
+    # KNMI restart re-post after the station's place in the EDR response shifted: same station, another sensor_id
+    "knmi_pos_a": ("knmi.relative_humidity", 31, "91", ("knmi-3", "relative_humidity", "KNMI 06344")),
+    "knmi_pos_b": ("knmi.relative_humidity", 31, "91", ("knmi-4", "relative_humidity", "KNMI 06344")),
+    # the same positional sensor_id for two stations: another reading, a conflict
+    "knmi_pos_c": ("knmi.relative_humidity", 32, "92", ("knmi-3", "relative_humidity", "KNMI 06344")),
+    "knmi_pos_d": ("knmi.relative_humidity", 32, "92", ("knmi-3", "relative_humidity", "KNMI 06260")),
     # --misrouted-leftovers: PM10 readings of 93182 in its pressure datastream
     "lo_twin": ("sc.pressure", 50, "12.5", (SC, "pm10", "SensorCommunity 93182")),
     "lo_twin_target": ("sc.pm10", 50, "12.5", (SC, "pm10", "SensorCommunity 93182")),
@@ -128,7 +134,7 @@ PARAMS: dict[str, dict[str, Any]] = {
 }
 
 TGV_MISPLACED = {"tgv_in_sc_first", "tgv_in_sc_mid", "tgv_in_sc_last", "tgv_in_sc_hum", "tgv_in_knmi"}
-DUPLICATES = {"dup1_b", "dup1_c", "dup6_b", "dup8_b", "noname_b", "knmi_dup_b"}
+DUPLICATES = {"dup1_b", "dup1_c", "dup6_b", "dup8_b", "noname_b", "knmi_dup_b", "knmi_pos_b"}
 LEFTOVERS = {"lo_twin"}
 
 
@@ -414,9 +420,10 @@ def test_duplicates_keep_the_lowest_id_and_leave_conflicts(fresh: Stack, tmp_pat
 
     assert _script(fresh, "--duplicates", "--chunk-rows", "5") == 0
     out = capsys.readouterr().out
-    assert re.search(r"exact duplicates to delete: 6 in 2 datastreams", out)
-    # conflicts: 41 (2 rows), 42 (3), 43 (2), 44 (2), 46 (2), 48 (2: sensor_name); the twin at 42 stays as well
-    assert re.search(r"conflicts \(same datastream and phenomenonTime, another value or label\): 6 times, 13 rows", out)
+    assert re.search(r"exact duplicates to delete: 7 in 2 datastreams", out)
+    # conflicts: 41 (2 rows), 42 (3), 43 (2), 44 (2), 46 (2), 48 (2: sensor_name), KNMI 32 (2: another station);
+    # the twin at 42 stays as well
+    assert re.search(r"conflicts \(same datastream and phenomenonTime, another value or label\): 7 times, 15 rows", out)
     assert re.search(r"exact twins of another row of their group \(left as well\): 1\n", out)
     assert "left alone: 2 datastreams of TGV Things (5 rows)" in out  # with the twins at minute 11
 
