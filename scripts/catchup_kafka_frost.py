@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 
@@ -27,8 +28,6 @@ from app.sources.tgv_kafka_mapping import avro_batch_to_sensor_readings  # noqa:
 FROST_BASE = "https://sta.wbd-rd.nl/FROST-Server/v1.1"
 FROST_AUTH = (settings.auth_username, settings.auth_password)
 DS_IDS = dict(settings.datastream_ids)  # stream_key → frost DS id
-
-import os
 
 DB_URL = os.getenv("SUPABASE_DB_URL", "")
 if not DB_URL:
