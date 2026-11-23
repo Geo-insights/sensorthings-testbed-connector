@@ -1292,13 +1292,17 @@ def _ids_rows(batch: Sequence[tuple[int, int | None]]) -> str:
 def twin_sql(o: str, prefix: str) -> str:
     """--require-twin: another row holds the same reading as row o (the --duplicates definition, a KNMI row's
     station by thing_name): in o's datastream with a lower ID, or in another datastream of o's Thing or of the Thing
-    o's thing_name label names. The lower ID keeps one copy of rows listed together in one DELETE."""
+    o's thing_name label names. The lower ID keeps one copy of rows listed together in one DELETE.
+
+    The datastreams are an ARRAY(...) compared with = ANY, not IN (subquery): in a DELETE's WHERE PostgreSQL turns
+    an IN subquery into a semi join and probes OBS_DS_PHENTIME by phenomenonTime alone (a scan of the whole index,
+    past statement_timeout on production); = ANY of an array keeps DATASTREAM_ID as the leading index condition."""
     return f"""EXISTS (SELECT 1 FROM "OBSERVATIONS" x
-         WHERE x."DATASTREAM_ID" IN (
+         WHERE x."DATASTREAM_ID" = ANY(ARRAY(
                    SELECT td."ID" FROM "DATASTREAMS" td
                     WHERE td."THING_ID" = (SELECT sd."THING_ID" FROM "DATASTREAMS" sd WHERE sd."ID" = {o}."DATASTREAM_ID")
                        OR td."THING_ID" IN (SELECT tt."ID" FROM "THINGS" tt
-                                             WHERE tt."NAME" = {pressure.sql_literal(prefix)} || {label(o, 'thing_name')}))
+                                             WHERE tt."NAME" = {pressure.sql_literal(prefix)} || {label(o, 'thing_name')})))
            AND x."PHENOMENON_TIME_START" = {o}."PHENOMENON_TIME_START"
            AND (x."DATASTREAM_ID" <> {o}."DATASTREAM_ID" OR x."ID" < {o}."ID")
            AND {same_reading("x", o, by_station=True)})"""
