@@ -264,6 +264,9 @@ _ALIASES: dict[str, CanonicalDatastream] = {
     "noise_laeq": CanonicalDatastream.NOISE_LAEQ,
     "noise_lamin": CanonicalDatastream.NOISE_LAMIN,
     "noise_lamax": CanonicalDatastream.NOISE_LAMAX,
+    # What the data API actually sends for DNMS min/max (noise_LA_min / noise_LA_max), lower-cased by resolve()
+    "noise_la_min": CanonicalDatastream.NOISE_LAMIN,
+    "noise_la_max": CanonicalDatastream.NOISE_LAMAX,
     # Buienradar
     "groundtemperature": CanonicalDatastream.GROUND_TEMPERATURE,
     "feeltemperature": CanonicalDatastream.FEEL_TEMPERATURE,

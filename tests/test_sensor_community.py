@@ -192,6 +192,23 @@ def test_parse_noise_sensor_lamax_value() -> None:
     assert by_prop["noise_lamax"].value == pytest.approx(65.8)
 
 
+def test_parse_noise_sensor_live_api_value_types() -> None:
+    """The data API sends DNMS min/max as noise_LA_min / noise_LA_max (seen 2026-11-24 for all 881 NL DNMS
+    sensors, sensor_type 'DNMS (Laerm)'); they must land on LAmin/LAmax, not be skipped as unknown."""
+    entry = _dnms_entry()
+    entry["sensor"]["sensor_type"]["name"] = "DNMS (Laerm)"
+    entry["sensordatavalues"] = [
+        {"value_type": "noise_LAeq", "value": "52.4"},
+        {"value_type": "noise_LA_min", "value": "44.1"},
+        {"value_type": "noise_LA_max", "value": "65.8"},
+    ]
+    by_prop = {r.observed_property: r for r in parse_sensor_data([entry])}
+    assert set(by_prop) == {"noise_laeq", "noise_lamin", "noise_lamax"}
+    assert by_prop["noise_lamin"].value == pytest.approx(44.1)
+    assert by_prop["noise_lamax"].value == pytest.approx(65.8)
+    assert by_prop["noise_lamin"].unit == by_prop["noise_lamax"].unit == "dB(A)"
+
+
 # ---------------------------------------------------------------------------
 # parse_sensor_data — temperature/humidity/pressure sensor (BME280)
 # ---------------------------------------------------------------------------
@@ -247,9 +264,9 @@ _SC_UNITS = {
     "counts_per_minute": "1/min", "hv_pulses": "1", "counts": "1", "sample_time_ms": "ms",
 }  # fmt: skip
 
-# What each of them resolves to today. noise_LA_min/noise_LA_max resolve to nothing (the
-# aliases are spelled noise_lamin/noise_lamax), so the mapper drops them: adding aliases
-# would register LAmin/LAmax datastreams for every DNMS station, a product decision.
+# What each of them resolves to today. noise_LA_min/noise_LA_max resolve to LAmin/LAmax
+# (aliases added 2026-11-24 on the owner's decision; this registers LAmin/LAmax datastreams
+# for every DNMS station).
 _CD = CanonicalDatastream
 _SC_CANONICAL: dict[str, CanonicalDatastream | None] = {
     "P0": None, "P1": _CD.PM10, "P2": _CD.PM2_5, "P4": None,
@@ -257,7 +274,7 @@ _SC_CANONICAL: dict[str, CanonicalDatastream | None] = {
     "TS": None,
     "temperature": _CD.TEMPERATURE, "humidity": _CD.HUMIDITY,
     "pressure": _CD.PRESSURE, "pressure_at_sealevel": None,
-    "noise_LAeq": _CD.NOISE_LAEQ, "noise_LA_min": None, "noise_LA_max": None,
+    "noise_LAeq": _CD.NOISE_LAEQ, "noise_LA_min": _CD.NOISE_LAMIN, "noise_LA_max": _CD.NOISE_LAMAX,
     "co2_ppm": None,
     "counts_per_minute": None, "hv_pulses": None, "counts": None, "sample_time_ms": None,
 }  # fmt: skip
