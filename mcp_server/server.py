@@ -586,6 +586,18 @@ app = mcp.streamable_http_app(
 )
 app.routes.insert(0, Route("/freshness", freshness_endpoint))
 
+
+async def health_endpoint(request):  # type: ignore[no-untyped-def]
+    """Liveness for the container healthcheck (GET /health in the FROST host's compose file).
+
+    Answers without calling FROST or Supabase: Caddy waits for this container to be healthy,
+    so a slow upstream must not mark it unhealthy. Upstream state is what /freshness reports."""
+    from starlette.responses import JSONResponse as _JSONResponse
+    return _JSONResponse({"status": "ok"})
+
+
+app.routes.insert(0, Route("/health", health_endpoint))
+
 # Auth + Pricing HTML pages
 app.routes.insert(0, Route("/auth", auth_page))
 app.routes.insert(0, Route("/pricing", pricing_page))
