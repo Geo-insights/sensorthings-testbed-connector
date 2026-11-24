@@ -13,6 +13,11 @@ from app.sources.ohnics import build_entity_set, parse_sensor_readings
 
 logger = logging.getLogger("connector.ohnics")
 
+# Canonical keys (app/sta/canonical.py) of what every Ohnics sensor measures. They become the
+# Datastreams' observed_property and streamKey; registration finds a Datastream registered
+# earlier under "pm25" by its name ("... sensor - PM2.5 concentration"), so none is duplicated.
+_PROPERTIES = ("pm2_5", "air_temperature")
+
 
 class OhnicsPollingSource(RestPollingSource):
     """Polls the Ohnics 5min.json endpoint for air quality readings in Delft."""
@@ -42,7 +47,7 @@ class OhnicsPollingSource(RestPollingSource):
         for name, meta in self._discovered_sensors.items():
             lat = meta.get("lat", 52.01)
             lon = meta.get("lon", 4.36)
-            props = meta.get("properties", ["pm25"])
+            props = meta.get("properties", list(_PROPERTIES))
             sets.append(build_entity_set(name, lat, lon, props))
         return sets
 
@@ -67,7 +72,7 @@ class OhnicsPollingSource(RestPollingSource):
             if name not in self._discovered_sensors:
                 lat = sensor_data.get("Lat", sensor_data.get("lat", 0.0))
                 lon = sensor_data.get("Long", sensor_data.get("Lon", sensor_data.get("lon", 0.0)))
-                self._discovered_sensors[name] = {"lat": lat, "lon": lon, "properties": ["pm25", "air_temperature"]}
+                self._discovered_sensors[name] = {"lat": lat, "lon": lon, "properties": list(_PROPERTIES)}
                 logger.info("Discovered Ohnics sensor: %s (lat=%s, lon=%s)", name, lat, lon)
 
             readings = parse_sensor_readings(sensor_data)

@@ -428,7 +428,8 @@ class _FakeOhnics:
 
 
 def test_ohnics_restart_reposts_nothing_although_its_datastreams_say_pm25(monkeypatch):
-    """Ohnics registers its PM2.5 Datastreams as "pm25"; its readings say "pm2_5"."""
+    """Ohnics' PM2.5 Datastreams on FROST say "pm25" (registered so until 2026-11-24); its readings say
+    "pm2_5", and so does what the source registers now. Seeding must still match them."""
     from app.services.ohnics_source import OhnicsPollingSource
 
     source = OhnicsPollingSource()
@@ -436,7 +437,7 @@ def test_ohnics_restart_reposts_nothing_although_its_datastreams_say_pm25(monkey
     source._prefix = "de-"
     readings = asyncio.run(source._do_fetch_readings())
     (sensor,) = source.entity_sets()[0]["sensors"]
-    assert sorted(sensor["observed_properties"]) == ["air_temperature", "pm25"]
+    assert sorted(sensor["observed_properties"]) == ["air_temperature", "pm2_5"]
     assert sorted(r.observed_property for r in readings) == ["air_temperature", "pm2_5"]
     _use_target(monkeypatch, BASE, prefix="GEO_")
     _serve(monkeypatch, _page(_stored(readings, {
