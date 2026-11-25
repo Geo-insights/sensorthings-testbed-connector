@@ -9,7 +9,21 @@ from dotenv import load_dotenv
 
 from app.frost.target import FrostTarget
 
-load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+SKIP_DOTENV_VAR = "CONNECTOR_SKIP_DOTENV"
+
+
+def load_dotenv_unless_skipped(path: Path) -> bool:
+    """Load ``path`` into the environment unless ``CONNECTOR_SKIP_DOTENV=1``.
+
+    The test suite sets it (tests/conftest.py) so a developer's .env (real FROST
+    URLs, credentials, Kafka device mappings) never reaches the tests.
+    """
+    if os.getenv(SKIP_DOTENV_VAR, "").strip() == "1":
+        return False
+    return load_dotenv(path)
+
+
+load_dotenv_unless_skipped(Path(__file__).resolve().parents[1] / ".env")
 
 
 def _load_datastream_map() -> dict[str, str]:
