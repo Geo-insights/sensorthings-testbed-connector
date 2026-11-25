@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Readings History</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #0f172a; --muted: #64748b; --grid: #e2e8f0;
+    --card: #f8fafc; --border: #e2e8f0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0b1220; --fg: #e2e8f0; --muted: #94a3b8; --grid: #1e293b;
+      --card: #111c2e; --border: #1e293b;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0b1220; --fg: #e2e8f0; --muted: #94a3b8; --grid: #1e293b;
+    --card: #111c2e; --border: #1e293b;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--fg); padding: 14px;
+    font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  }
+  h1 { font-size: 15px; font-weight: 650; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .wrap { position: relative; margin-top: 12px; }
+  svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .legend { display: flex; flex-wrap: wrap; gap: 10px 16px; margin-top: 12px; }
+  .lg { display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer; user-select: none; }
+  .lg.off { opacity: 0.35; }
+  .sw { width: 10px; height: 10px; border-radius: 2px; flex: none; }
+  .tip {
+    position: absolute; pointer-events: none; opacity: 0;
+    background: var(--card); border: 1px solid var(--border); border-radius: 7px;
+    padding: 7px 9px; font-size: 12px; white-space: nowrap;
+    box-shadow: 0 4px 14px rgba(0,0,0,.14); transition: opacity .1s; z-index: 5;
+  }
+  .tip b { font-weight: 620; }
+  .tip .t-meta { color: var(--muted); font-size: 11px; margin-top: 2px; }
+  .empty { color: var(--muted); padding: 28px 0; text-align: center; }
+  .attr { color: var(--muted); font-size: 11px; margin-top: 12px;
+          border-top: 1px solid var(--border); padding-top: 9px; }
+  text { fill: var(--muted); font-size: 11px; }
+  .ax { stroke: var(--grid); }
+</style>
+</head>
+<body>
+<div id="root"><div class="empty">Waiting for data&hellip;</div></div>
+
+<script>
+const PALETTE = ["#3b82f6","#f59e0b","#10b981","#ec4899","#8b5cf6","#06b6d4","#ef4444","#84cc16"];
+const hidden = new Set();
+let current = null;
+
+/* ---------- MCP Apps bridge (JSON-RPC 2.0 over postMessage) ---------- */
+let rpcId = 0;
+const pending = new Map();
+
+function request(method, params) {
+  const id = ++rpcId;
+  window.parent.postMessage({ jsonrpc: "2.0", id, method, params: params || {} }, "*");
+  return new Promise((resolve) => pending.set(id, resolve));
+}
+function notify(method, params) {
+  window.parent.postMessage({ jsonrpc: "2.0", method, params: params || {} }, "*");
+}
+
+window.addEventListener("message", (event) => {
+  const msg = event.data;
+  if (!msg || msg.jsonrpc !== "2.0") return;
+  if (msg.id != null && pending.has(msg.id)) {
+    pending.get(msg.id)(msg.result);
+    pending.delete(msg.id);
+    return;
+  }
+  if (msg.method === "ui/notifications/tool-result") {
+    const r = (msg.params && (msg.params.result || msg.params)) || {};
+    const data = r.structuredContent || r.structured_content || r;
+    render(data);
+  } else if (msg.method === "ui/notifications/host-context-changed") {
+    const theme = msg.params && msg.params.theme;
+    if (theme === "light" || theme === "dark") {
+      document.documentElement.setAttribute("data-theme", theme);
+      if (current) render(current);
+    }
+  }
+});
+
+(async () => {
+  await request("ui/initialize", {});
+  notify("ui/notifications/initialized", {});
+})();
+
+let lastH = 0;
+function reportSize() {
+  const h = Math.ceil(document.body.scrollHeight);
+  if (h && h !== lastH) {
+    lastH = h;
+    notify("ui/notifications/size-changed", { height: h });
+  }
+}
+
+/* ---------- chart ---------- */
+function fmtTime(d, span) {
+  if (span <= 2 * 864e5) {
+    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+  return d.toLocaleDateString([], { day: "numeric", month: "short" });
+}
+
+function niceTicks(lo, hi, count) {
+  if (lo === hi) { lo -= 1; hi += 1; }
+  const raw = (hi - lo) / count;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const norm = raw / mag;
+  const step = (norm >= 5 ? 10 : norm >= 2 ? 5 : norm >= 1 ? 2 : 1) * mag;
+  const out = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi + step * 1e-9; v += step) {
+    out.push(Math.round(v / step) * step);
+  }
+  return out;
+}
+
+function render(data) {
+  current = data;
+  const root = document.getElementById("root");
+  const stations = (data && data.stations) || [];
+
+  const series = stations.map((s, i) => ({
+    name: s.station_name || ("Station " + (i + 1)),
+    source: s.source || "",
+    attribution: s.source_attribution || "",
+    color: PALETTE[i % PALETTE.length],
+    unit: (s.readings && s.readings[0] && s.readings[0].unit) || "",
+    pts: (s.readings || [])
+      .map((r) => ({ t: Date.parse(r.timestamp), v: Number(r.value) }))
+      .filter((p) => Number.isFinite(p.t) && Number.isFinite(p.v))
+      .sort((a, b) => a.t - b.t),
+  })).filter((s) => s.pts.length > 0);
+
+  const param = (data && data.parameter) || "reading";
+  const unitSeries = series.find((s) => s.unit);
+  const unit = unitSeries ? unitSeries.unit : "";
+  const total = (data && data.total_readings) || series.reduce((n, s) => n + s.pts.length, 0);
+
+  if (!series.length) {
+    root.innerHTML = "<h1>" + esc(param) + "</h1>" +
+      '<div class="empty">No readings in this period.</div>';
+    reportSize();
+    return;
+  }
+
+  const active = series.filter((s) => !hidden.has(s.name));
+  const shown = active.length ? active : series;
+
+  let tLo = Infinity, tHi = -Infinity, vLo = Infinity, vHi = -Infinity;
+  for (const s of shown) for (const p of s.pts) {
+    if (p.t < tLo) tLo = p.t;
+    if (p.t > tHi) tHi = p.t;
+    if (p.v < vLo) vLo = p.v;
+    if (p.v > vHi) vHi = p.v;
+  }
+  if (tLo === tHi) { tLo -= 36e5; tHi += 36e5; }
+
+  const W = 680, H = 260;
+  const M = { t: 10, r: 12, b: 26, l: 46 };
+  const iw = W - M.l - M.r, ih = H - M.t - M.b;
+
+  const yTicks = niceTicks(vLo, vHi, 4);
+  const yLo = Math.min(vLo, yTicks[0]);
+  const yHi = Math.max(vHi, yTicks[yTicks.length - 1]);
+
+  const X = (t) => M.l + ((t - tLo) / (tHi - tLo)) * iw;
+  const Y = (v) => M.t + ih - ((v - yLo) / (yHi - yLo || 1)) * ih;
+
+  const span = tHi - tLo;
+  const xTicks = [];
+  const nX = Math.min(6, Math.max(2, Math.floor(iw / 110)));
+  for (let i = 0; i <= nX; i++) xTicks.push(tLo + (span * i) / nX);
+
+  let svg = '<svg viewBox="0 0 ' + W + " " + H + '" role="img" aria-label="Time series of ' + esc(param) + '">';
+  for (const v of yTicks) {
+    const y = Y(v);
+    svg += '<line class="ax" x1="' + M.l + '" y1="' + y.toFixed(1) +
+           '" x2="' + (W - M.r) + '" y2="' + y.toFixed(1) + '"/>';
+    svg += '<text x="' + (M.l - 8) + '" y="' + (y + 3.5).toFixed(1) +
+           '" text-anchor="end">' + trim(v) + "</text>";
+  }
+  for (const t of xTicks) {
+    svg += '<text x="' + X(t).toFixed(1) + '" y="' + (H - 8) +
+           '" text-anchor="middle">' + esc(fmtTime(new Date(t), span)) + "</text>";
+  }
+  for (const s of shown) {
+    const d = s.pts.map((p, i) => (i ? "L" : "M") + X(p.t).toFixed(1) + " " + Y(p.v).toFixed(1)).join(" ");
+    svg += '<path d="' + d + '" fill="none" stroke="' + s.color +
+           '" stroke-width="1.9" stroke-linejoin="round" stroke-linecap="round"/>';
+    if (s.pts.length === 1) {
+      svg += '<circle cx="' + X(s.pts[0].t).toFixed(1) + '" cy="' + Y(s.pts[0].v).toFixed(1) +
+             '" r="3" fill="' + s.color + '"/>';
+    }
+  }
+  svg += '<g id="hov"></g></svg>';
+
+  const legend = series.map((s) =>
+    '<span class="lg ' + (hidden.has(s.name) ? "off" : "") + '" data-n="' + esc(s.name) + '">' +
+    '<span class="sw" style="background:' + s.color + '"></span>' + esc(s.name) + "</span>"
+  ).join("");
+
+  const attrs = [...new Set(series.map((s) => s.attribution).filter(Boolean))];
+
+  root.innerHTML =
+    "<h1>" + esc(param) +
+      (unit ? ' <span class="sub" style="font-weight:400">(' + esc(unit) + ")</span>" : "") + "</h1>" +
+    '<div class="sub">' + total + " reading" + (total === 1 ? "" : "s") + " &middot; " +
+      series.length + " station" + (series.length === 1 ? "" : "s") + " &middot; " +
+      esc(new Date(tLo).toLocaleString()) + " &rarr; " + esc(new Date(tHi).toLocaleString()) + "</div>" +
+    '<div class="wrap">' + svg + '<div class="tip" id="tip"></div></div>' +
+    '<div class="legend">' + legend + "</div>" +
+    (attrs.length ? '<div class="attr">' + attrs.map(esc).join(" &middot; ") + "</div>" : "");
+
+  root.querySelectorAll(".lg").forEach((el) => {
+    el.addEventListener("click", () => {
+      const n = el.dataset.n;
+      if (hidden.has(n)) hidden.delete(n);
+      else if (series.length - hidden.size > 1) hidden.add(n);
+      render(current);
+    });
+  });
+
+  wireHover(root, shown, { X: X, Y: Y, M: M, W: W, H: H, unit: unit });
+  reportSize();
+}
+
+function wireHover(root, shown, g) {
+  const svg = root.querySelector("svg");
+  const tip = root.querySelector("#tip");
+  const hov = root.querySelector("#hov");
+  if (!svg || !tip) return;
+
+  svg.addEventListener("pointerleave", () => { tip.style.opacity = 0; hov.innerHTML = ""; });
+  svg.addEventListener("pointermove", (e) => {
+    const box = svg.getBoundingClientRect();
+    const sx = ((e.clientX - box.left) / box.width) * g.W;
+    let best = null;
+    for (const s of shown) for (const p of s.pts) {
+      const d = Math.abs(g.X(p.t) - sx);
+      if (!best || d < best.d) best = { d: d, p: p, s: s };
+    }
+    if (!best || best.d > 42) { tip.style.opacity = 0; hov.innerHTML = ""; return; }
+
+    const cx = g.X(best.p.t), cy = g.Y(best.p.v);
+    const yBot = g.M.t + (g.H - g.M.t - g.M.b);
+    hov.innerHTML =
+      '<line class="ax" x1="' + cx.toFixed(1) + '" y1="' + g.M.t +
+        '" x2="' + cx.toFixed(1) + '" y2="' + yBot.toFixed(1) + '"/>' +
+      '<circle cx="' + cx.toFixed(1) + '" cy="' + cy.toFixed(1) +
+        '" r="4" fill="' + best.s.color + '" stroke="var(--bg)" stroke-width="1.5"/>';
+
+    tip.innerHTML = "<b>" + trim(best.p.v) + (g.unit ? " " + esc(g.unit) : "") + "</b>" +
+      '<div class="t-meta">' + esc(best.s.name) + "<br>" +
+      esc(new Date(best.p.t).toLocaleString()) + "</div>";
+    tip.style.opacity = 1;
+    const px = (cx / g.W) * box.width;
+    const py = (cy / g.H) * box.height;
+    tip.style.left = Math.max(0, Math.min(px + 12, box.width - tip.offsetWidth - 4)) + "px";
+    tip.style.top = Math.max(0, py - tip.offsetHeight - 10) + "px";
+  });
+}
+
+function trim(v) {
+  const a = Math.abs(v);
+  const s = a >= 100 ? v.toFixed(0) : a >= 1 ? v.toFixed(1) : v.toFixed(2);
+  return s.replace(/\.0+$/, "").replace(/(\.\d*[1-9])0+$/, "$1");
+}
+function esc(s) {
+  return String(s === null || s === undefined ? "" : s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+window.addEventListener("resize", () => { if (current) render(current); });
+</script>
+</body>
+</html>

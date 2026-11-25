@@ -11,15 +11,16 @@ import logging
 import time
 
 import httpx
+from mcp.server.caching import CacheHint
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.context import Context
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.streamable_http import TransportSecuritySettings
-from mcp_types import ToolAnnotations
 from starlette.routing import Route
 
 from mcp_server import catalog_tools
 from mcp_server import tools as tool_impls
+from mcp_server.apps import READ_ONLY_ANNOTATIONS, apps
 from mcp_server.auth import SCOPE_PREMIUM, ApiKeyResolver, auth_enabled, auth_from_request, require_scope
 from mcp_server.catalog_schemas import (
     CompareResult,
@@ -38,7 +39,6 @@ from mcp_server.oauth_discovery import oauth_protected_resource_endpoint
 from mcp_server.pages import auth_page, payment_success_page, pricing_page
 from mcp_server.schemas import (
     FreshnessResult,
-    HistoryResult,
     ParametersResult,
     ReadingsResult,
     SourcesResult,
@@ -53,14 +53,6 @@ from mcp_server.supabase_client import SupabaseCircuitOpen, SupabaseReadClient
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# Tool annotations shared by all tools (read-only, queries external data)
-_READ_ONLY_ANNOTATIONS = ToolAnnotations(
-    read_only_hint=True,
-    destructive_hint=False,
-    idempotent_hint=True,
-    open_world_hint=True,
-)
-
 # Create the MCP server
 mcp = MCPServer(
     "Geo-Insights Environmental Data",
@@ -74,6 +66,18 @@ mcp = MCPServer(
         "get_policy_requirements for local regulations, and rank_measures for recommendations. "
         "No authentication required."
     ),
+    # MCP Apps (io.modelcontextprotocol/ui): interactive UI for supporting hosts.
+    extensions=[apps],
+    # Caching hints (SEP-2549, revision 2026-07-28). Only these six methods are
+    # cacheable; tools/call is not, so live sensor readings are never cached.
+    # All are "public": none of these results is user-specific. Premium gating
+    # happens in tools/call, so no access decision rests on cacheScope.
+    cache_hints={
+        "server/discover": CacheHint(ttl_ms=86_400_000, scope="public"),  # 24h
+        "tools/list": CacheHint(ttl_ms=86_400_000, scope="public"),  # 24h
+        "resources/list": CacheHint(ttl_ms=86_400_000, scope="public"),  # 24h
+        "resources/read": CacheHint(ttl_ms=3_600_000, scope="public"),  # 1h
+    },
 )
 
 # Global FROST client (initialized on startup)
@@ -158,7 +162,7 @@ async def parameters_resource() -> str:
 
 @mcp.tool(
     title="List Environmental Data Sources",
-    annotations=_READ_ONLY_ANNOTATIONS,
+    annotations=READ_ONLY_ANNOTATIONS,
 )
 async def list_sources() -> SourcesResult:
     """List all environmental data sources with station counts and geographic coverage.
@@ -187,7 +191,7 @@ async def list_sources() -> SourcesResult:
 
 @mcp.tool(
     title="List Environmental Parameters",
-    annotations=_READ_ONLY_ANNOTATIONS,
+    annotations=READ_ONLY_ANNOTATIONS,
 )
 async def get_parameters() -> ParametersResult:
     """List all 35 available environmental parameters with units and aliases.
@@ -208,7 +212,7 @@ async def get_parameters() -> ParametersResult:
 
 @mcp.tool(
     title="Get Latest Environmental Readings",
-    annotations=_READ_ONLY_ANNOTATIONS,
+    annotations=READ_ONLY_ANNOTATIONS,
 )
 async def get_latest_readings(
     lat: float,
@@ -255,58 +259,8 @@ async def get_latest_readings(
 
 
 @mcp.tool(
-    title="Get Historical Readings",
-    annotations=_READ_ONLY_ANNOTATIONS,
-)
-async def get_readings_history(
-    lat: float,
-    lon: float,
-    parameter: str,
-    start: str,
-    end: str | None = None,
-    radius_km: float = 10.0,
-    limit: int = 100,
-) -> HistoryResult:
-    """Get historical environmental readings near a location over a time range.
-
-    Use this for trend analysis, comparisons, and time-series queries.
-    Unlike get_latest_readings (which returns only the most recent value),
-    this returns multiple observations per station within the time window.
-
-    Args:
-        lat: Latitude in WGS84 (e.g. 51.92 for Rotterdam)
-        lon: Longitude in WGS84 (e.g. 4.47 for Rotterdam)
-        parameter: Parameter name or alias (required — e.g. "temperature",
-                   "pm25", "no2"). Use get_parameters() for valid names.
-        start: Start of time range in ISO 8601 (e.g. "2026-11-01T00:00:00Z")
-        end: End of time range in ISO 8601 (default: now)
-        radius_km: Search radius in kilometers (default 10, max 50)
-        limit: Maximum readings per station (default 100, max 1000)
-
-    Returns stations grouped by location, each with a time-ordered array of
-    readings, plus parameter info and the actual time range covered.
-
-    Invalid coordinates, unrecognized parameters, or unparseable dates return
-    a structured error. Data source failures include cause and retry timing.
-    """
-    start_t = time.monotonic()
-    try:
-        result = await tool_impls.get_readings_history(
-            _get_client(), lat, lon, parameter, start, end, radius_km, limit
-        )
-        request_logger.log("get_readings_history", int((time.monotonic() - start_t) * 1000), "", "", "ok")
-        return result
-    except ToolError:
-        request_logger.log("get_readings_history", int((time.monotonic() - start_t) * 1000), "", "", "validation_error")
-        raise
-    except (CircuitOpen, httpx.HTTPError, Exception) as exc:
-        request_logger.log("get_readings_history", int((time.monotonic() - start_t) * 1000), "", "", "error")
-        _raise_frost_error(exc)
-
-
-@mcp.tool(
     title="Check Data Freshness",
-    annotations=_READ_ONLY_ANNOTATIONS,
+    annotations=READ_ONLY_ANNOTATIONS,
 )
 async def get_data_freshness() -> FreshnessResult:
     """Check how fresh the data is for each of the 10 sources.
@@ -337,7 +291,7 @@ async def get_data_freshness() -> FreshnessResult:
 
 @mcp.tool(
     title="Search BGI Measures",
-    annotations=_READ_ONLY_ANNOTATIONS,
+    annotations=READ_ONLY_ANNOTATIONS,
 )
 async def search_bgi_measures(
     goal: str | None = None,
@@ -375,7 +329,7 @@ async def search_bgi_measures(
 
 @mcp.tool(
     title="Get BGI Measure Detail",
-    annotations=_READ_ONLY_ANNOTATIONS,
+    annotations=READ_ONLY_ANNOTATIONS,
 )
 async def get_measure_detail(measure_id_or_slug: str) -> str:
     """Get full detail for one BGI measure: performance, costs, scores, constraints.
@@ -405,7 +359,7 @@ async def get_measure_detail(measure_id_or_slug: str) -> str:
 
 @mcp.tool(
     title="Get Municipality Policy Requirements",
-    annotations=_READ_ONLY_ANNOTATIONS,
+    annotations=READ_ONLY_ANNOTATIONS,
 )
 async def get_policy_requirements(
     gemeente_code_or_name: str,
@@ -441,7 +395,7 @@ async def get_policy_requirements(
 
 @mcp.tool(
     title="Lookup Municipality",
-    annotations=_READ_ONLY_ANNOTATIONS,
+    annotations=READ_ONLY_ANNOTATIONS,
 )
 async def lookup_municipality(
     name: str | None = None,
@@ -468,7 +422,7 @@ async def lookup_municipality(
 
 @mcp.tool(
     title="Rank BGI Measures for Municipality",
-    annotations=_READ_ONLY_ANNOTATIONS,
+    annotations=READ_ONLY_ANNOTATIONS,
 )
 async def rank_measures(
     gemeente_code: str,
@@ -516,7 +470,7 @@ async def rank_measures(
 
 @mcp.tool(
     title="Get Environmental Context for Location",
-    annotations=_READ_ONLY_ANNOTATIONS,
+    annotations=READ_ONLY_ANNOTATIONS,
 )
 async def get_context_summary(lat: float, lon: float) -> ContextSummary:
     """Get environmental and socioeconomic context for a location in the Netherlands.
@@ -545,7 +499,7 @@ async def get_context_summary(lat: float, lon: float) -> ContextSummary:
 
 @mcp.tool(
     title="Compare BGI Measures",
-    annotations=_READ_ONLY_ANNOTATIONS,
+    annotations=READ_ONLY_ANNOTATIONS,
 )
 async def compare_measures(measure_slugs: list[str]) -> CompareResult:
     """Side-by-side comparison of 2-5 BGI measures.
