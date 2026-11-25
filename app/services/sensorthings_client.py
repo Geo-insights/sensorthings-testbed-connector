@@ -49,6 +49,11 @@ from app.sta.models import adapt_datastream_payload, adapt_observation_payload, 
 
 logger = logging.getLogger(__name__)
 
+# Serialises dead-letter appends across push threads and client instances: an
+# append-mode write is not atomic on every platform (on Windows two threads can
+# lose a line), and the size check must see the size the previous append left.
+_DLQ_WRITE_LOCK = threading.Lock()
+
 
 def _validation_target_label(base_url: str) -> str:
     """Look up the operator-configured label for a FROST target base URL."""
@@ -1930,21 +1935,23 @@ class SensorThingsClient:
         return self._http.post_with_retry(endpoint, payload, datastream_id)
 
     def _write_failed_observation(self, record: dict[str, Any]) -> None:
-        self._failed_observations_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            current_size = self._failed_observations_path.stat().st_size
-        except FileNotFoundError:
-            current_size = 0
-        if current_size >= settings.failed_dlq_max_bytes:
-            logger.warning(
-                "DLQ at %d bytes (limit %d) — dropping observation for datastream %s",
-                current_size,
-                settings.failed_dlq_max_bytes,
-                record.get("datastream_id", "?"),
-            )
-            return
-        with self._failed_observations_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        with _DLQ_WRITE_LOCK:
+            self._failed_observations_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                current_size = self._failed_observations_path.stat().st_size
+            except FileNotFoundError:
+                current_size = 0
+            if current_size >= settings.failed_dlq_max_bytes:
+                logger.warning(
+                    "DLQ at %d bytes (limit %d) — dropping observation for datastream %s",
+                    current_size,
+                    settings.failed_dlq_max_bytes,
+                    record.get("datastream_id", "?"),
+                )
+                return
+            with self._failed_observations_path.open("a", encoding="utf-8") as handle:
+                handle.write(line)
 
     def _base_url_for_endpoint(self, endpoint: str) -> str | None:
         """Match an absolute endpoint URL back to a configured target base URL."""
