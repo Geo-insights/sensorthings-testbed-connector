@@ -460,3 +460,95 @@ class TestSamenMetenPollingSource:
         props = set(sets[0]["observed_properties"].keys())
         assert "pm2_5" in props
         assert "pm10" in props
+
+
+# ---------------------------------------------------------------------------
+# parse_things_response — calibrated _kal PM preferred over raw (#38)
+# ---------------------------------------------------------------------------
+
+_RIVM_THING = "LUC_354724647888301"
+
+
+def _rivm_datastream(ds_id: int, suffix: str) -> dict:
+    """A RIVM Datastream as the Things listing returns it: no ObservedProperty, the property in the name."""
+    return {"@iot.id": ds_id, "name": f"{_RIVM_THING}-12-{suffix}"}
+
+
+def _rivm_thing(datastreams: list[dict]) -> dict:
+    """RIVM Thing 8272, shaped as on api-samenmeten.rivm.nl (2026-11-25)."""
+    return _make_thing(8272, _RIVM_THING, 52.0, 4.36, datastreams=datastreams)
+
+
+def _parsed_datastreams(thing: dict) -> list[tuple[int, str]]:
+    (parsed,) = parse_things_response(_make_things_response([thing]))
+    return [(ds["ds_id"], ds["observed_property"]) for ds in parsed["datastreams"]]
+
+
+class TestParseThingsResponsePrefersCalibrated:
+    def test_calibrated_pm_replaces_raw_and_other_properties_stay(self):
+        """protects=one PM series per RIVM Thing: _kal kept, raw pm25/pm10 dropped, rh and temp untouched;
+        fails_when=a raw PM datastream is still returned next to its _kal twin, or a non-PM datastream is dropped;
+        no_claim=which canonical rh/temp map to, or how the source fetches observations."""
+        thing = _rivm_thing([
+            _rivm_datastream(43001, "pm25"),
+            _rivm_datastream(43002, "pm25_kal"),
+            _rivm_datastream(43003, "pm10"),
+            _rivm_datastream(43004, "pm10_kal"),
+            _rivm_datastream(43005, "rh"),
+            _rivm_datastream(43006, "temp"),
+        ])
+
+        result = _parsed_datastreams(thing)
+
+        assert [ds_id for ds_id, _prop in result] == [43002, 43004, 43005, 43006]
+        assert result[:2] == [(43002, "pm2_5"), (43004, "pm10")]
+
+    def test_raw_pm_is_kept_when_the_thing_has_no_calibrated_series(self):
+        """protects=raw fallback: a Thing with only pm25 still yields its PM2.5 datastream;
+        fails_when=the raw datastream is dropped although no _kal datastream exists;
+        no_claim=raw values are comparable to calibrated ones."""
+        thing = _rivm_thing([_rivm_datastream(43001, "pm25"), _rivm_datastream(43005, "rh")])
+
+        assert _parsed_datastreams(thing)[0] == (43001, "pm2_5")
+        assert len(_parsed_datastreams(thing)) == 2
+
+    def test_calibrated_by_observed_property_name(self):
+        """protects=the ObservedProperty name path: OP name pm25_kal counts as calibrated;
+        fails_when=the _kal check only looks at Datastream names, so both OP-named series are kept;
+        no_claim=behaviour when OP name and DS name disagree."""
+        thing = _make_thing(8272, _RIVM_THING, 52.0, 4.36, datastreams=[
+            _make_datastream(43001, "pm25"),
+            _make_datastream(43002, "pm25_kal"),
+        ])
+
+        assert _parsed_datastreams(thing) == [(43002, "pm2_5")]
+
+    def test_calibrated_by_datastream_name_when_observed_property_is_none(self):
+        """protects=the production path: ObservedProperty null, DS name 'X-12-pm25_kal' counts as calibrated;
+        fails_when=a null ObservedProperty breaks the name fallback or the _kal check;
+        no_claim=Datastream names without a dash."""
+        raw = {**_rivm_datastream(43001, "pm25"), "ObservedProperty": None}
+        kal = {**_rivm_datastream(43002, "pm25_kal"), "ObservedProperty": None}
+
+        assert _parsed_datastreams(_rivm_thing([raw, kal])) == [(43002, "pm2_5")]
+
+    def test_two_calibrated_series_keep_the_lowest_id_and_warn_once(self, caplog):
+        """protects=determinism when RIVM lists two _kal datastreams for one canonical: lowest ds_id wins, one WARNING;
+        fails_when=both are kept, the higher id wins, or the conflict is logged zero or several times;
+        no_claim=which of the two series is the better one."""
+        thing = _rivm_thing([
+            _rivm_datastream(43009, "pm25_kal"),
+            _rivm_datastream(43001, "pm25"),
+            _rivm_datastream(43002, "pm25_kal"),
+            _rivm_datastream(43004, "pm10_kal"),
+        ])
+
+        with caplog.at_level("WARNING", logger="app.sources.samen_meten"):
+            result = _parsed_datastreams(thing)
+
+        assert result == [(43002, "pm2_5"), (43004, "pm10")]
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert "8272" in message and _RIVM_THING in message
+        assert "43002" in message and "43009" in message

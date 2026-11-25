@@ -76,6 +76,13 @@ def _map_observed_property_name(raw_name: str) -> str | None:
     return canon.value if canon is not None else None
 
 
+# RIVM names its calibrated PM series like the raw one plus this suffix
+# ("pm25_kal" next to "pm25"). For these canonicals parse_things_response keeps
+# the calibrated series and falls back to raw only when a Thing has none.
+_CALIBRATED_SUFFIX = "_kal"
+_CALIBRATED_PREFERRED: tuple[str, ...] = ("pm2_5", "pm10")
+
+
 # ---------------------------------------------------------------------------
 # Source-specific descriptions
 # ---------------------------------------------------------------------------
@@ -117,6 +124,10 @@ def parse_things_response(data: dict[str, Any]) -> list[dict[str, Any]]:
     - ``observed_property`` is the canonical key (e.g. "pm2_5").
     - Things without a usable location are silently skipped.
     - Datastreams with unrecognised ObservedProperty names are silently skipped.
+    - PM2.5 and PM10: when a Thing has a calibrated ``_kal`` datastream of the
+      canonical (by ObservedProperty name, else Datastream name suffix), its raw
+      ones are left out, so one series feeds our datastream; raw is the fallback
+      (see ``_prefer_calibrated``).
     - The ``@iot.nextLink`` key (if present) signals more pages; callers must
       handle pagination themselves.
     """
@@ -147,6 +158,7 @@ def parse_things_response(data: dict[str, Any]) -> list[dict[str, Any]]:
             datastreams_raw = []
 
         datastreams: list[dict[str, Any]] = []
+        calibrated: list[bool] = []
         for ds in datastreams_raw:
             if not isinstance(ds, dict):
                 continue
@@ -173,6 +185,9 @@ def parse_things_response(data: dict[str, Any]) -> list[dict[str, Any]]:
                 continue
 
             datastreams.append({"ds_id": int(ds_id), "observed_property": canonical})
+            calibrated.append(op_name.strip().lower().endswith(_CALIBRATED_SUFFIX))
+
+        datastreams = _prefer_calibrated(thing_id, thing_name, datastreams, calibrated)
 
         things.append(
             {
@@ -185,6 +200,46 @@ def parse_things_response(data: dict[str, Any]) -> list[dict[str, Any]]:
         )
 
     return things
+
+
+def _prefer_calibrated(
+    thing_id: Any,
+    thing_name: str,
+    datastreams: list[dict[str, Any]],
+    calibrated: list[bool],
+) -> list[dict[str, Any]]:
+    """Keep one PM datastream per canonical: the calibrated ``_kal`` one when the Thing has it.
+
+    RIVM publishes raw PM (``pm25``, ``pm10``) next to its calibrated series
+    (``pm25_kal``, ``pm10_kal``); both map to one canonical key and so to one of
+    our datastreams, where they would write two values per hour. For each
+    canonical in ``_CALIBRATED_PREFERRED`` with at least one calibrated entry,
+    every raw entry is dropped and, of several calibrated ones, the lowest
+    ``ds_id`` is kept (logged as a warning). Without a calibrated entry the raw
+    ones stay. Other canonicals and the order of what stays are unchanged.
+    """
+    keep_ids: dict[str, int] = {}
+    for canonical in _CALIBRATED_PREFERRED:
+        ids = sorted(
+            entry["ds_id"]
+            for entry, is_calibrated in zip(datastreams, calibrated, strict=True)
+            if is_calibrated and entry["observed_property"] == canonical
+        )
+        if not ids:
+            continue
+        if len(ids) > 1:
+            logger.warning(
+                "samen_meten: Thing %s (%s) has %d calibrated %s datastreams %s; keeping the lowest id %s",
+                thing_id, thing_name, len(ids), canonical, ids, ids[0],
+            )
+        keep_ids[canonical] = ids[0]
+    if not keep_ids:
+        return datastreams
+    return [
+        entry
+        for entry in datastreams
+        if entry["observed_property"] not in keep_ids or entry["ds_id"] == keep_ids[entry["observed_property"]]
+    ]
 
 
 def _extract_location(thing: dict[str, Any]) -> tuple[float | None, float | None]:
