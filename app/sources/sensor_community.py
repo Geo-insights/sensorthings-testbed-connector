@@ -10,6 +10,18 @@ Supported sensor types:
 - BME280 / BMP280 — temperature, humidity, pressure (reported in Pa, pushed as hPa)
 - DNMS — noise levels (noise_LAeq, noise_LAmin, noise_LAmax)
 
+One datastream per sensor type (#39)
+------------------------------------
+A location's datastream of a property (sensor_id ``sensor_community-{loc}``)
+belongs to one sensor type, its owner. Another type at that location reporting
+the same property (a DHT22 next to a BME280) gets a Sensor and datastream of its
+own, sensor_id ``sensor_community-{loc}-{slug}`` (``sensor_type_slug``), so no
+datastream mixes two instruments. The owner of each (location, property) is
+chosen once by ``OWNER_RANK`` and kept (``SensorCommunityPollingSource``
+persists the owner map); ``parse_sensor_data`` and ``build_entity_set`` take
+that map. A location whose properties each come from one type keeps exactly
+the sensor ids and datastreams it had before.
+
 API endpoint: https://data.sensor.community/airrohr/v1/filter/country=NL
 """
 
@@ -17,6 +29,8 @@ from __future__ import annotations
 
 import logging
 import math
+import re
+from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, NamedTuple
@@ -105,18 +119,105 @@ _DESCRIPTIONS: dict[str, str] = {
 }
 
 
+# Which sensor type owns a location's datastream of a property when several
+# types at the location report it: the first listed. Keys are CanonicalDatastream
+# values. Types not listed (and every type of a property not listed) rank after
+# all listed ones, ties alphabetical.
+OWNER_RANK: dict[str, list[str]] = {
+    "temperature": [
+        "SHT35", "SHT31", "SHT30", "SHT85", "BME280", "HTU21D", "DS18B20", "SCD30", "SEN5x", "BMP280", "BMP180", "DHT22",
+    ],
+    "humidity": ["SHT35", "SHT31", "SHT30", "SHT85", "BME280", "HTU21D", "SCD30", "SEN5x", "DHT22"],
+    "pressure": ["BME280", "BMP280", "BMP180"],
+    "pm2_5": ["SPS30", "SEN5x", "NextPM", "SDS011", "PMS7003", "PMS5003", "PMS3003", "HPM"],
+    "pm10": ["SPS30", "SEN5x", "NextPM", "SDS011", "PMS7003", "PMS5003", "PMS3003", "HPM"],
+}
+
+UNKNOWN_SENSOR_TYPE = "unknown"
+
+
+def entry_sensor_type(entry: Mapping[str, Any]) -> str:
+    """The sensor type name of one response entry (``sensor.sensor_type.name``), "unknown" if absent."""
+    sensor_info = entry.get("sensor", {}) or {}
+    sensor_type_info = (sensor_info.get("sensor_type", {}) or {}) if isinstance(sensor_info, Mapping) else {}
+    if not isinstance(sensor_type_info, Mapping):
+        return UNKNOWN_SENSOR_TYPE
+    return str(sensor_type_info.get("name", UNKNOWN_SENSOR_TYPE))
+
+
+def sensor_type_slug(sensor_type: str) -> str:
+    """The sensor_id suffix of a type: lower case, runs of non-alphanumerics as one "-", stripped.
+
+    ``DHT22`` → ``dht22``, ``DNMS (Laerm)`` → ``dnms-laerm``, ``SEN5x`` → ``sen5x``.
+    """
+    return re.sub(r"[^a-z0-9]+", "-", sensor_type.lower()).strip("-") or UNKNOWN_SENSOR_TYPE
+
+
+def type_sensor_id(location_id: int | str, sensor_type: str) -> str:
+    """The sensor_id of a type's own sensor at a location, for the properties it does not own there."""
+    return f"sensor_community-{location_id}-{sensor_type_slug(sensor_type)}"
+
+
+def _owner_rank_key(observed_property: str, sensor_type: str) -> tuple[int, str, str]:
+    ranked = [name.casefold() for name in OWNER_RANK.get(observed_property, [])]
+    folded = sensor_type.casefold()
+    position = ranked.index(folded) if folded in ranked else len(ranked)
+    return position, folded, sensor_type
+
+
+def choose_owner(observed_property: str, sensor_types: Iterable[str]) -> str:
+    """The best-ranked of ``sensor_types`` for ``observed_property`` (``OWNER_RANK``)."""
+    candidates = set(sensor_types)
+    if not candidates:
+        raise ValueError(f"no sensor type reports {observed_property!r}")
+    return min(candidates, key=lambda sensor_type: _owner_rank_key(observed_property, sensor_type))
+
+
 def build_entity_set(
     location_id: int | str,
     lat: float,
     lon: float,
     observed_properties: list[str] | None = None,
+    secondary: Mapping[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     """Build a CLIMATE_ADAPTATION_ENTITY_SETS-format dict for one Sensor.Community location.
 
     One Thing per location_id; sensors at the same location are co-located.
+    The location sensor (``sensor_community-{loc}``) has a datastream of every
+    property in ``observed_properties``; each property's owner type writes to it.
+    ``secondary`` maps a sensor type to the properties it reports there but does
+    not own; each such type gets a sensor of its own (``type_sensor_id``) with
+    those datastreams. Without ``secondary`` the set is the location sensor alone.
     """
     props = observed_properties or ["pm10", "pm2_5"]
     loc_str = str(location_id)
+    sensors: list[dict[str, Any]] = [
+        {
+            "sensor_id": f"sensor_community-{loc_str}",
+            "name": f"SensorCommunity {loc_str} sensor",
+            "description": f"Sensor.Community citizen sensor station ({loc_str}).",
+            "encodingType": "application/json",
+            "metadata": "https://sensor.community",
+            "observed_properties": props,
+            "properties": {},
+        }
+    ]
+    described = set(props)
+    for sensor_type, type_props in (secondary or {}).items():
+        if not type_props:
+            continue
+        described.update(type_props)
+        sensors.append(
+            {
+                "sensor_id": type_sensor_id(loc_str, sensor_type),
+                "name": f"SensorCommunity {loc_str} {sensor_type} sensor",
+                "description": f"Sensor.Community {sensor_type} sensor at location {loc_str}.",
+                "encodingType": "application/json",
+                "metadata": "https://sensor.community",
+                "observed_properties": list(type_props),
+                "properties": {"sensor_type": sensor_type},
+            }
+        )
     return {
         "site_key": f"sensor_community_{loc_str}",
         "site_name": f"SensorCommunity {loc_str}",
@@ -137,27 +238,25 @@ def build_entity_set(
             "location": {"type": "Point", "coordinates": [lon, lat]},
             "properties": {},
         },
-        "sensors": [
-            {
-                "sensor_id": f"sensor_community-{loc_str}",
-                "name": f"SensorCommunity {loc_str} sensor",
-                "description": f"Sensor.Community citizen sensor station ({loc_str}).",
-                "encodingType": "application/json",
-                "metadata": "https://sensor.community",
-                "observed_properties": props,
-                "properties": {},
-            }
-        ],
-        "observed_properties": {k: v for k, v in _DESCRIPTIONS.items() if k in props},
+        "sensors": sensors,
+        "observed_properties": {k: v for k, v in _DESCRIPTIONS.items() if k in described},
     }
 
 
-def parse_sensor_data(sensor_entries: list[dict[str, Any]]) -> list[SensorReading]:
+def parse_sensor_data(
+    sensor_entries: list[dict[str, Any]],
+    owners: Mapping[str, Mapping[str, str]] | None = None,
+) -> list[SensorReading]:
     """Parse the full Sensor.Community NL-filter API response into SensorReadings.
 
     Each entry in the array represents one sensor at a location.  Multiple
     sensor types (SDS011, BME280, DNMS) can share a location and are processed
     as separate entries in the response array.
+
+    ``owners`` maps a location id (str) to ``{observed_property: owner type}``.
+    A reading's sensor_id is ``sensor_community-{loc}`` when its sensor type
+    owns (loc, property), or when no ``owners`` is given; otherwise it is its
+    type's own ``sensor_community-{loc}-{slug}`` (``type_sensor_id``).
 
     Unknown ``value_type`` values are silently skipped.
     """
@@ -175,9 +274,8 @@ def parse_sensor_data(sensor_entries: list[dict[str, Any]]) -> list[SensorReadin
         if location_id is None:
             continue
 
-        sensor_info = entry.get("sensor", {}) or {}
-        sensor_type_info = sensor_info.get("sensor_type", {}) or {}
-        sensor_type_name = str(sensor_type_info.get("name", "unknown"))
+        sensor_type_name = entry_sensor_type(entry)
+        location_owners = owners.get(str(location_id), {}) if owners is not None else None
 
         ts_raw = str(entry.get("timestamp", "")).strip()
         if ts_raw:
@@ -191,7 +289,7 @@ def parse_sensor_data(sensor_entries: list[dict[str, Any]]) -> list[SensorReadin
         else:
             ts = datetime.now(UTC)
 
-        sensor_id = f"sensor_community-{location_id}"
+        location_sensor_id = f"sensor_community-{location_id}"
         sensor_name = f"SensorCommunity {location_id} {sensor_type_name} sensor"
         thing_name = f"SensorCommunity {location_id}"
 
@@ -228,6 +326,11 @@ def parse_sensor_data(sensor_entries: list[dict[str, Any]]) -> list[SensorReadin
                 continue
 
             value = to_canonical_unit(canonical, value, location_id)
+
+            if location_owners is None or location_owners.get(canonical.value) == sensor_type_name:
+                sensor_id = location_sensor_id
+            else:
+                sensor_id = type_sensor_id(location_id, sensor_type_name)
 
             meta = canonical.meta
             readings.append(

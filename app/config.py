@@ -397,6 +397,8 @@ class Settings:
     sensor_community_enabled: bool = os.getenv("SENSOR_COMMUNITY_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     sensor_community_api_url: str = os.getenv("SENSOR_COMMUNITY_API_URL", "https://data.sensor.community/airrohr/v1/filter/country=NL").strip()
     sensor_community_poll_seconds: int = int(os.getenv("SENSOR_COMMUNITY_POLL_SECONDS", "300"))
+    # Owner sensor type per (location, property) (#39); on the persistent volume, kept across restarts.
+    sensor_community_owners_path: str = os.getenv("SENSOR_COMMUNITY_OWNERS_PATH", "data/sc_sensor_owners.json").strip()
     # --- Samen Meten RIVM STA federation (#13) ---
     samen_meten_enabled: bool = os.getenv("SAMEN_METEN_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     samen_meten_api_url: str = os.getenv("SAMEN_METEN_API_URL", "https://api-samenmeten.rivm.nl/v1.0").strip().rstrip("/")

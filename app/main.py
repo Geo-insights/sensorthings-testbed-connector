@@ -313,9 +313,13 @@ def _dedup_readings(
     Within the batch a repeat of an earlier reading (same key, timestamp, value
     and sensor name) is dropped as well: the Sensor.Community API sometimes
     lists a sensor twice for one timestamp. Readings of one key and timestamp
-    with different values, or from sensors of another type (the SC sensor name
-    carries it), all stay, since co-located sensors of one location share a
-    sensor_id.
+    with different values, or with another sensor name, all stay. Co-located
+    Sensor.Community sensors of different types no longer share a key: each
+    (location, property) has one owner type on the location sensor_id, and
+    other types reporting that property use their own
+    ``sensor_community-{loc}-{slug}`` (#39). The sensor name in the identity
+    still keeps a repeat of another type apart where a key is shared anyway
+    (readings parsed without an owner map).
     """
     new = []
     seen: set[tuple[str, datetime, Any, Any]] = set()

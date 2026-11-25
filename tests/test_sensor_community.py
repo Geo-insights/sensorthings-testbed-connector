@@ -32,10 +32,13 @@ import pytest
 
 from app.services.rest_polling_source import RestPollingSource
 from app.sources.sensor_community import (
+    OWNER_RANK,
     PA_BAND,
     UNIT_SCALES,
     build_entity_set,
+    choose_owner,
     parse_sensor_data,
+    sensor_type_slug,
     to_canonical_unit,
 )
 from app.sta.canonical import CanonicalDatastream, resolve
@@ -535,6 +538,120 @@ def test_build_entity_set_site_key_includes_location_id() -> None:
 def test_build_entity_set_source_property() -> None:
     es = build_entity_set(456, 52.01, 4.36)
     assert es["thing"]["properties"]["source"] == "sensor_community"
+
+
+# ---------------------------------------------------------------------------
+# One datastream per sensor type (#39): slug, owner rank, sensor ids, secondary sensors
+# ---------------------------------------------------------------------------
+
+
+def _dht22_entry(location_id: int = 456) -> dict[str, Any]:
+    """DHT22 temperature/humidity sensor next to the BME280 of ``_bme280_entry``."""
+    return {
+        "id": 123459,
+        "sensor": {"id": 792, "sensor_type": {"name": "DHT22"}},
+        "location": {"id": location_id, "latitude": "52.01", "longitude": "4.36"},
+        "sensordatavalues": [
+            {"value_type": "temperature", "value": "18.9"},
+            {"value_type": "humidity", "value": "70.0"},
+        ],
+        "timestamp": "2026-10-07 12:00:00",
+    }
+
+
+@pytest.mark.parametrize(
+    ("sensor_type", "slug"),
+    [("DHT22", "dht22"), ("DNMS (Laerm)", "dnms-laerm"), ("SEN5x", "sen5x"), (" Radiation SBM-19 ", "radiation-sbm-19")],
+)
+def test_sensor_type_slug(sensor_type: str, slug: str) -> None:
+    """protects=the sensor_id suffix of a type's own datastream (sensor_community-{loc}-{slug});
+    fails_when=case, punctuation runs or edge separators leak into the slug;
+    no_claim=two types never share a slug."""
+    assert sensor_type_slug(sensor_type) == slug
+
+
+@pytest.mark.parametrize(
+    ("observed_property", "sensor_types", "owner"),
+    [
+        ("temperature", {"DHT22", "BME280"}, "BME280"),
+        ("temperature", {"DHT22", "BMP280"}, "BMP280"),
+        ("temperature", {"BMP180", "SHT31"}, "SHT31"),
+        ("humidity", {"DHT22", "SCD30", "BME280"}, "BME280"),
+        ("pressure", {"BMP180", "BME280"}, "BME280"),
+        ("pm2_5", {"SDS011", "SPS30"}, "SPS30"),
+        ("pm10", {"SDS011", "SEN5x"}, "SEN5x"),
+        ("temperature", {"DHT22", "Unlisted9"}, "DHT22"),  # unlisted types rank after every listed one
+        ("temperature", {"Zeta", "Alpha"}, "Alpha"),  # unlisted ties: alphabetical
+        ("noise_laeq", {"DNMS (Laerm)", "ABC"}, "ABC"),  # property without a rank: alphabetical
+    ],
+)
+def test_choose_owner_follows_the_rank(observed_property: str, sensor_types: set[str], owner: str) -> None:
+    """protects=the owner of a (location, property) is the best-ranked reporting type, independent of order;
+    fails_when=OWNER_RANK order, the unlisted-after-listed rule or the alphabetical tie-break is not applied;
+    no_claim=the rank reflects real instrument quality."""
+    assert choose_owner(observed_property, sensor_types) == owner
+    assert choose_owner(observed_property, sorted(sensor_types, reverse=True)) == owner
+
+
+def test_owner_rank_keys_are_the_canonical_values_resolve_returns() -> None:
+    """protects=OWNER_RANK is looked up with the canonical keys readings carry;
+    fails_when=a rank key is no longer a canonical value (e.g. after a canonical rename), silently ranking alphabetically;
+    no_claim=the canonical names themselves."""
+    for raw, key in [("temperature", "temperature"), ("humidity", "humidity"), ("pressure", "pressure"),
+                     ("P2", "pm2_5"), ("P1", "pm10")]:
+        canonical = resolve(raw)
+        assert canonical is not None and canonical.value == key
+    assert set(OWNER_RANK) == {"temperature", "humidity", "pressure", "pm2_5", "pm10"}
+
+
+def test_parse_sensor_ids_follow_the_owner_map() -> None:
+    """protects=a non-owner type's readings get its own sensor_id, the owner's keep the location id;
+    fails_when=the owner map is ignored, or a non-owner reading still uses sensor_community-{loc};
+    no_claim=how owners are chosen (see the source tests)."""
+    entries = [_dht22_entry(), _bme280_entry()]
+    owners = {"456": {"temperature": "BME280", "humidity": "BME280", "pressure": "BME280"}}
+
+    readings = parse_sensor_data(entries, owners=owners)
+
+    ids = {(r.sensor_name, r.observed_property): r.sensor_id for r in readings}
+    assert ids == {
+        ("SensorCommunity 456 DHT22 sensor", "temperature"): "sensor_community-456-dht22",
+        ("SensorCommunity 456 DHT22 sensor", "humidity"): "sensor_community-456-dht22",
+        ("SensorCommunity 456 BME280 sensor", "temperature"): "sensor_community-456",
+        ("SensorCommunity 456 BME280 sensor", "humidity"): "sensor_community-456",
+        ("SensorCommunity 456 BME280 sensor", "pressure"): "sensor_community-456",
+    }
+    assert {(r.thing_name, r.location) for r in readings} == {("SensorCommunity 456", "456")}
+
+
+def test_parse_without_owner_map_keeps_the_location_sensor_id() -> None:
+    """protects=today's behaviour for callers that pass no owner map;
+    fails_when=parse_sensor_data(entries) assigns type sensor_ids by itself;
+    no_claim=those readings avoid shared datastreams."""
+    readings = parse_sensor_data([_dht22_entry(), _bme280_entry()])
+
+    assert {r.sensor_id for r in readings} == {"sensor_community-456"}
+
+
+def test_build_entity_set_adds_a_sensor_per_secondary_type() -> None:
+    """protects=a type that reports properties it does not own gets its own Sensor + datastreams;
+    fails_when=the secondary sensor is missing, has the wrong sensor_id/name/properties, or alters the location sensor;
+    no_claim=how FROST names the datastreams (see the integration test)."""
+    plain = build_entity_set(456, 52.01, 4.36, ["temperature", "humidity", "pressure"])
+    es = build_entity_set(
+        456, 52.01, 4.36, ["temperature", "humidity", "pressure"], secondary={"DHT22": ["temperature", "humidity"]},
+    )
+
+    location_sensor, dht22 = es["sensors"]
+    assert location_sensor == plain["sensors"][0]
+    assert dht22["sensor_id"] == "sensor_community-456-dht22"
+    assert dht22["name"] == "SensorCommunity 456 DHT22 sensor"
+    assert dht22["observed_properties"] == ["temperature", "humidity"]
+    assert dht22["properties"] == {"sensor_type": "DHT22"}
+    assert {k: v for k, v in es.items() if k != "sensors"} == {k: v for k, v in plain.items() if k != "sensors"}
+    assert build_entity_set(456, 52.01, 4.36, ["pm10"], secondary={"SDS011": []}) == build_entity_set(
+        456, 52.01, 4.36, ["pm10"]
+    )
 
 
 # ---------------------------------------------------------------------------
