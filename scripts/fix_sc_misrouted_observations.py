@@ -151,6 +151,38 @@ hPa, and the dry run counts them ("value changed"). The pressure backfill's
 in either order, to get back to the state before both scripts; run only this
 one to undo only the moves.
 
+--sensor-type-split (#40): mixed Sensor.Community datastreams
+-------------------------------------------------------------
+Before #39 every sensor type at a Sensor.Community location wrote into the
+location's datastream of a property (properties.sensor_id
+'sensor_community-{loc}'), so e.g. a BME280 and a DHT22 shared one temperature
+datastream. Since #39 each (location, property) has one owner type
+(data/sc_sensor_owners.json on the connector) and every other type writes to a
+datastream of its own (sensor_id 'sensor_community-{loc}-{slug}',
+app.sources.sensor_community.type_sensor_id). This mode moves the history:
+
+  selection  rows with ID <= --max-id (the last ID before the #39 deploy) in a
+             Sensor.Community location datastream, labelled with that
+             datastream's sensor_id, whose sensor type (PARAMETERS.sensor_name,
+             'SensorCommunity {loc} {TYPE} sensor') is not the owner of (loc, the
+             datastream's observed property) in --owners
+  move       to the datastream of type_sensor_id(loc, TYPE) and the same property;
+             PARAMETERS.sensor_id becomes that datastream's sensor_id, so the
+             default mode's label checks keep passing
+  needs-datastream  that datastream does not exist (yet): reported, not moved
+  owner-missing     (loc, property) has no owner in --owners: reported, not moved
+  unparsable-type   PARAMETERS.sensor_name doesn't match the pattern: reported
+  other-label       labelled with another property: the default mode's job
+
+The rest is the default mode's machinery: dry run by default (--plan-file
+writes the plan), --apply with --ids-file (each batch recorded before it is
+written, with its old datastream and old sensor_id), --datastream as a canary,
+duplicates kept in place (the target already holds the same reading under the
+target's sensor_id), datastream times refreshed after each group, and
+--rollback restores DATASTREAM_ID, FEATURE_ID and PARAMETERS.sensor_id. After
+--apply it scans the source datastreams again and reports the non-owner rows
+left (exit 1 when any movable one is left).
+
 How it connects: like the pressure backfill it pipes SQL into psql inside the
 FROST database container (ssh to the FROST host with keepalives, so a dead
 connection fails within about a minute, or docker exec for a local
@@ -164,6 +196,8 @@ Usage
     python scripts/fix_sc_misrouted_observations.py --ssh ... --apply --ids-file moved.jsonl --datastream 1386
     python scripts/fix_sc_misrouted_observations.py --ssh ... --rollback --ids-file moved.jsonl [--apply]
     python scripts/fix_sc_misrouted_observations.py --ssh ... --refresh-only --ids-file moved.jsonl
+    python scripts/fix_sc_misrouted_observations.py --ssh ... --sensor-type-split --owners sc_sensor_owners.json \\
+        --max-id 40184234 --plan-file split.csv [--apply --ids-file split.jsonl [--datastream ID]]
 """
 
 from __future__ import annotations
@@ -173,6 +207,7 @@ import csv
 import json
 import math
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -186,6 +221,7 @@ from typing import Any
 
 # Run as `python scripts/fix_sc_misrouted_observations.py` from the repository root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from app.sources.sensor_community import type_sensor_id
 from app.sta.canonical import resolve
 
 RunSql = Callable[[str], list[str]]
@@ -271,6 +307,9 @@ class Catalogue:
         return ds is not None and ds.source == SC_SOURCE
 
 
+GroupKey = tuple[int, str | None, str | None, str | None, str | None]
+
+
 @dataclass
 class Group:
     """Observations of one source datastream sharing one label."""
@@ -285,10 +324,12 @@ class Group:
     max_id: int = 0
     first: str = ""
     last: str = ""
+    # --sensor-type-split only: the label's PARAMETERS.sensor_name, part of the group's label (label_filter).
+    sensor_name: str | None = None
 
     @property
-    def key(self) -> tuple[int, str | None, str | None, str | None]:
-        return (self.ds, self.sid, self.prop, self.thing)
+    def key(self) -> GroupKey:
+        return (self.ds, self.sid, self.prop, self.thing, self.sensor_name)
 
     def merge(self, other: Group) -> None:
         """Add the counts of the same label from another ID range."""
@@ -307,6 +348,7 @@ class PlannedGroup:
     target: Datastream | None = None
     foi: int | None = None  # FEATURE_ID to set; None: keep each row's own
     note: str = ""
+    relabel: str | None = None  # PARAMETERS.sensor_id to set (--sensor-type-split); None: keep each row's own
 
 
 @dataclass
@@ -316,7 +358,7 @@ class Plan:
     def by_action(self) -> dict[str, list[PlannedGroup]]:
         out: dict[str, list[PlannedGroup]] = {a: [] for a in ACTIONS}
         for planned in self.groups:
-            out[planned.action].append(planned)
+            out.setdefault(planned.action, []).append(planned)
         return out
 
 
@@ -342,13 +384,16 @@ def lit(value: str | None) -> str:
 
 
 def label_filter(alias: str, group: Group) -> str:
-    """Rows of exactly this group's label (NULL-safe)."""
+    """Rows of exactly this group's label (NULL-safe); with its sensor_name too when the group has one."""
     o = alias
-    return (
+    condition = (
         f"""{o}."PARAMETERS"->>'sensor_id' IS NOT DISTINCT FROM {lit(group.sid)}"""
         f""" AND {o}."PARAMETERS"->>'observed_property' IS NOT DISTINCT FROM {lit(group.prop)}"""
         f""" AND {o}."PARAMETERS"->>'thing_name' IS NOT DISTINCT FROM {lit(group.thing)}"""
     )
+    if group.sensor_name is not None:
+        condition += f""" AND {o}."PARAMETERS"->>'sensor_name' = {lit(group.sensor_name)}"""
+    return condition
 
 
 def parse_json_lines(lines: Iterable[str], tag: str) -> list[dict[str, Any]]:
@@ -445,11 +490,16 @@ _SAME_READING_COLUMNS = ('"PHENOMENON_TIME_END"', '"RESULT_TYPE"', '"RESULT_NUMB
 _LABEL_KEYS = ("sensor_id", "observed_property")
 
 
-def same_reading_sql(target_ds: int, alias: str = "o") -> str:
-    """EXISTS: datastream target_ds already holds the reading of row ``alias`` (same label, time and result)."""
+def same_reading_sql(target_ds: int, alias: str = "o", sensor_id: str | None = None) -> str:
+    """EXISTS: datastream target_ds already holds the reading of row ``alias`` (same label, time and result).
+
+    ``sensor_id``: the label the row gets with its move (--sensor-type-split), compared instead of its own.
+    """
     o = alias
     same = [f'x."PHENOMENON_TIME_START" = {o}."PHENOMENON_TIME_START"']
-    same += [f'x."PARAMETERS"->>{lit(k)} IS NOT DISTINCT FROM {o}."PARAMETERS"->>{lit(k)}' for k in _LABEL_KEYS]
+    for k in _LABEL_KEYS:
+        mine = lit(sensor_id) if k == "sensor_id" and sensor_id is not None else f'{o}."PARAMETERS"->>{lit(k)}'
+        same.append(f'x."PARAMETERS"->>{lit(k)} IS NOT DISTINCT FROM {mine}')
     same += [f"x.{c} IS NOT DISTINCT FROM {o}.{c}" for c in _SAME_READING_COLUMNS]
     conditions = "\n                  AND ".join(same)
     return f"""EXISTS (SELECT 1 FROM "OBSERVATIONS" x
@@ -463,11 +513,11 @@ def duplicates_sql(planned: PlannedGroup) -> str:
     assert target is not None
     return f"""
 SELECT json_build_object('t', 'dup', 'ds', {int(g.ds)}, 'sid', {lit(g.sid)}, 'prop', {lit(g.prop)},
-                         'thing', {lit(g.thing)}, 'n', count(*))::text
+                         'thing', {lit(g.thing)}, 'sname', {lit(g.sensor_name)}, 'n', count(*))::text
   FROM "OBSERVATIONS" o
  WHERE o."DATASTREAM_ID" = {int(g.ds)} AND o."ID" BETWEEN {int(g.min_id)} AND {int(g.max_id)}
    AND {label_filter("o", g)}
-   AND {same_reading_sql(target.id)};
+   AND {same_reading_sql(target.id, sensor_id=planned.relabel)};
 """
 
 
@@ -480,7 +530,7 @@ def batch_select_sql(planned: PlannedGroup, after_id: int, limit: int) -> str:
     assert target is not None
     return f"""
 SELECT json_build_object('t', 'row', 'id', o."ID", 'foi', o."FEATURE_ID", 'num', o."RESULT_NUMBER",
-                         'dup', {same_reading_sql(target.id)})::text
+                         'dup', {same_reading_sql(target.id, sensor_id=planned.relabel)})::text
   FROM "OBSERVATIONS" o
  WHERE o."DATASTREAM_ID" = {int(g.ds)} AND o."ID" > {int(after_id)} AND o."ID" <= {int(g.max_id)}
    AND {label_filter("o", g)}
@@ -489,15 +539,26 @@ SELECT json_build_object('t', 'row', 'id', o."ID", 'foi', o."FEATURE_ID", 'num',
 """
 
 
-def move_sql(from_ds: int, to_ds: int, rows: Sequence[tuple[int, int | None]], foi: int | None) -> str:
-    """Move the listed rows that are still in from_ds; foi None keeps each row's FEATURE_ID."""
+def _set_sensor_id(sensor_id: str | None) -> str:
+    """The SET item that relabels PARAMETERS.sensor_id; empty for None."""
+    if sensor_id is None:
+        return ""
+    return f""", "PARAMETERS" = jsonb_set(o."PARAMETERS", '{{sensor_id}}', to_jsonb({lit(sensor_id)}::text))"""
+
+
+def move_sql(from_ds: int, to_ds: int, rows: Sequence[tuple[int, int | None]], foi: int | None,
+             sensor_id: str | None = None) -> str:
+    """Move the listed rows that are still in from_ds; foi None keeps each row's FEATURE_ID.
+
+    ``sensor_id`` (--sensor-type-split) also sets PARAMETERS.sensor_id to it.
+    """
     values = ", ".join(f"({int(i)}::bigint, {'NULL' if f is None else int(f)}::bigint)" for i, f in rows)
     feature = "o.\"FEATURE_ID\"" if foi is None else f"{int(foi)}"
     return f"""
 WITH v(id, foi) AS (VALUES {values}),
 moved AS (
     UPDATE "OBSERVATIONS" o
-       SET "DATASTREAM_ID" = {int(to_ds)}, "FEATURE_ID" = {feature}
+       SET "DATASTREAM_ID" = {int(to_ds)}, "FEATURE_ID" = {feature}{_set_sensor_id(sensor_id)}
       FROM v
      WHERE o."ID" = v.id AND o."DATASTREAM_ID" = {int(from_ds)}
     RETURNING o."ID"
@@ -506,14 +567,17 @@ SELECT json_build_object('t', 'moved', 'n', count(*))::text FROM moved;
 """
 
 
-def restore_sql(from_ds: int, to_ds: int, rows: Sequence[tuple[int, int | None]]) -> str:
-    """Rollback: rows still in to_ds go back to from_ds with their recorded FEATURE_ID."""
+def restore_sql(from_ds: int, to_ds: int, rows: Sequence[tuple[int, int | None]], sensor_id: str | None = None) -> str:
+    """Rollback: rows still in to_ds go back to from_ds with their recorded FEATURE_ID.
+
+    ``sensor_id``: the PARAMETERS.sensor_id they had before a --sensor-type-split move, restored too.
+    """
     values = ", ".join(f"({int(i)}::bigint, {'NULL' if f is None else int(f)}::bigint)" for i, f in rows)
     return f"""
 WITH v(id, foi) AS (VALUES {values}),
 restored AS (
     UPDATE "OBSERVATIONS" o
-       SET "DATASTREAM_ID" = {int(from_ds)}, "FEATURE_ID" = v.foi
+       SET "DATASTREAM_ID" = {int(from_ds)}, "FEATURE_ID" = v.foi{_set_sensor_id(sensor_id)}
       FROM v
      WHERE o."ID" = v.id AND o."DATASTREAM_ID" = {int(to_ds)}
     RETURNING o."ID"
@@ -649,7 +713,7 @@ def parse_groups(lines: Sequence[str]) -> list[Group]:
 
 
 def merge_groups(groups: Iterable[Group]) -> list[Group]:
-    merged: dict[tuple[int, str | None, str | None, str | None], Group] = {}
+    merged: dict[GroupKey, Group] = {}
     for group in groups:
         known = merged.get(group.key)
         if known is None:
@@ -693,13 +757,19 @@ def plan_group(group: Group, catalogue: Catalogue, by_sensor: dict[tuple[str, st
     if len(candidates) > 1:
         return PlannedGroup(group, AMBIGUOUS, note="datastreams " + ",".join(str(c.id) for c in candidates))
 
-    target = candidates[0]
+    return _move_to(group, source, candidates[0], catalogue)
+
+
+def _move_to(group: Group, source: Datastream, target: Datastream, catalogue: Catalogue,
+             relabel: str | None = None) -> PlannedGroup:
+    """A move within one Thing keeps each row's FoI; to another Thing it needs that Thing's generated FoI."""
     if target.thing_id == source.thing_id:
-        return PlannedGroup(group, MOVE, target, foi=None)
+        return PlannedGroup(group, MOVE, target, foi=None, relabel=relabel)
     thing_foi = catalogue.fois.get(target.thing_id)
     if thing_foi is None or thing_foi.foi is None:
-        return PlannedGroup(group, MOVE_BLOCKED, target, note="target Thing has no single Location with a generated FoI")
-    return PlannedGroup(group, MOVE, target, foi=thing_foi.foi)
+        return PlannedGroup(group, MOVE_BLOCKED, target, note="target Thing has no single Location with a generated FoI",
+                            relabel=relabel)
+    return PlannedGroup(group, MOVE, target, foi=thing_foi.foi, relabel=relabel)
 
 
 def build_plan(groups: Iterable[Group], catalogue: Catalogue) -> Plan:
@@ -891,7 +961,7 @@ def count_duplicates(run_sql: RunSql, plan: Plan, chunk: int) -> dict[tuple[Any,
     for part in _chunks(moves, chunk):
         for row in parse_json_lines(run_sql(READ_ONLY_SESSION + "".join(duplicates_sql(p) for p in part)), "dup"):
             if int(row["n"]):
-                found[(int(row["ds"]), row.get("sid"), row.get("prop"), row.get("thing"))] = int(row["n"])
+                found[(int(row["ds"]), row.get("sid"), row.get("prop"), row.get("thing"), row.get("sname"))] = int(row["n"])
     return found
 
 
@@ -1090,13 +1160,17 @@ def apply_moves(run_sql: RunSql, plan: Plan, ids_file: IdsFile, args: argparse.N
             batch_no += 1
             batch = f"{run_id}-{batch_no}"
             # Durable record first: what moves where, and each row's FEATURE_ID and RESULT_NUMBER now.
-            ids_file.append({
+            record: dict[str, Any] = {
                 "op": "move", "batch": batch, "from_ds": g.ds, "to_ds": target.id, "to_foi": planned.foi,
                 "rows": [[i, f, r.get("num")] for (i, f), r in zip(ids, to_move, strict=True)],
-            })
+            }
+            if planned.relabel is not None:  # --sensor-type-split: the label before and after, for --rollback
+                record |= {"from_sensor_id": g.sid, "to_sensor_id": planned.relabel}
+            ids_file.append(record)
             written = True
             try:
-                result = parse_json_lines(run_sql(WRITE_SESSION + move_sql(g.ds, target.id, ids, planned.foi)), "moved")
+                sql = move_sql(g.ds, target.id, ids, planned.foi, planned.relabel)
+                result = parse_json_lines(run_sql(WRITE_SESSION + sql), "moved")
             except PsqlError as exc:
                 note = _refresh_after_failure(run_sql, pair, args.chunk)
                 raise PsqlError(f"{exc} (batch {batch}; rows moved before it: {moved:,}; re-running is safe, "
@@ -1149,7 +1223,8 @@ def rollback(run_sql: RunSql, ids_file: IdsFile, chunk: int, datastreams: Iterab
         pending |= {from_ds, to_ds}
         for part in _chunks(recorded_rows(record), batch_rows):
             try:
-                result = parse_json_lines(run_sql(WRITE_SESSION + restore_sql(from_ds, to_ds, part)), "restored")
+                sql = restore_sql(from_ds, to_ds, part, record.get("from_sensor_id") if "to_sensor_id" in record else None)
+                result = parse_json_lines(run_sql(WRITE_SESSION + sql), "restored")
             except PsqlError as exc:
                 note = _refresh_after_failure(run_sql, pending, chunk)
                 raise PsqlError(f"{exc} (moving batch {record['batch']} back; rows moved back before it: "
@@ -1241,6 +1316,305 @@ def print_move_states(states: Sequence[MoveState]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# --sensor-type-split (#40): non-owner rows out of mixed Sensor.Community location datastreams
+# ---------------------------------------------------------------------------
+
+OWNER_MISSING = "owner-missing"
+UNPARSABLE = "unparsable-type"
+OTHER_LABEL = "other-label"
+TYPE_SPLIT_ACTIONS = (MOVE, MOVE_BLOCKED, NEEDS_DATASTREAM, AMBIGUOUS, OWNER_MISSING, UNPARSABLE, OTHER_LABEL)
+
+# The sensor type in PARAMETERS.sensor_name ("SensorCommunity 6591 DHT22 sensor"): the same pattern in
+# PostgreSQL (substring ... from, an ARE) and Python (fullmatch with DOTALL: '.' also matches a line end there).
+SENSOR_NAME_PATTERN = r"^SensorCommunity \S+ (.*) sensor$"
+_SENSOR_NAME_TYPE = re.compile(r"SensorCommunity \S+ (.*) sensor", re.DOTALL)
+_LOCATION_SENSOR_ID = re.compile(r"sensor_community-([^-]+)")
+OWNERS_FILE_VERSION = 1
+
+Owners = dict[str, dict[str, str]]  # location id -> {canonical property: owner sensor type}
+
+
+class OwnersFileError(RuntimeError):
+    pass
+
+
+def load_owners_file(path: Path) -> Owners:
+    """The connector's data/sc_sensor_owners.json: {"version": 1, "owners": {loc: {property: type}}}.
+
+    Unlike the connector, which starts empty, anything unexpected is an error here: a move
+    decided on a wrong owner map would move the wrong rows.
+    """
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise OwnersFileError(f"--owners {path}: unreadable ({exc})") from exc
+    if (not isinstance(document, dict) or document.get("version") != OWNERS_FILE_VERSION
+            or not isinstance(document.get("owners"), dict)):
+        raise OwnersFileError(f"--owners {path}: not a version {OWNERS_FILE_VERSION} owner map "
+                              '({"version": 1, "owners": {"<location>": {"<property>": "<sensor type>"}}})')
+    owners: Owners = {}
+    for loc, props in document["owners"].items():
+        if not isinstance(props, dict) or not all(isinstance(t, str) and t for t in props.values()):
+            raise OwnersFileError(f"--owners {path}: location {loc!r}: not a {{property: sensor type}} map")
+        owners[str(loc)] = {canonical(str(prop)): str(owner) for prop, owner in props.items()}
+    return owners
+
+
+def parse_sensor_type(sensor_name: str | None) -> str | None:
+    """The sensor type of a PARAMETERS.sensor_name ("SensorCommunity 6591 DHT22 sensor" -> "DHT22"); None if not one."""
+    match = _SENSOR_NAME_TYPE.fullmatch(sensor_name or "")
+    return match[1] if match else None
+
+
+def location_of(ds: Datastream) -> str | None:
+    """The location id of a Sensor.Community location datastream (sensor_id 'sensor_community-{loc}'), else None."""
+    if ds.source != SC_SOURCE:
+        return None
+    match = _LOCATION_SENSOR_ID.fullmatch(ds.sensor_id)
+    return match[1] if match else None
+
+
+def location_datastreams(catalogue: Catalogue, owners: Owners,
+                         only: Iterable[int] | None = None) -> list[tuple[int, str, str | None]]:
+    """(id, sensor_id, owner type or None) of every Sensor.Community location datastream (those in ``only``)."""
+    wanted = set(only or ())
+    out = []
+    for ds in sorted(catalogue.datastreams.values(), key=lambda d: d.id):
+        loc = location_of(ds)
+        if loc is not None and (not wanted or ds.id in wanted):
+            out.append((ds.id, ds.sensor_id, owners.get(loc, {}).get(ds.prop)))
+    return out
+
+
+def type_split_scan_sql(where: str, datastreams: Sequence[tuple[int, str, str | None]]) -> str:
+    """Groups of the rows selected by ``where`` (on alias o) in these location datastreams, labelled with the
+    datastream's sensor_id, whose sensor type is not the datastream's owner (all rows when it has none)."""
+    values = ", ".join(f"({int(ds)}, {lit(sid)}::text, {lit(owner)}::text)" for ds, sid, owner in datastreams)
+    return f"""
+WITH v(ds, sid, owner) AS (VALUES {values})
+SELECT json_build_object('t', 'tgrp', 'ds', g.ds, 'sid', g.sid, 'prop', g.prop, 'thing', g.thing, 'loc', g.loc,
+                         'sname', g.sname, 'n', g.n, 'min_id', g.min_id, 'max_id', g.max_id, 'first', g.first,
+                         'last', g.last)::text
+  FROM (SELECT o."DATASTREAM_ID" AS ds, o."PARAMETERS"->>'sensor_id' AS sid,
+               o."PARAMETERS"->>'observed_property' AS prop, o."PARAMETERS"->>'thing_name' AS thing,
+               o."PARAMETERS"->>'sensor_name' AS sname,
+               max(o."PARAMETERS"->>'location') AS loc, count(*) AS n, min(o."ID") AS min_id, max(o."ID") AS max_id,
+               min(o."PHENOMENON_TIME_START") AS first, max(o."PHENOMENON_TIME_START") AS last
+          FROM "OBSERVATIONS" o
+          JOIN v ON v.ds = o."DATASTREAM_ID"
+         WHERE {where}
+           AND o."PARAMETERS"->>'sensor_id' = v.sid
+           AND substring(o."PARAMETERS"->>'sensor_name' from {lit(SENSOR_NAME_PATTERN)}) IS DISTINCT FROM v.owner
+         GROUP BY 1, 2, 3, 4, 5) g;
+"""
+
+
+def type_split_range_sql(first_id: int, last_id: int, max_id: int,
+                         datastreams: Sequence[tuple[int, str, str | None]]) -> str:
+    return type_split_scan_sql(f'o."ID" BETWEEN {int(first_id)} AND {min(int(last_id), int(max_id))}', datastreams)
+
+
+def type_split_datastream_sql(ds_id: int, max_id: int, datastreams: Sequence[tuple[int, str, str | None]]) -> str:
+    return type_split_scan_sql(f'o."DATASTREAM_ID" = {int(ds_id)} AND o."ID" <= {int(max_id)}', datastreams)
+
+
+def parse_type_groups(lines: Sequence[str]) -> list[Group]:
+    return [
+        Group(
+            ds=int(row["ds"]), sid=row.get("sid"), prop=row.get("prop"), thing=row.get("thing"), loc=row.get("loc"),
+            rows=int(row["n"]), min_id=int(row["min_id"]), max_id=int(row["max_id"]),
+            first=str(row.get("first") or ""), last=str(row.get("last") or ""), sensor_name=row.get("sname"),
+        )
+        for row in parse_json_lines(lines, "tgrp")
+    ]
+
+
+def type_split_scan(run_sql: RunSql, bounds: tuple[int, int] | None, catalogue: Catalogue, owners: Owners,
+                    args: argparse.Namespace) -> list[Group]:
+    """Non-owner groups with ID <= --max-id: by ID range over all rows, or per datastream with --datastream."""
+    datastreams = location_datastreams(catalogue, owners, args.datastream)
+    if not datastreams:
+        return []
+    if args.datastream:
+        statements = [type_split_datastream_sql(ds, args.max_id, datastreams) for ds, _, _ in datastreams]
+    elif bounds is None or bounds[0] > args.max_id:
+        return []
+    else:
+        statements = [type_split_range_sql(lo, hi, args.max_id, datastreams)
+                      for lo, hi in scan_ranges((bounds[0], min(bounds[1], args.max_id)), args.range_ids)]
+    groups: list[Group] = []
+    done = 0
+    for part in _chunks(statements, args.chunk):
+        groups += parse_type_groups(run_sql(READ_ONLY_SESSION + "".join(part)))
+        done += len(part)
+        _progress(f"  scanned {done}/{len(statements)} statements, {len(groups)} group rows so far")
+        if args.pause:
+            time.sleep(args.pause)
+    return merge_groups(groups)
+
+
+def plan_type_group(group: Group, catalogue: Catalogue, owners: Owners,
+                    by_sensor: dict[tuple[str, str], list[Datastream]]) -> PlannedGroup | None:
+    """Where a group of one sensor type in a location datastream goes; None when that type is the owner."""
+    source = catalogue.datastreams.get(group.ds)
+    loc = location_of(source) if source is not None else None
+    if source is None or loc is None:
+        return PlannedGroup(group, AMBIGUOUS, note="source is not a Sensor.Community location datastream")
+    owner = owners.get(loc, {}).get(source.prop)
+    if owner is None:
+        return PlannedGroup(group, OWNER_MISSING, note=f"no owner of ({loc}, {source.prop}) in the owners file")
+    if group.sid != source.sensor_id or canonical(group.prop) != source.prop:
+        return PlannedGroup(group, OTHER_LABEL, note="labelled with another sensor or property: the default "
+                                                     "(misrouted) mode's job")
+    sensor_type = parse_sensor_type(group.sensor_name)
+    if sensor_type is None:
+        return PlannedGroup(group, UNPARSABLE, note=f"sensor_name {group.sensor_name!r} names no sensor type")
+    if sensor_type == owner:
+        return None
+    target_sid = type_sensor_id(loc, sensor_type)
+    candidates = by_sensor.get((target_sid, source.prop), [])
+    if not candidates:
+        return PlannedGroup(group, NEEDS_DATASTREAM, note=f"no datastream {target_sid} / {source.prop} yet")
+    if len(candidates) > 1:
+        return PlannedGroup(group, AMBIGUOUS, note="datastreams " + ",".join(str(c.id) for c in candidates))
+    return _move_to(group, source, candidates[0], catalogue, relabel=candidates[0].sensor_id)
+
+
+def build_type_split_plan(groups: Iterable[Group], catalogue: Catalogue, owners: Owners) -> Plan:
+    by_sensor = catalogue.by_sensor_prop()
+    plan = Plan()
+    for group in groups:
+        planned = plan_type_group(group, catalogue, owners, by_sensor)
+        if planned is not None:
+            plan.groups.append(planned)
+    return plan
+
+
+def _owner_of(ds: Datastream | None, owners: Owners) -> str:
+    loc = location_of(ds) if ds is not None else None
+    return owners.get(loc or "", {}).get(ds.prop if ds else "", "") or "(none)"
+
+
+def print_type_split_report(plan: Plan, catalogue: Catalogue, owners: Owners,
+                            duplicates: dict[GroupKey, int]) -> None:
+    """Per source datastream: each non-owner type's rows, what happens to them and where; totals by type."""
+    per_ds: dict[int, list[PlannedGroup]] = defaultdict(list)
+    for planned in plan.groups:
+        per_ds[planned.group.ds].append(planned)
+    print("\nNon-owner rows per source datastream")
+    for ds_id in sorted(per_ds):
+        ds = catalogue.datastreams.get(ds_id)
+        print(f"  {ds_id:>8}  {ds.name if ds else '?'}  [{ds.prop if ds else '?'}, owner {_owner_of(ds, owners)}]")
+        for planned in sorted(per_ds[ds_id], key=lambda p: -p.group.rows):
+            g, target = planned.group, planned.target
+            sensor_type = parse_sensor_type(g.sensor_name) or repr(g.sensor_name)
+            where = f"-> {target.id} {target.name}" if target is not None else planned.note
+            dup = duplicates.get(g.key)
+            kept = f" ({dup:,} kept: target holds the same reading)" if dup else ""
+            print(f"    {sensor_type:<16}{g.rows:>10,}  {planned.action:<17}{where}{kept}")
+
+    by_type: dict[str, Counter[str]] = defaultdict(Counter)
+    for planned in plan.groups:
+        by_type[parse_sensor_type(planned.group.sensor_name) or "(unparsable)"][planned.action] += planned.group.rows
+    print("\nTotals by sensor type")
+    print(f"  {'type':<16}" + "".join(f"{a:>18}" for a in TYPE_SPLIT_ACTIONS))
+    for sensor_type in sorted(by_type, key=lambda t: -sum(by_type[t].values())):
+        print(f"  {sensor_type:<16}" + "".join(f"{by_type[sensor_type][a]:>18,}" for a in TYPE_SPLIT_ACTIONS))
+    by_action = plan.by_action()
+    print(f"  {'total':<16}" + "".join(f"{sum(p.group.rows for p in by_action.get(a, [])):>18,}"
+                                       for a in TYPE_SPLIT_ACTIONS))
+    if duplicates:
+        print(f"  of the moves, rows whose target already holds the same reading (not moved): "
+              f"{sum(duplicates.values()):,}")
+
+
+def write_type_split_csv(path: Path, plan: Plan, catalogue: Catalogue, owners: Owners,
+                         duplicates: dict[GroupKey, int]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as out:
+        writer = csv.writer(out)
+        writer.writerow([
+            "action", "source_datastream", "source_name", "location", "property", "owner", "sensor_type",
+            "label_sensor_name", "label_sensor_id", "label_observed_property", "rows", "first", "last", "min_id",
+            "max_id", "target_datastream", "target_name", "target_sensor_id", "feature_id", "duplicates", "note",
+        ])
+        for planned in sorted(plan.groups, key=lambda p: (TYPE_SPLIT_ACTIONS.index(p.action), p.group.ds,
+                                                          -p.group.rows)):
+            g, target = planned.group, planned.target
+            source = catalogue.datastreams.get(g.ds)
+            writer.writerow([
+                planned.action, g.ds, source.name if source else "", (location_of(source) if source else "") or "",
+                source.prop if source else "", _owner_of(source, owners), parse_sensor_type(g.sensor_name) or "",
+                g.sensor_name or "", g.sid or "", g.prop or "", g.rows, g.first, g.last, g.min_id, g.max_id,
+                target.id if target else "", target.name if target else "", planned.relabel or "",
+                "" if planned.foi is None else planned.foi, duplicates.get(g.key, ""), planned.note,
+            ])
+
+
+def run_type_split(args: argparse.Namespace, run_sql: RunSql) -> int:
+    mode = "APPLY: moves observations" if args.apply else "DRY RUN: read-only, nothing is written"
+    print(f"Sensor.Community type split: non-owner rows with ID <= {args.max_id:,} ({mode})")
+    owners = load_owners_file(args.owners)
+    print(f"Owners: {sum(len(p) for p in owners.values()):,} (location, property) owners at {len(owners):,} "
+          f"locations ({args.owners})")
+    ids_file = IdsFile(args.ids_file) if args.apply else None
+    if ids_file is not None:
+        ids_file.prepare()  # a wrong file fails before anything else; a cut-off last line goes
+    catalogue, bounds = parse_catalogue(run_sql(READ_ONLY_SESSION + catalogue_sql()), args.prefix)
+    locations = location_datastreams(catalogue, owners)
+    print(f"Catalogue: {len(catalogue.datastreams):,} datastreams, {len(locations):,} Sensor.Community location "
+          f"datastreams ({sum(1 for _, _, o in locations if o is None):,} without an owner); observation IDs {bounds}")
+    if args.datastream:
+        not_location = sorted(set(args.datastream) - {ds for ds, _, _ in locations})
+        if not_location:
+            print(f"Not Sensor.Community location datastreams: {not_location}")
+            return 1
+
+    _progress("Scanning (Sensor.Community location datastreams, rows up to --max-id) ...")
+    plan = build_type_split_plan(type_split_scan(run_sql, bounds, catalogue, owners, args), catalogue, owners)
+    duplicates = {} if args.no_duplicate_check else count_duplicates(run_sql, plan, args.chunk)
+    print_type_split_report(plan, catalogue, owners, duplicates)
+    if args.plan_file:
+        write_type_split_csv(args.plan_file, plan, catalogue, owners, duplicates)
+        print(f"\nPlan written to {args.plan_file}")
+
+    moves = plan.by_action()[MOVE]
+    print(f"\nPlan: move {sum(p.group.rows for p in moves):,} rows in {len(moves)} groups (DATASTREAM_ID and "
+          f"PARAMETERS.sensor_id), UPDATEs of at most {args.batch_rows:,} rows, each committed on its own; the "
+          "phenomenon/result times of each group's source and target datastream are refreshed once its batches "
+          "are done.")
+    if moves:
+        example = moves[0]
+        print("First batch would be selected with:" + batch_select_sql(example, example.group.min_id - 1, args.batch_rows))
+    if ids_file is None:
+        print("Dry run: nothing was written. Re-run with --apply --ids-file PATH to move.")
+        return 0
+
+    if refuse_if_busy(run_sql):
+        return 1
+    refresh_recorded(run_sql, ids_file, args.chunk)  # what an earlier, interrupted run may have left stale
+    ids_file.append({"op": "run", "mode": "sensor-type-split", "max_id": args.max_id,
+                     "started": datetime.now(UTC).isoformat(), "datastreams": args.datastream or "all"})
+    _progress(f"Applying; every batch is recorded in {args.ids_file} before it is written ...")
+    moved, skipped, touched = apply_moves(run_sql, plan, ids_file, args)
+    print(f"Moved {moved:,} observations ({skipped:,} left in place: their target already holds "
+          f"the same reading); refreshed times of {len(touched)} datastreams. Record: {args.ids_file}")
+
+    sources = sorted({p.group.ds for p in plan.groups})
+    if not sources:
+        return 0
+    _progress("Verifying, read-only ...")
+    recheck = argparse.Namespace(**{**vars(args), "datastream": sources})
+    after = build_type_split_plan(type_split_scan(run_sql, bounds, catalogue, owners, recheck), catalogue, owners)
+    left = {action: sum(p.group.rows for p in items) for action, items in after.by_action().items()}
+    kept = sum(count_duplicates(run_sql, after, args.chunk).values())
+    movable = left.get(MOVE, 0) - kept
+    others = ", ".join(f"{a} {left.get(a, 0):,}" for a in TYPE_SPLIT_ACTIONS if a != MOVE)
+    print(f"Verification: non-owner rows with ID <= {args.max_id:,} left in the {len(sources)} source datastreams: "
+          f"to move {movable:,}, kept as duplicates {kept:,}; {others}.")
+    return 1 if movable else 0
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1281,7 +1655,27 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--top", type=int, default=15, help="lines per report section (%(default)s)")
     parser.add_argument("--no-duplicate-check", action="store_true", help="skip counting duplicates in the dry run")
     parser.add_argument("--timeout", type=float, default=1800, help="seconds per psql session (%(default)s)")
+    parser.add_argument("--sensor-type-split", action="store_true",
+                        help="instead of misrouted rows: move the rows of non-owner sensor types out of "
+                             "Sensor.Community location datastreams into their type's datastream (#40); needs "
+                             "--owners and --max-id")
+    parser.add_argument("--owners", type=Path, metavar="PATH",
+                        help="with --sensor-type-split: a copy of the connector's data/sc_sensor_owners.json")
+    parser.add_argument("--max-id", type=int, metavar="N",
+                        help="with --sensor-type-split: only observations with ID <= N (the last ID before the "
+                             "connector wrote per-type datastreams)")
     args = parser.parse_args(argv)
+    if args.sensor_type_split:
+        if args.rollback or args.refresh_only:
+            parser.error("--rollback and --refresh-only work from the IDs file alone: no --sensor-type-split")
+        if args.owners is None or args.max_id is None:
+            parser.error("--sensor-type-split needs --owners and --max-id")
+        if not args.owners.is_file():
+            parser.error(f"--owners {args.owners} does not exist")
+        if args.max_id < 1:
+            parser.error("--max-id must be positive")
+    elif args.owners is not None or args.max_id is not None:
+        parser.error("--owners and --max-id only go with --sensor-type-split")
     if min(args.range_ids, args.batch_rows, args.chunk, args.top) < 1:
         parser.error("--range-ids, --batch-rows, --chunk and --top must be positive")
     if args.refresh_only and (args.apply or args.rollback):
@@ -1359,6 +1753,8 @@ def run(args: argparse.Namespace, run_sql: RunSql) -> int:
         return run_refresh_only(args, run_sql)
     if args.rollback:
         return run_rollback(args, run_sql)
+    if args.sensor_type_split:
+        return run_type_split(args, run_sql)
 
     mode = "APPLY: moves observations" if args.apply else "DRY RUN: read-only, nothing is written"
     print(f"Misrouted Sensor.Community observations ({mode})")
@@ -1427,7 +1823,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     try:
         return run(args, run_sql)
-    except (PsqlError, IdsFileError, OSError) as exc:
+    except (PsqlError, IdsFileError, OwnersFileError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

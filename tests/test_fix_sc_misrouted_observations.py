@@ -8,6 +8,7 @@ throwaway FROST-Server 2.8 + PostGIS.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import re
@@ -16,7 +17,7 @@ import socket
 import subprocess
 import time
 import uuid
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -1152,3 +1153,456 @@ def test_with_the_pressure_backfill_either_undo_order_restores_the_seed_on_frost
     after = _datastreams(s.db)
     emptied = {s.ds[label] for label in _EMPTY_BEFORE}
     assert {i: v for i, v in after.items() if i not in emptied} == {i: v for i, v in seeded_ds.items() if i not in emptied}
+
+
+# ---------------------------------------------------------------------------
+# --sensor-type-split (#40): non-owner sensor types out of Sensor.Community location datastreams
+# ---------------------------------------------------------------------------
+
+# Shaped like production's mixed datastreams (#37): 6591 BME280 + DHT22 (temperature and humidity), 55085
+# SPS30 + SDS011 (PM), 95248 BME280 + SCD30 whose SCD30 humidity datastream doesn't exist yet, and 777 whose
+# location never reported after the #39 deploy, so it has no owner.
+_SPLIT_OWNERS = {"6591": {"temperature": "BME280", "humidity": "BME280"},
+                 "55085": {"pm2_5": "SPS30", "pm10": "SPS30"},
+                 "95248": {"temperature": "BME280", "humidity": "BME280"}}
+_SPLIT_DS: dict[int, tuple[int, str, str]] = {  # id: (Thing, sensor_id, observed_property)
+    2001: (10, "sensor_community-6591", "temperature"), 2002: (10, "sensor_community-6591", "humidity"),
+    2003: (10, "sensor_community-6591-dht22", "temperature"), 2004: (10, "sensor_community-6591-dht22", "humidity"),
+    2101: (20, "sensor_community-55085", "pm2_5"), 2102: (20, "sensor_community-55085", "pm10"),
+    2103: (20, "sensor_community-55085-sds011", "pm2_5"), 2104: (20, "sensor_community-55085-sds011", "pm10"),
+    2201: (30, "sensor_community-95248", "temperature"), 2202: (30, "sensor_community-95248", "humidity"),
+    2203: (30, "sensor_community-95248-scd30", "temperature"),
+    2301: (40, "sensor_community-777", "temperature"),
+}
+_SPLIT_MAX_ID = 100
+_VALUES_OWNER = re.compile(r"\((\d+), ('(?:[^']|'')*'|NULL)::text, ('(?:[^']|'')*'|NULL)::text\)")
+
+
+@dataclass
+class _TObs:
+    ds: int
+    sid: str
+    prop: str
+    sname: str | None
+    num: float = 20.0
+    foi: int = 110
+
+
+def _sname(loc: str, sensor_type: str) -> str:
+    return f"SensorCommunity {loc} {sensor_type} sensor"
+
+
+def _split_obs() -> dict[int, _TObs]:
+    a, b, c, d = "sensor_community-6591", "sensor_community-55085", "sensor_community-95248", "sensor_community-777"
+    return {
+        1: _TObs(2001, a, "temperature", _sname("6591", "BME280")),
+        2: _TObs(2001, a, "temperature", _sname("6591", "DHT22"), num=21.0),
+        3: _TObs(2001, a, "temperature", _sname("6591", "BME280")),
+        4: _TObs(2001, a, "temperature", _sname("6591", "DHT22"), num=22.0),
+        5: _TObs(2002, a, "humidity", _sname("6591", "BME280")),
+        6: _TObs(2002, a, "humidity", _sname("6591", "DHT22"), num=70.0),
+        7: _TObs(2101, b, "pm2_5", _sname("55085", "SPS30"), foi=120),
+        8: _TObs(2101, b, "pm2_5", _sname("55085", "SDS011"), num=5.0, foi=120),
+        9: _TObs(2102, b, "pm10", _sname("55085", "SDS011"), num=9.0, foi=120),
+        10: _TObs(2201, c, "temperature", _sname("95248", "SCD30"), foi=130),
+        11: _TObs(2202, c, "humidity", _sname("95248", "SCD30"), foi=130),
+        12: _TObs(2301, d, "temperature", _sname("777", "DHT22"), foi=140),
+        13: _TObs(2001, a, "temperature", "airrohr 6591", foi=110),
+        500: _TObs(2001, a, "temperature", _sname("6591", "DHT22")),  # after --max-id: written after #39
+    }
+
+
+def _unquote(literal: str) -> str | None:
+    return None if literal == "NULL" else literal[1:-1].replace("''", "'")
+
+
+class TypeSplitDb:
+    """psql for --sensor-type-split, in memory: like FakeDb it answers by JSON tag and keeps where every row
+    is and its PARAMETERS.sensor_id; the type-split scan is evaluated from the statement's VALUES list (owner
+    per datastream), its ID bounds and the same sensor_name pattern. The real SQL runs on FROST in
+    tests/integration/test_sc_type_split_it.py."""
+
+    def __init__(self, obs: dict[int, _TObs] | None = None, bounds: tuple[int, int] = (1, 500)) -> None:
+        self.obs = obs if obs is not None else _split_obs()
+        self.bounds = bounds
+        self.sessions: list[str] = []
+        self.scanned: list[tuple[str, int, int]] = []  # ("range", lo, hi) or ("ds", id, max id)
+        self.refreshed: list[list[int]] = []
+
+    def __call__(self, sql: str) -> list[str]:
+        self.sessions.append(sql)
+        if 'UPDATE "DATASTREAMS"' in sql:
+            self.refreshed.append([int(i) for i in re.findall(r'WHERE d\."ID" = (\d+);', sql)])
+            return []
+        if "'t', 'busy'" in sql:
+            return []
+        if "'t', 'ds'" in sql:
+            return self._catalogue()
+        if "'t', 'tgrp'" in sql:
+            return [line for statement in sql.split(";\n") if "'t', 'tgrp'" in statement
+                    for line in self._groups(statement)]
+        if "'t', 'row'" in sql:
+            return self._batch(sql)
+        if "moved AS" in sql or "restored AS" in sql:
+            return self._write(sql)
+        return []  # duplicates: none
+
+    def _catalogue(self) -> list[str]:
+        things = {10: "6591", 20: "55085", 30: "95248", 40: "777"}
+        lines = [
+            _line(t="ds", id=ds, name=f"GEO_SensorCommunity {sid.split('-', 1)[1]} sensor - {prop}", thing_id=thing,
+                  thing=f"GEO_SensorCommunity {things[thing]}", source="sensor_community", sensor_id=sid, prop=prop)
+            for ds, (thing, sid, prop) in _SPLIT_DS.items()
+        ]
+        fois = [_line(t="foi", thing_id=t, locations=1, foi=100 + t, fois=1) for t in things]
+        return [*lines, *fois, _line(t="bounds", min=self.bounds[0], max=self.bounds[1])]
+
+    def _groups(self, statement: str) -> list[str]:
+        owners = {int(ds): (_unquote(sid), _unquote(owner)) for ds, sid, owner in _VALUES_OWNER.findall(statement)}
+        if m := re.search(r'o\."ID" BETWEEN (\d+) AND (\d+)', statement):
+            self.scanned.append(("range", int(m[1]), int(m[2])))
+            selected = {i for i in self.obs if int(m[1]) <= i <= int(m[2])}
+        else:
+            m = re.search(r'o\."DATASTREAM_ID" = (\d+) AND o\."ID" <= (\d+)', statement)
+            assert m is not None
+            self.scanned.append(("ds", int(m[1]), int(m[2])))
+            selected = {i for i, o in self.obs.items() if o.ds == int(m[1]) and i <= int(m[2])}
+        groups: dict[tuple[int, str, str, str | None], list[int]] = defaultdict(list)
+        for i in sorted(selected):
+            o = self.obs[i]
+            if o.ds in owners and o.sid == owners[o.ds][0] and fix.parse_sensor_type(o.sname) != owners[o.ds][1]:
+                groups[(o.ds, o.sid, o.prop, o.sname)].append(i)
+        return [
+            _line(t="tgrp", ds=ds, sid=sid, prop=prop, thing=f"SensorCommunity {sid.split('-')[1]}",
+                  loc=sid.split("-")[1], sname=sname, n=len(ids), min_id=min(ids), max_id=max(ids),
+                  first="2026-11-12T14:12:23+00:00", last="2026-11-20T14:17:23+00:00")
+            for (ds, sid, prop, sname), ids in groups.items()
+        ]
+
+    def _batch(self, sql: str) -> list[str]:
+        where = re.search(r'WHERE o\."DATASTREAM_ID" = (\d+) AND o\."ID" > (\d+) AND o\."ID" <= (\d+)', sql)
+        sname = re.search(r"'sensor_name' = ('(?:[^']|'')*')", sql)
+        limit = re.search(r"LIMIT (\d+);", sql)
+        assert where is not None and sname is not None and limit is not None
+        ds, after, last = int(where[1]), int(where[2]), int(where[3])
+        rows = [(i, o) for i, o in sorted(self.obs.items())
+                if o.ds == ds and after < i <= last and o.sname == _unquote(sname[1])]
+        return [_line(t="row", id=i, foi=o.foi, num=o.num, dup=False) for i, o in rows[: int(limit[1])]]
+
+    def _write(self, sql: str) -> list[str]:
+        new = re.search(r'SET "DATASTREAM_ID" = (\d+)', sql)
+        now = re.search(r'WHERE o\."ID" = v\.id AND o\."DATASTREAM_ID" = (\d+)', sql)
+        label = re.search(r"to_jsonb\(('(?:[^']|'')*')::text\)", sql)
+        assert new is not None and now is not None
+        count = 0
+        for i in (int(i) for i in _VALUES_ID.findall(sql)):
+            if i in self.obs and self.obs[i].ds == int(now[1]):
+                self.obs[i].ds = int(new[1])
+                if label is not None:
+                    self.obs[i].sid = str(_unquote(label[1]))
+                count += 1
+        return [_line(t="moved" if "moved AS" in sql else "restored", n=count)]
+
+
+def _owners_file(path: Path, owners: dict[str, dict[str, str]] | None = None) -> Path:
+    path.write_text(json.dumps({"version": 1, "owners": _SPLIT_OWNERS if owners is None else owners}), encoding="utf-8")
+    return path
+
+
+def _split_args(tmp_path: Path, *extra: str, max_id: int = _SPLIT_MAX_ID) -> argparse.Namespace:
+    owners = _owners_file(tmp_path / "sc_sensor_owners.json")
+    return fix.parse_args(["--container", "db", "--sensor-type-split", "--owners", str(owners),
+                           "--max-id", str(max_id), *extra])
+
+
+def _split_catalogue() -> fix.Catalogue:
+    catalogue, _ = fix.parse_catalogue(TypeSplitDb()._catalogue(), "GEO_")
+    return catalogue
+
+
+def _tgroup(ds: int, loc: str, sensor_type: str | None, sname: str | None = None, prop: str | None = None) -> fix.Group:
+    if sname is None and sensor_type is not None:
+        sname = _sname(loc, sensor_type)
+    return fix.Group(ds=ds, sid=f"sensor_community-{loc}", prop=prop or _SPLIT_DS[ds][2],
+                     thing=f"SensorCommunity {loc}", loc=loc, rows=10, min_id=1, max_id=99, sensor_name=sname)
+
+
+def _split_plan(*groups: fix.Group) -> dict[Any, fix.PlannedGroup]:
+    return {p.group.key: p for p in fix.build_type_split_plan(groups, _split_catalogue(), _SPLIT_OWNERS).groups}
+
+
+def test_type_split_moves_a_non_owner_type_to_its_own_datastream_with_its_label() -> None:
+    """protects=selection + target resolution: a non-owner type's rows in a location datastream go to the
+    datastream of type_sensor_id(loc, type) and the same property, relabelled with its sensor_id, keeping their
+    FoI (same Thing); fails_when=the target is looked up by another slug/property, the label is not changed, or
+    the owner's rows are planned; no_claim=that the SQL selects these rows (integration test)."""
+    dht22 = _tgroup(2001, "6591", "DHT22")
+    sds011_pm10 = _tgroup(2102, "55085", "SDS011")
+    owner = _tgroup(2001, "6591", "BME280")
+
+    plan = _split_plan(dht22, sds011_pm10, owner)
+
+    moved = plan[dht22.key]
+    assert (moved.action, moved.target and moved.target.id, moved.foi) == (fix.MOVE, 2003, None)
+    assert moved.relabel == "sensor_community-6591-dht22" == fix.type_sensor_id("6591", "DHT22")
+    pm10 = plan[sds011_pm10.key]
+    assert (pm10.target and pm10.target.id, pm10.relabel) == (2104, "sensor_community-55085-sds011")
+    assert owner.key not in plan
+
+
+def test_type_split_target_uses_the_connectors_slug() -> None:
+    """protects=the target sensor_id is the connector's own (app.sources.sensor_community.type_sensor_id), also
+    for types with odd characters; fails_when=the script builds its own slug ('DNMS (Laerm)' -> 'dnms (laerm)');
+    no_claim=that every SC type name is in OWNER_RANK."""
+    catalogue = fix.Catalogue(
+        {1: fix.Datastream(1, "n", 10, "GEO_SensorCommunity 9", "sensor_community", "sensor_community-9", "noise_laeq"),
+         2: fix.Datastream(2, "n", 10, "GEO_SensorCommunity 9", "sensor_community", "sensor_community-9-dnms-laerm",
+                           "noise_laeq")},
+        {10: fix.ThingFoi(1, 110)}, "GEO_")
+    group = fix.Group(1, "sensor_community-9", "noise_laeq", "SensorCommunity 9", sensor_name=_sname("9", "DNMS (Laerm)"))
+
+    (planned,) = fix.build_type_split_plan([group], catalogue, {"9": {"noise_laeq": "SEN5x"}}).groups
+
+    assert (planned.action, planned.target and planned.target.id) == (fix.MOVE, 2)
+    assert planned.relabel == "sensor_community-9-dnms-laerm"
+
+
+def test_type_split_reports_a_missing_type_datastream_as_needs_datastream() -> None:
+    """protects=needs-datastream: a non-owner type without its datastream yet is reported, not moved;
+    fails_when=it is moved elsewhere (e.g. another property's type datastream) or dropped from the report;
+    no_claim=that the connector creates the datastream later."""
+    scd30_humidity = _tgroup(2202, "95248", "SCD30")
+
+    planned = _split_plan(scd30_humidity)[scd30_humidity.key]
+
+    assert (planned.action, planned.target, planned.relabel) == (fix.NEEDS_DATASTREAM, None, None)
+    assert "sensor_community-95248-scd30 / humidity" in planned.note
+
+
+def test_type_split_never_moves_unparsable_sensor_names_or_locations_without_an_owner() -> None:
+    """protects=rows whose type can't be read, or whose (loc, property) has no owner, or that carry another
+    property's label, are reported and never moved; fails_when=such a group gets a target (e.g. treated as
+    type '' or as 'not the owner'); no_claim=what should happen to them later."""
+    garbage = _tgroup(2001, "6591", None, sname="airrohr 6591")
+    no_name = _tgroup(2001, "6591", None)
+    trailing = _tgroup(2001, "6591", None, sname="SensorCommunity 6591 DHT22 sensor (old)")
+    no_owner = _tgroup(2301, "777", "DHT22")
+    other_label = _tgroup(2001, "6591", "DHT22", prop="pm10")
+
+    plan = _split_plan(garbage, no_name, trailing, no_owner, other_label)
+
+    assert {g.sensor_name: plan[g.key].action for g in (garbage, no_name, trailing)} == {
+        "airrohr 6591": fix.UNPARSABLE, None: fix.UNPARSABLE, "SensorCommunity 6591 DHT22 sensor (old)": fix.UNPARSABLE}
+    assert plan[no_owner.key].action == fix.OWNER_MISSING
+    assert plan[other_label.key].action == fix.OTHER_LABEL
+    assert all(p.target is None and p.relabel is None for p in plan.values())
+    assert fix.parse_sensor_type(_sname("6591", "DNMS (Laerm)")) == "DNMS (Laerm)"
+
+
+def test_type_split_scan_never_reads_past_max_id(tmp_path) -> None:
+    """protects=the --max-id cut: every scan statement (by ID range, or per datastream with --datastream) stops
+    at --max-id, so rows written after the #39 deploy are never selected; fails_when=a range or datastream scan
+    reaches past it; no_claim=that --max-id is the right watermark (the operator reads it from production)."""
+    db = TypeSplitDb(bounds=(1, 1000))
+    assert fix.run(_split_args(tmp_path, "--range-ids", "40"), db) == 0
+    assert db.scanned == [("range", 1, 40), ("range", 41, 80), ("range", 81, 100)]
+
+    db = TypeSplitDb()
+    assert fix.run(_split_args(tmp_path, "--datastream", "2001"), db) == 0
+    assert db.scanned == [("ds", 2001, _SPLIT_MAX_ID)]
+
+    db = TypeSplitDb(bounds=(150, 500))
+    assert fix.run(_split_args(tmp_path), db) == 0
+    assert db.scanned == []  # every row is newer than --max-id
+    sql = fix.type_split_range_sql(1, 500, 100, [(2001, "sensor_community-6591", "BME280")])
+    assert 'o."ID" BETWEEN 1 AND 100' in sql
+
+
+def test_type_split_scan_sql_selects_location_rows_whose_type_is_not_the_owner() -> None:
+    """protects=the selection SQL: only rows labelled with their location datastream's sensor_id, type parsed
+    by the issue's pattern, compared NULL-safely with that datastream's owner (all rows when it has none);
+    fails_when=the label check, pattern or owner comparison changes; no_claim=PostgreSQL's evaluation of it
+    (integration test)."""
+    sql = fix.type_split_range_sql(1, 50, 100, [(2001, "sensor_community-6591", "BME280"),
+                                                (2301, "sensor_community-777", None)])
+    assert "(2001, 'sensor_community-6591'::text, 'BME280'::text), (2301, 'sensor_community-777'::text, NULL::text)" in sql
+    assert """o."PARAMETERS"->>'sensor_id' = v.sid""" in sql
+    assert (r"""substring(o."PARAMETERS"->>'sensor_name' from '^SensorCommunity \S+ (.*) sensor$')"""
+            """ IS DISTINCT FROM v.owner""") in sql
+    assert fix.SENSOR_NAME_PATTERN == r"^SensorCommunity \S+ (.*) sensor$"
+
+
+def test_type_split_only_scans_location_datastreams() -> None:
+    """protects=only Sensor.Community location datastreams (sensor_id 'sensor_community-{loc}') are scanned,
+    each with its owner of (loc, property); fails_when=type datastreams or other sources are scanned (their rows
+    would be 'not the owner' and moved again); no_claim=none."""
+    catalogue = _split_catalogue()
+    other = fix.Datastream(9, "x", 50, "GEO_SamenMeten X", "samen_meten", "sensor_community-1", "pm10")
+    catalogue.datastreams[9] = other
+
+    assert fix.location_datastreams(catalogue, _SPLIT_OWNERS) == [
+        (2001, "sensor_community-6591", "BME280"), (2002, "sensor_community-6591", "BME280"),
+        (2101, "sensor_community-55085", "SPS30"), (2102, "sensor_community-55085", "SPS30"),
+        (2201, "sensor_community-95248", "BME280"), (2202, "sensor_community-95248", "BME280"),
+        (2301, "sensor_community-777", None),
+    ]
+    assert fix.location_datastreams(catalogue, _SPLIT_OWNERS, [2202]) == [(2202, "sensor_community-95248", "BME280")]
+
+
+def test_type_split_dry_run_reports_per_datastream_and_totals_by_type(tmp_path, capsys) -> None:
+    """protects=acceptance 1: the dry run is read-only and lists per source datastream the rows to move with
+    their target, needs-datastream and other unmovable rows, and totals by sensor type (also as CSV);
+    fails_when=it writes, or a group or total is missing or wrong; no_claim=layout details beyond these."""
+    db = TypeSplitDb()
+    plan_file = tmp_path / "split.csv"
+
+    assert fix.run(_split_args(tmp_path, "--plan-file", str(plan_file)), db) == 0
+
+    assert all(sql.startswith(fix.READ_ONLY_SESSION) and "UPDATE" not in sql.upper() for sql in db.sessions)
+    out = capsys.readouterr().out
+    assert re.search(r"DHT22\s+2\s+move\s+-> 2003 ", out)
+    assert re.search(r"SCD30\s+1\s+needs-datastream\s+no datastream sensor_community-95248-scd30 / humidity", out)
+    dht22 = re.search(r"\n  DHT22" + r"\s+([\d,]+)" * 7 + r"\n", out)
+    assert dht22 is not None and dht22.groups() == ("3", "0", "0", "0", "1", "0", "0")  # 777's DHT22: no owner
+    totals = re.search(r"\n  total" + r"\s+([\d,]+)" * 7 + r"\n", out)
+    assert totals is not None and totals.groups() == ("6", "0", "1", "0", "1", "1", "0")
+    with plan_file.open(encoding="utf-8", newline="") as src:
+        rows = list(csv.DictReader(src))
+    moves = {(r["source_datastream"], r["sensor_type"]): (r["target_datastream"], r["target_sensor_id"], r["rows"])
+             for r in rows if r["action"] == fix.MOVE}
+    assert moves == {
+        ("2001", "DHT22"): ("2003", "sensor_community-6591-dht22", "2"),
+        ("2002", "DHT22"): ("2004", "sensor_community-6591-dht22", "1"),
+        ("2101", "SDS011"): ("2103", "sensor_community-55085-sds011", "1"),
+        ("2102", "SDS011"): ("2104", "sensor_community-55085-sds011", "1"),
+        ("2201", "SCD30"): ("2203", "sensor_community-95248-scd30", "1"),
+    }
+    assert {(r["action"], r["source_datastream"]) for r in rows if r["action"] != fix.MOVE} == {
+        (fix.NEEDS_DATASTREAM, "2202"), (fix.OWNER_MISSING, "2301"), (fix.UNPARSABLE, "2001")}
+    assert "Dry run: nothing was written." in out
+
+
+def test_type_split_apply_moves_the_planned_rows_and_records_label_and_datastream(tmp_path, capsys) -> None:
+    """protects=acceptance 2+3 at unit level: --apply moves exactly the planned rows (not rows after --max-id,
+    not needs-datastream/owner-missing/unparsable rows), sets PARAMETERS.sensor_id to the target's, records
+    each batch with its old datastream and old sensor_id before writing, refreshes source and target, and
+    verifies 0 movable rows left; fails_when=any of these changes; no_claim=the SQL's effect on FROST
+    (integration test)."""
+    ids_file = tmp_path / "split.jsonl"
+    db = TypeSplitDb()
+
+    assert fix.run(_split_args(tmp_path, "--apply", "--ids-file", str(ids_file)), db) == 0
+
+    where = {i: (o.ds, o.sid) for i, o in db.obs.items()}
+    assert where[2] == where[4] == (2003, "sensor_community-6591-dht22")
+    assert where[6] == (2004, "sensor_community-6591-dht22")
+    assert (where[8], where[9]) == ((2103, "sensor_community-55085-sds011"), (2104, "sensor_community-55085-sds011"))
+    assert where[10] == (2203, "sensor_community-95248-scd30")
+    unmoved = {1: 2001, 3: 2001, 5: 2002, 7: 2101, 11: 2202, 12: 2301, 13: 2001, 500: 2001}
+    assert {i: where[i][0] for i in unmoved} == unmoved
+    assert sorted(db.refreshed) == [[2001, 2003], [2002, 2004], [2101, 2103], [2102, 2104], [2201, 2203]]
+
+    records = [json.loads(line) for line in ids_file.read_text(encoding="utf-8").splitlines()]
+    assert records[0] == fix.IDS_HEADER
+    assert records[1]["op"] == "run" and records[1]["mode"] == "sensor-type-split" and records[1]["max_id"] == 100
+    moves = [r for r in records if r["op"] == "move"]
+    assert sorted((r["from_ds"], r["to_ds"], r["from_sensor_id"], r["to_sensor_id"], [row[0] for row in r["rows"]])
+                  for r in moves) == [
+        (2001, 2003, "sensor_community-6591", "sensor_community-6591-dht22", [2, 4]),
+        (2002, 2004, "sensor_community-6591", "sensor_community-6591-dht22", [6]),
+        (2101, 2103, "sensor_community-55085", "sensor_community-55085-sds011", [8]),
+        (2102, 2104, "sensor_community-55085", "sensor_community-55085-sds011", [9]),
+        (2201, 2203, "sensor_community-95248", "sensor_community-95248-scd30", [10]),
+    ]
+    assert next(r for r in moves if r["from_ds"] == 2001)["rows"] == [[2, 110, 21.0], [4, 110, 22.0]]
+    first_move = next(sql for sql in db.sessions if "moved AS" in sql and "= 2003," in sql)
+    assert ('"PARAMETERS" = jsonb_set(o."PARAMETERS", \'{sensor_id}\', '
+            "to_jsonb('sensor_community-6591-dht22'::text))") in first_move
+    assert 'WHERE o."ID" = v.id AND o."DATASTREAM_ID" = 2001' in first_move
+    out = capsys.readouterr().out
+    assert "Moved 6 observations (0 left in place" in out
+    assert re.search(r"Verification: .* to move 0, kept as duplicates 0; .*needs-datastream 1", out)
+
+
+def test_type_split_apply_exits_1_when_movable_rows_are_left(tmp_path, capsys) -> None:
+    """protects=acceptance 3's check: when the re-scan after --apply still finds rows to move (here a fake
+    whose UPDATE moves nothing), the run says so and exits 1; fails_when=the verification is skipped or always
+    passes; no_claim=why rows were left (rerunning is safe)."""
+    class StuckDb(TypeSplitDb):
+        def _write(self, sql: str) -> list[str]:
+            return [_line(t="moved", n=0)]
+
+    assert fix.run(_split_args(tmp_path, "--apply", "--ids-file", str(tmp_path / "split.jsonl")), StuckDb()) == 1
+    assert re.search(r"Verification: .* to move 6, kept as duplicates 0", capsys.readouterr().out)
+
+
+def test_type_split_duplicates_compare_with_the_label_the_row_gets() -> None:
+    """protects=the duplicate check of a type-split move compares the target's rows with the row's label
+    after the move (the type sensor_id), not its location label, which no target row carries; fails_when=it
+    compares o's own sensor_id again; no_claim=how many duplicates production has."""
+    planned = fix.PlannedGroup(_tgroup(2001, "6591", "DHT22"), fix.MOVE, _split_catalogue().datastreams[2003],
+                               relabel="sensor_community-6591-dht22")
+
+    for sql in (fix.batch_select_sql(planned, 0, 10), fix.duplicates_sql(planned)):
+        assert """x."PARAMETERS"->>'sensor_id' IS NOT DISTINCT FROM 'sensor_community-6591-dht22'""" in sql
+        assert """x."PARAMETERS"->>'observed_property' IS NOT DISTINCT FROM o."PARAMETERS"->>'observed_property'""" in sql
+        assert """o."PARAMETERS"->>'sensor_name' = 'SensorCommunity 6591 DHT22 sensor'""" in sql
+    assert """IS NOT DISTINCT FROM o."PARAMETERS"->>'sensor_id'""" in fix.same_reading_sql(2003)
+
+
+def test_rollback_restores_the_sensor_id_of_type_split_moves_only(tmp_path) -> None:
+    """protects=--rollback of a type-split batch restores DATASTREAM_ID, FEATURE_ID and the recorded old
+    PARAMETERS.sensor_id, while a default-mode batch's restore leaves PARAMETERS alone; fails_when=the old
+    sensor_id is not restored, or a misrouted batch gets its label rewritten; no_claim=rows moved again since."""
+    ids_file = _ids_file(
+        tmp_path / "split.jsonl",
+        _move_record("b1", 1386, 1388, [[31, 110, 1.0]]),
+        _move_record("b2", 2001, 2003, [[2, 110, 21.0], [4, 110, 22.0]])
+        | {"from_sensor_id": "sensor_community-6591", "to_sensor_id": "sensor_community-6591-dht22"},
+    )
+    obs = {2: _TObs(2003, "sensor_community-6591-dht22", "temperature", _sname("6591", "DHT22")),
+           4: _TObs(2003, "sensor_community-6591-dht22", "temperature", _sname("6591", "DHT22")),
+           31: _TObs(1388, "sensor_community-93182", "pm10", None)}
+    db = TypeSplitDb(obs)
+
+    restored, touched = fix.rollback(db, fix.IdsFile(ids_file), chunk=10)
+
+    assert (restored, touched) == (3, {1386, 1388, 2001, 2003})
+    split_restore, misrouted_restore = [sql for sql in db.sessions if "restored AS" in sql]  # newest batch first
+    assert ('SET "DATASTREAM_ID" = 2001, "FEATURE_ID" = v.foi, "PARAMETERS" = jsonb_set(o."PARAMETERS", '
+            "'{sensor_id}', to_jsonb('sensor_community-6591'::text))") in split_restore
+    assert 'SET "DATASTREAM_ID" = 1386, "FEATURE_ID" = v.foi\n' in misrouted_restore
+    assert "jsonb_set" not in misrouted_restore
+    assert {i: (o.ds, o.sid) for i, o in db.obs.items()} == {
+        2: (2001, "sensor_community-6591"), 4: (2001, "sensor_community-6591"), 31: (1386, "sensor_community-93182")}
+    assert "to_jsonb('it''s'::text)" in fix.restore_sql(2001, 2003, [(2, None)], "it's")
+
+
+def test_type_split_needs_its_inputs_and_a_valid_owners_file(tmp_path) -> None:
+    """protects=--sensor-type-split refuses to run without --owners and --max-id, with them in another mode,
+    or with an owners file that is not the connector's version 1 map; fails_when=it falls back to an empty map
+    (as the connector does) and plans every type as owner-missing, or accepts a broken file; no_claim=the file
+    matches the connector's current owners."""
+    owners = _owners_file(tmp_path / "owners.json")
+    for argv in (["--sensor-type-split"], ["--sensor-type-split", "--owners", str(owners)],
+                 ["--sensor-type-split", "--max-id", "5"], ["--owners", str(owners), "--max-id", "5"],
+                 ["--sensor-type-split", "--owners", str(tmp_path / "none.json"), "--max-id", "5"],
+                 ["--sensor-type-split", "--owners", str(owners), "--max-id", "0"]):
+        with pytest.raises(SystemExit):
+            fix.parse_args(["--container", "db", *argv])
+    ids_file = _ids_file(tmp_path / "split.jsonl")
+    with pytest.raises(SystemExit):
+        fix.parse_args(["--container", "db", "--rollback", "--ids-file", str(ids_file), "--sensor-type-split",
+                        "--owners", str(owners), "--max-id", "5"])
+
+    assert fix.load_owners_file(owners)["6591"] == {"temperature": "BME280", "humidity": "BME280"}
+    alias = _owners_file(tmp_path / "alias.json", {"1": {"pm25": "SDS011"}})
+    assert fix.load_owners_file(alias) == {"1": {"pm2_5": "SDS011"}}
+    for bad in ('{"version": 2, "owners": {}}', '{"owners": {}}', "[]", "{", '{"version": 1, "owners": {"1": "x"}}',
+                '{"version": 1, "owners": {"1": {"pm10": 3}}}'):
+        (tmp_path / "bad.json").write_text(bad, encoding="utf-8")
+        with pytest.raises(fix.OwnersFileError):
+            fix.load_owners_file(tmp_path / "bad.json")
+    (tmp_path / "bad.json").write_text("{", encoding="utf-8")
+    assert fix.main(["--container", "db", "--sensor-type-split", "--owners", str(tmp_path / "bad.json"),
+                     "--max-id", "5"]) == 1
