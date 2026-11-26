@@ -782,6 +782,9 @@ class SensorThingsClient:
 
     def _create_entity(self, path: str, payload: dict[str, Any]) -> tuple[str | None, requests.Response]:
         endpoint = self._endpoint(path)
+        if endpoint is None:
+            # What requests.post(None) raised: callers handling RequestException keep working.
+            raise requests.exceptions.MissingSchema("Invalid URL 'None': no FROST base URL configured")
         response = requests.post(
             endpoint,
             json=payload,
@@ -1852,7 +1855,7 @@ class SensorThingsClient:
         if not response.ok:
             fallback_payload = dict(payload)
             fallback_payload["TaskingCapability"] = {"@iot.id": _coerce_iot_id(capability_id)}
-            endpoint = self._endpoint(settings.tasks_path)
+            endpoint = self._endpoint_for_base_url(base_url, settings.tasks_path)
             response = requests.post(endpoint, json=fallback_payload, headers=self._headers(), timeout=self._request_timeout())
 
         task_id = self._extract_iot_id(response)
@@ -1904,6 +1907,13 @@ class SensorThingsClient:
             params["$filter"] = " and ".join(filters)
 
         endpoint = self._endpoint(settings.tasks_path)
+        if endpoint is None:
+            return {
+                "mode": "preview",
+                "site_key": query.site_key,
+                "tasks": [],
+                "message": "No SensorThings server configured.",
+            }
         response = requests.get(endpoint, params=params, headers=self._headers(), timeout=self._request_timeout())
 
         try:
@@ -2570,7 +2580,7 @@ class SensorThingsClient:
         for _ep, payload, ds_id, sensor_id in tasks:
             grouped.setdefault(ds_id, []).append((payload, sensor_id))
 
-        body = [
+        body: list[dict[str, Any]] = [
             {
                 "Datastream": _ds_ref(ds_id),
                 "components": components,
@@ -2595,7 +2605,7 @@ class SensorThingsClient:
             logger.error(
                 "Batch observation push failed (%d observations, url=%s): %s", len(flat), url, exc
             )
-            results = []
+            results: list[dict[str, Any]] = []
             per_obs_endpoint = self._endpoint_for_base_url(base_url, settings.observations_path)
             for ds_id, payload, sensor_id in flat:
                 health_monitor.record_failure(ds_id, str(exc))
