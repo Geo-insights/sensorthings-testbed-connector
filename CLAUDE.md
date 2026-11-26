@@ -126,11 +126,26 @@ claude --dangerously-skip-permissions \
   --max-turns 30
 ```
 
+**Keep the machine awake (Windows):** a long unattended run dies when the laptop
+sleeps mid-task, so wrap it instead of calling `claude` directly:
+```powershell
+.\scripts\run_autonomous.ps1 -MaxTurns 30 `
+  -Prompt "TASK DESCRIPTION. Exit when done-gate passes (pytest + ruff + mypy clean)."
+```
+`scripts/run_autonomous.ps1` holds a `SetThreadExecutionState` request for as long as
+the child session runs and releases it on exit (no admin rights, no leftover state —
+the request dies with the process). It blocks only the *idle* sleep timeout: closing
+the lid or pressing power still sleeps a Modern Standby laptop, and
+battery-critical actions still apply, so plug in for multi-hour runs.
+Pass `-KeepDisplayOn` to also hold the screen awake, and `-ExtraArgs` for any other
+`claude` flags.
+
 **Rules for autonomous sessions:**
 - Always set `--max-turns` (30 is a good default; raise to 50 for larger tasks).
 - The task prompt must include the done-gate command and an explicit exit instruction.
 - Claim your task in `TASK_LEDGER.md` at the start; mark it done at the end.
 - Do not push to remote unless the task prompt explicitly says to.
+- On Windows, launch through `scripts/run_autonomous.ps1` so the run survives idle sleep.
 
 ## Skills
 See ../gi-skills/skills/connector-review/SKILL.md
