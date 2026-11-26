@@ -343,49 +343,49 @@ class TestParseObservations:
 
 class TestBuildEntitySet:
     def test_returns_required_keys(self):
-        es = build_entity_set("RIVM-101", 52.1, 4.3, ["pm2_5", "pm10"])
+        es = build_entity_set("RIVM-101", 52.1, 4.3, ["pm2_5", "pm10"], thing_id=101)
         for key in ("site_key", "site_name", "thing", "location", "sensors", "observed_properties"):
             assert key in es, f"missing key: {key}"
 
     def test_site_key_is_samen_meten(self):
-        es = build_entity_set("RIVM-101", 52.1, 4.3, ["pm2_5"])
+        es = build_entity_set("RIVM-101", 52.1, 4.3, ["pm2_5"], thing_id=101)
         assert es["site_key"] == "samen_meten"
 
     def test_thing_name_prefixed_with_samenmeten(self):
-        es = build_entity_set("RIVM-101", 52.1, 4.3, ["pm2_5"])
+        es = build_entity_set("RIVM-101", 52.1, 4.3, ["pm2_5"], thing_id=101)
         assert es["thing"]["name"] == "SamenMeten RIVM-101"
 
     def test_location_coordinates_are_lon_lat(self):
-        es = build_entity_set("S", 52.1, 4.3, ["pm2_5"])
+        es = build_entity_set("S", 52.1, 4.3, ["pm2_5"], thing_id=101)
         coords = es["location"]["location"]["coordinates"]
         assert coords == [4.3, 52.1]  # [lon, lat] per GeoJSON
 
     def test_source_property_is_samen_meten(self):
-        es = build_entity_set("RIVM-101", 52.1, 4.3, ["pm2_5"])
+        es = build_entity_set("RIVM-101", 52.1, 4.3, ["pm2_5"], thing_id=101)
         assert es["thing"]["properties"]["source"] == "samen_meten"
 
     def test_observed_properties_subset(self):
-        es = build_entity_set("S", 52.1, 4.3, ["pm2_5", "temperature"])
+        es = build_entity_set("S", 52.1, 4.3, ["pm2_5", "temperature"], thing_id=101)
         obs_props = set(es["observed_properties"].keys())
         assert obs_props == {"pm2_5", "temperature"}
 
     def test_unknown_observed_properties_excluded(self):
-        es = build_entity_set("S", 52.1, 4.3, ["pm2_5", "not_real_xyz"])
+        es = build_entity_set("S", 52.1, 4.3, ["pm2_5", "not_real_xyz"], thing_id=101)
         obs_props = set(es["observed_properties"].keys())
         assert "not_real_xyz" not in obs_props
         assert "pm2_5" in obs_props
 
     def test_observed_properties_are_canonical(self):
-        es = build_entity_set("S", 52.1, 4.3, ["pm2_5", "pm10", "temperature", "humidity"])
+        es = build_entity_set("S", 52.1, 4.3, ["pm2_5", "pm10", "temperature", "humidity"], thing_id=101)
         for key in es["observed_properties"]:
             assert resolve(key) is not None, f"observed_property {key!r} not canonical"
 
     def test_sensors_list_has_one_entry(self):
-        es = build_entity_set("RIVM-101", 52.1, 4.3, ["pm2_5"])
+        es = build_entity_set("RIVM-101", 52.1, 4.3, ["pm2_5"], thing_id=101)
         assert len(es["sensors"]) == 1
 
     def test_empty_observed_properties_list(self):
-        es = build_entity_set("RIVM-101", 52.1, 4.3, [])
+        es = build_entity_set("RIVM-101", 52.1, 4.3, [], thing_id=101)
         assert es["observed_properties"] == {}
 
 
@@ -552,3 +552,88 @@ class TestParseThingsResponsePrefersCalibrated:
         message = warnings[0].getMessage()
         assert "8272" in message and _RIVM_THING in message
         assert "43002" in message and "43009" in message
+
+
+# ---------------------------------------------------------------------------
+# Air pressure: RIVM "pres" datastreams (#44)
+# ---------------------------------------------------------------------------
+
+
+class TestPressure:
+    def test_pres_maps_to_canonical_pressure_by_observed_property_and_by_datastream_name(self):
+        """protects=RIVM pressure reaches FROST: OP name 'pres' and DS name 'LTD_95310-6-pres' both map to pressure;
+        fails_when=either path still returns None and the datastream is skipped;
+        no_claim=which other RIVM properties are mapped."""
+        by_op = _make_datastream(57050, "pres")
+        by_name = {"@iot.id": 57051, "name": "LTD_95310-6-pres", "ObservedProperty": None}
+        thing = _make_thing(12570, "LTD_95310", 52.0, 4.36, datastreams=[by_op, by_name])
+
+        assert _parsed_datastreams(thing) == [(57050, "pressure"), (57051, "pressure")]
+
+    def test_pressure_readings_are_hpa_values_as_rivm_sends_them(self):
+        """protects=no unit conversion: RIVM sends hPa (~1019) and the reading carries the canonical hPa unchanged;
+        fails_when=the value is scaled (the Sensor.Community Pa/hPa bug) or the unit is not hPa;
+        no_claim=plausibility checks on the value."""
+        obs = [{"phenomenonTime": "2026-11-26T12:00:00.000Z", "result": 1019.26}]
+
+        (reading,) = parse_observations(obs, "sm-12570", "SamenMeten LTD_95310 sensor", "pressure", "SamenMeten LTD_95310")
+
+        assert reading.value == pytest.approx(1019.26)
+        assert reading.unit == "hPa"
+        assert reading.observed_property == "pressure"
+        assert reading.observed_property_name == "Air pressure"
+
+    def test_entity_set_registers_a_pressure_datastream(self):
+        """protects=registration: a Thing with pressure gets a pressure datastream in its entity set;
+        fails_when=pressure is filtered out of the sensor's observed_properties (no _DESCRIPTIONS entry);
+        no_claim=the ObservedProperty payload FROST receives."""
+        es = build_entity_set("LTD_95310", 52.1, 4.3, ["pm2_5", "pressure"], thing_id=12570)
+
+        assert set(es["sensors"][0]["observed_properties"]) == {"pm2_5", "pressure"}
+        assert "pressure" in es["observed_properties"]
+
+
+# ---------------------------------------------------------------------------
+# One sensor id for datastreams and readings (#45)
+# ---------------------------------------------------------------------------
+
+
+class _ObservationsClient:
+    """Stands in for AsyncAPIClient: every Datastream returns the same observations."""
+
+    def __init__(self, observations: list[dict]) -> None:
+        self.observations = observations
+
+    async def get(self, path: str, params: dict | None = None) -> dict:
+        return {"value": self.observations}
+
+
+class TestSensorId:
+    def test_entity_set_sensor_id_is_the_rivm_thing_id(self):
+        """protects=datastream properties.sensor_id = 'sm-{RIVM Thing id}', not the lowercased Thing name;
+        fails_when=build_entity_set derives the id from the name again;
+        no_claim=how FROST stores the property."""
+        es = build_entity_set("LTD_94963", 52.1, 4.3, ["pm2_5"], thing_id=12507)
+
+        assert es["sensors"][0]["sensor_id"] == "sm-12507"
+
+    def test_datastream_and_readings_carry_the_same_sensor_id(self):
+        """protects=#45: the entity set's sensor_id equals the PARAMETERS.sensor_id of the readings it routes;
+        fails_when=entity_sets and _do_fetch_readings build the id differently (name vs Thing id);
+        no_claim=routing to a FROST datastream id."""
+        import asyncio
+
+        source = SamenMetenPollingSource()
+        source._discovered_things[12507] = {
+            "name": "LTD_94963",
+            "lat": 52.1,
+            "lon": 4.3,
+            "datastreams": [{"ds_id": 43002, "observed_property": "pm2_5"}],
+        }
+        source._client = _ObservationsClient([{"phenomenonTime": "2026-11-26T12:00:00Z", "result": 7.5}])
+
+        (entity_set,) = source.entity_sets()
+        readings = asyncio.run(source._do_fetch_readings())
+
+        assert readings, "the fake client returns one observation"
+        assert {r.sensor_id for r in readings} == {entity_set["sensors"][0]["sensor_id"]} == {"sm-12507"}

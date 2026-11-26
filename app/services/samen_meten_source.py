@@ -18,7 +18,12 @@ from app.config import settings
 from app.models import SensorReading
 from app.services.api_client import AsyncAPIClient
 from app.services.rest_polling_source import RestPollingSource
-from app.sources.samen_meten import build_entity_set, parse_observations, parse_things_response
+from app.sources.samen_meten import (
+    build_entity_set,
+    parse_observations,
+    parse_things_response,
+    samen_meten_sensor_id,
+)
 
 logger = logging.getLogger("connector.samen_meten")
 
@@ -55,7 +60,7 @@ class SamenMetenPollingSource(RestPollingSource):
     def entity_sets(self) -> list[dict[str, Any]]:
         """Return entity sets for all discovered Things."""
         sets: list[dict[str, Any]] = []
-        for meta in self._discovered_things.values():
+        for thing_id, meta in self._discovered_things.items():
             props = list({ds["observed_property"] for ds in meta.get("datastreams", [])})
             sets.append(
                 build_entity_set(
@@ -63,6 +68,7 @@ class SamenMetenPollingSource(RestPollingSource):
                     lat=meta["lat"],
                     lon=meta["lon"],
                     observed_properties=props,
+                    thing_id=thing_id,
                 )
             )
         return sets
@@ -136,7 +142,7 @@ class SamenMetenPollingSource(RestPollingSource):
             self._dead_ds.pop(ds_id, None)
 
             thing_name = meta["name"]
-            sensor_id = f"sm-{thing_id}"
+            sensor_id = samen_meten_sensor_id(thing_id)
             sensor_name = f"SamenMeten {thing_name} sensor"
             full_thing_name = f"SamenMeten {thing_name}"
 

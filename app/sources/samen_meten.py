@@ -52,6 +52,9 @@ _SM_NAME_MAP: dict[str, str] = {
     "no2": "no2",
     "o3": "o3",
     "nh3": "nh3",
+    # Air pressure: RIVM ObservedProperty "pres" ("atmosferische druk"), DS names
+    # "LTD_95310-6-pres"; RIVM's unit is hPa (values ~1000), the canonical unit.
+    "pres": "pressure",
 }
 
 
@@ -100,7 +103,19 @@ _DESCRIPTIONS: dict[str, str] = {
     "co2": "Carbon dioxide concentration in ambient air.",
     "so2": "Sulfur dioxide concentration in ambient air.",
     "nh3": "Ammonia concentration in ambient air.",
+    "pressure": "Atmospheric air pressure at Samen Meten sensor location.",
 }
+
+
+def samen_meten_sensor_id(thing_id: int | str) -> str:
+    """Our sensor id of a RIVM Samen Meten Thing: ``sm-{RIVM Thing id}``.
+
+    The one id of a Samen Meten sensor, on its Datastreams
+    (``properties.sensor_id``) and on its readings (``PARAMETERS.sensor_id``),
+    so both join on it (#45). The RIVM Thing id is stable; the Thing name is not
+    unique enough to key on and used to give Datastreams another id than readings.
+    """
+    return f"sm-{thing_id}"
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +360,8 @@ def build_entity_set(
     lat: float,
     lon: float,
     observed_properties: list[str],
+    *,
+    thing_id: int,
 ) -> dict[str, Any]:
     """Build a CLIMATE_ADAPTATION_ENTITY_SETS-format dict for one Samen Meten thing.
 
@@ -352,13 +369,16 @@ def build_entity_set(
     :param lat: WGS-84 latitude.
     :param lon: WGS-84 longitude.
     :param observed_properties: List of canonical observed property keys.
+    :param thing_id: The RIVM Thing id; the sensor id is ``samen_meten_sensor_id(thing_id)``,
+        the same id the readings carry.
 
     Thing name: "SamenMeten {thing_name}".
     Site key: "samen_meten".
+    Datastreams are found by name ("SamenMeten {thing_name} sensor - {property}"),
+    so the sensor id does not decide which Datastream a set maps to.
     """
     full_thing_name = f"SamenMeten {thing_name}"
-    # Sanitise sensor_id: strip spaces/special chars for a URL-safe id
-    sensor_id = f"sm-{thing_name.lower().replace(' ', '-').replace('/', '-')}"
+    sensor_id = samen_meten_sensor_id(thing_id)
 
     valid_props = [p for p in observed_properties if p in _DESCRIPTIONS]
 

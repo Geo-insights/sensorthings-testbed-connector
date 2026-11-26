@@ -384,12 +384,11 @@ class _FakeSamenMeten:
 
 
 def test_samen_meten_restart_reposts_nothing(monkeypatch):
-    """Samen Meten keys its Datastreams on the remote Thing's name, its readings on the Thing's id.
+    """Samen Meten keys its Datastreams and its readings on the RIVM Thing id (#45).
 
-    The readings are the Datastream's own Thing's, so the Datastream's key
-    (sm-<name>) is marked as well as the readings' (sm-<id>). No Samen Meten
-    reading has a sm-<name> key, so that mark is never read: dedup is decided
-    by the sm-<id> marks alone, as before.
+    The newest row of each Datastream carries the Datastream's own key
+    (sm-<id>::<property>), so the restart marks exactly the readings' keys: no
+    "older sensor id" mark, and the look-back posts nothing twice.
     """
     from app.services.samen_meten_source import SamenMetenPollingSource
 
@@ -398,7 +397,7 @@ def test_samen_meten_restart_reposts_nothing(monkeypatch):
     readings = asyncio.run(source._do_fetch_readings())
     entity_set = source.entity_sets()[0]
     (sensor,) = entity_set["sensors"]
-    assert {r.sensor_id for r in readings} == {"sm-4711"} and sensor["sensor_id"] == "sm-ohn_gm-2138"
+    assert {r.sensor_id for r in readings} == {sensor["sensor_id"]} == {"sm-4711"}
     assert {r.thing_name for r in readings} == {entity_set["thing"]["name"]} == {"SamenMeten OHN_gm-2138"}
     _use_target(monkeypatch, BASE, prefix="GEO_")
     _serve(monkeypatch, _page(_stored(readings, {
@@ -408,11 +407,7 @@ def test_samen_meten_restart_reposts_nothing(monkeypatch):
     seeded = main._seed_timestamps_from_frost("samen_meten")
 
     newest = _utc("2026-11-20T09:10:00")
-    assert seeded == {
-        "sm-4711::pm2_5": newest, "sm-4711::pm10": newest,
-        "sm-ohn_gm-2138::pm2_5": newest, "sm-ohn_gm-2138::pm10": newest,
-    }
-    assert not {main._reading_key(r) for r in readings} & {"sm-ohn_gm-2138::pm2_5", "sm-ohn_gm-2138::pm10"}
+    assert seeded == {"sm-4711::pm2_5": newest, "sm-4711::pm10": newest}
     # The restarted loop's look-back serves the same Observations again: none is posted twice.
     assert main._dedup_readings(readings, seeded) == []
     later = samen_meten.parse_observations(
