@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import AsyncGenerator
 from typing import Any
 
 from app.models import SensorReading
@@ -17,6 +18,15 @@ class PollingSource(ABC):
     async def fetch_readings(self) -> list[SensorReading]:
         """Fetch latest data from the external API and return SensorReadings."""
         ...
+
+    async def fetch_reading_batches(self) -> AsyncGenerator[list[SensorReading], None]:
+        """A cycle's readings, in the batches the polling loop registers and pushes one at a time.
+
+        Most sources deliver a cycle at once: one batch, ``fetch_readings()``. A
+        source whose cycle takes long yields batches while it fetches, so its
+        readings reach FROST during the cycle instead of at its end.
+        """
+        yield await self.fetch_readings()
 
     @abstractmethod
     def entity_sets(self) -> list[dict[str, Any]]:

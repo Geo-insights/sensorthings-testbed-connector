@@ -418,6 +418,9 @@ class Settings:
     samen_meten_api_url: str = os.getenv("SAMEN_METEN_API_URL", "https://api-samenmeten.rivm.nl/v1.0").strip().rstrip("/")
     samen_meten_poll_seconds: int = int(os.getenv("SAMEN_METEN_POLL_SECONDS", "600"))
     samen_meten_max_things: int = int(os.getenv("SAMEN_METEN_MAX_THINGS", "0"))  # 0 = no cap
+    # Seconds between Samen Meten pushes while a cycle runs. A cycle reads 11,000+
+    # datastreams and can take two hours, so its readings go to FROST in batches.
+    samen_meten_batch_seconds: int = int(os.getenv("SAMEN_METEN_BATCH_SECONDS", "300"))
     # --- Buienradar weather (#14) ---
     buienradar_enabled: bool = os.getenv("BUIENRADAR_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     buienradar_api_url: str = os.getenv("BUIENRADAR_API_URL", "https://data.buienradar.nl/2.0/feed/json").strip()
@@ -508,11 +511,16 @@ class Settings:
     alert_min_interval_seconds: int = int(os.getenv("ALERT_MIN_INTERVAL_SECONDS", "1800"))
     # --- Freshness / stall detection ---
     # A source is considered "stale" when no successful push has happened within
-    # (expected interval + grace). Used by the Kafka watchdog and /connector/freshness.
+    # (expected interval + grace); for a polling source, plus twice the longest wait
+    # for data in its last cycle that delivered. Used by the Kafka and polling
+    # watchdogs and /connector/freshness.
     freshness_grace_seconds: int = int(os.getenv("FRESHNESS_GRACE_SECONDS", "600"))
     # Explicit override for the Kafka source stall threshold (seconds). When 0,
     # derived from kafka_tgv_poll_seconds + freshness_grace_seconds.
     kafka_stale_seconds: int = int(os.getenv("KAFKA_STALE_SECONDS", "0"))
+    # Explicit override for the Samen Meten stall threshold (seconds). When 0,
+    # derived like every polling source's (see freshness_grace_seconds).
+    samen_meten_stale_seconds: int = int(os.getenv("SAMEN_METEN_STALE_SECONDS", "0"))
     # Backlog-staleness guard. When the newest observation pushed in a cycle is
     # older than this many seconds, the consumer is replaying a stale backlog
     # (downstream sees an old "latest" timestamp). 0 disables the check.

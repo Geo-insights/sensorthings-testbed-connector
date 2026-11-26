@@ -2,7 +2,8 @@ import asyncio
 import logging
 import threading
 import time
-from contextlib import asynccontextmanager, suppress
+from collections.abc import AsyncGenerator
+from contextlib import aclosing, asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -774,8 +775,13 @@ class _EntitySetRegistry:
             self.failures[identity] = self.failures.get(identity, 0) + 1
 
 
-async def _register_new_entity_sets(source: Any, registry: _EntitySetRegistry) -> int:
+async def _register_new_entity_sets(
+    source: Any, registry: _EntitySetRegistry, entity_sets: list[dict[str, Any]] | None = None
+) -> int:
     """Register the source's entity sets that ``registry`` does not have yet.
+
+    ``entity_sets`` narrows them to those (a batch's, ``_batch_entity_sets``);
+    by default all of ``source.entity_sets()``.
 
     Returns how many stay unregistered: those whose registration failed, and,
     after ``_REGISTRATION_FAILURES_BEFORE_DEFERRING`` failures in a row (the
@@ -788,7 +794,7 @@ async def _register_new_entity_sets(source: Any, registry: _EntitySetRegistry) -
     The readings of deferred sets lose nothing by it where the source serves
     them again: they get no datastream, so their marks stay (``_readings_to_mark``).
     """
-    pending = registry.pending(source.entity_sets())
+    pending = registry.pending(source.entity_sets() if entity_sets is None else entity_sets)
     if not pending:
         return 0
     logger.info("%s: registering %d new entity sets in FROST", source.source_name, len(pending))
@@ -827,19 +833,98 @@ async def _register_new_entity_sets(source: Any, registry: _EntitySetRegistry) -
     return len(failed) + deferred
 
 
-def _polling_stale_threshold(poll_seconds: int) -> int:
-    """Seconds of no data after which a polling source is considered stalled."""
-    return poll_seconds + max(0, settings.freshness_grace_seconds)
+def _stale_seconds_override(source_name: str) -> int:
+    """A polling source's stall threshold set in the environment, or 0 to derive it."""
+    overrides = {"samen_meten": settings.samen_meten_stale_seconds}
+    return max(0, overrides.get(source_name, 0))
+
+
+def _polling_stale_threshold(source_name: str, poll_seconds: int) -> int:
+    """Seconds of no data after which a polling source is considered stalled.
+
+    Its poll interval plus the grace, plus twice the longest wait for data in its
+    last cycle that delivered: a source whose cycle takes long goes that long
+    without data in normal operation. Twice, because the stretch from one
+    cycle's last delivery to the next cycle's first spans the end of the one and
+    the start of the other, with the poll interval between them. A cycle that
+    delivered nothing does not count, so a stall cannot widen its own threshold.
+    An override from the environment (``_stale_seconds_override``) wins.
+    """
+    override = _stale_seconds_override(source_name)
+    if override:
+        return override
+    from app.services.health_monitor import health_monitor
+
+    wait = health_monitor.source_longest_wait(source_name) or 0.0
+    return int(poll_seconds + max(0, settings.freshness_grace_seconds) + 2 * wait)
+
+
+class _CycleWaits:
+    """The longest stretch of a polling cycle without data reaching FROST.
+
+    Measured from the cycle's start to its first delivery, between deliveries,
+    and from its last delivery to the cycle's end.
+    """
+
+    def __init__(self) -> None:
+        self._last = time.monotonic()
+        self._longest = 0.0
+        self.delivered = False
+
+    def delivery(self) -> None:
+        now = time.monotonic()
+        self._longest = max(self._longest, now - self._last)
+        self._last = now
+        self.delivered = True
+
+    def longest(self) -> float:
+        return max(self._longest, time.monotonic() - self._last)
+
+
+def _reading_batches(source: Any) -> AsyncGenerator[list[Any], None]:
+    """A cycle's readings in batches: the source's own, or ``fetch_readings()`` as one."""
+    fetch_batches = getattr(source, "fetch_reading_batches", None)
+    if fetch_batches is None:
+        return _one_batch(source)
+    batches: AsyncGenerator[list[Any], None] = fetch_batches()
+    return batches
+
+
+async def _one_batch(source: Any) -> AsyncGenerator[list[Any], None]:
+    yield await source.fetch_readings()
+
+
+def _batch_entity_sets(source: Any, readings: list[Any]) -> list[dict[str, Any]] | None:
+    """The entity sets a batch's push needs registered, or None for all of the source's.
+
+    A source that pushes a cycle in several batches (Samen Meten) names the sets
+    of each batch's readings (``entity_sets_for``), so a batch does not wait for
+    the registration of every set the source knows; the loop registers the rest
+    after the cycle's last batch. For any other source a batch needs them all.
+    """
+    return source.entity_sets_for(readings) if _registers_per_batch(source) else None
+
+
+def _registers_per_batch(source: Any) -> bool:
+    """Whether a batch registers only its own readings' entity sets (``_batch_entity_sets``)."""
+    return callable(getattr(source, "entity_sets_for", None))
 
 
 async def _polling_ingest_loop(source):
     """Background loop for a REST API polling source."""
+    from app.services.health_monitor import health_monitor
 
     poll_seconds = source.poll_interval()
-    stale_threshold = _polling_stale_threshold(poll_seconds)
+    health_name = source.source_name.lower()
+    override = _stale_seconds_override(health_name)
     logger.info(
-        "Polling loop started for %s (every %ds, stall threshold %ds)",
-        source.source_name, poll_seconds, stale_threshold,
+        "Polling loop started for %s (every %ds, stall threshold %s)",
+        source.source_name,
+        poll_seconds,
+        f"{override}s, set in the environment"
+        if override
+        else f"{_polling_stale_threshold(health_name, poll_seconds)}s "
+        "plus twice the longest wait for data in its last cycle",
     )
 
     # Eager registration: register entities before the first data fetch so we
@@ -862,71 +947,83 @@ async def _polling_ingest_loop(source):
     )
 
     while True:
+        waits = _CycleWaits()
         try:
-            readings = await source.fetch_readings()
-            if readings:
-                # Register the entity sets discovered since the last cycle, and
-                # retry those that failed, before pushing their readings.
-                registered_before = bool(registry.registered)
+            # Most sources deliver a cycle in one batch; Samen Meten in several,
+            # while it fetches. A push that raises ends the cycle and its fetch.
+            async with aclosing(_reading_batches(source)) as batches:
+                async for readings in batches:
+                    if not readings:
+                        continue
+                    # Register the entity sets discovered since the last push, and
+                    # retry those that failed, before pushing their readings.
+                    registered_before = bool(registry.registered)
+                    await _register_new_entity_sets(source, registry, _batch_entity_sets(source, readings))
+                    if registry.registered and not registered_before and not last_timestamps:
+                        # Nothing was seeded at startup; seed now that the entities exist.
+                        last_timestamps = await run_in_threadpool(
+                            _seed_timestamps_from_frost, source.source_name
+                        )
+
+                    # Only push if entities are registered or we have cached IDs
+                    # from a previous run. Pushing before registration generates
+                    # thousands of DLQ entries on first boot for no reason.
+                    if not registry.registered and not last_timestamps:
+                        logger.info(
+                            "%s: skipping push (%d readings) — entities not yet registered",
+                            source.source_name, len(readings),
+                        )
+                        new_readings = []
+                    else:
+                        new_readings = _dedup_readings(readings, last_timestamps)
+                        if not new_readings:
+                            logger.debug(
+                                "%s: all %d readings already pushed, skipping", source.source_name, len(readings)
+                            )
+                    if new_readings:
+                        def _do_push(nr: list = new_readings, ps: str = health_name) -> dict:
+                            return client.push_observations(nr, source=ps)
+
+                        # A push that raises advances no mark (the next cycle
+                        # tries again), and one that leaves readings without a
+                        # datastream on the primary target advances none of theirs.
+                        result = await run_in_threadpool(_do_push)
+                        marked = _readings_to_mark(new_readings, result)
+                        _update_timestamps(marked, last_timestamps)
+                        health_monitor.record_source_success(health_name)
+                        waits.delivery()
+                        logger.info(
+                            "%s push: readings=%d new=%d pushed=%s%s",
+                            source.source_name,
+                            len(readings),
+                            len(new_readings),
+                            result.get("total_sent", 0),
+                            f" without_datastream={len(new_readings) - len(marked)} (their marks stay)"
+                            if len(marked) < len(new_readings)
+                            else "",
+                        )
+            if _registers_per_batch(source):
+                # The batches registered the sets of their readings; now the
+                # rest (Things without new readings this cycle).
                 await _register_new_entity_sets(source, registry)
-                if registry.registered and not registered_before and not last_timestamps:
-                    # Nothing was seeded at startup; seed now that the entities exist.
-                    last_timestamps = await run_in_threadpool(
-                        _seed_timestamps_from_frost, source.source_name
-                    )
-
-                # Only push if entities are registered or we have cached IDs
-                # from a previous run. Pushing before registration generates
-                # thousands of DLQ entries on first boot for no reason.
-                if not registry.registered and not last_timestamps:
-                    logger.info(
-                        "%s: skipping push (%d readings) — entities not yet registered",
-                        source.source_name, len(readings),
-                    )
-                    new_readings = []
-                else:
-                    new_readings = _dedup_readings(readings, last_timestamps)
-                    if not new_readings:
-                        logger.debug("%s: all %d readings already pushed, skipping", source.source_name, len(readings))
-                if new_readings:
-                    _push_source = source.source_name.lower()
-                    def _do_push(nr: list = new_readings, ps: str = _push_source) -> dict:
-                        return client.push_observations(nr, source=ps)
-
-                    # A push that raises advances no mark (the next cycle
-                    # tries again), and one that leaves readings without a
-                    # datastream on the primary target advances none of theirs.
-                    result = await run_in_threadpool(_do_push)
-                    marked = _readings_to_mark(new_readings, result)
-                    _update_timestamps(marked, last_timestamps)
-                    from app.services.health_monitor import health_monitor
-                    health_monitor.record_source_success(source.source_name.lower())
-                    logger.info(
-                        "%s push: readings=%d new=%d pushed=%s%s",
-                        source.source_name,
-                        len(readings),
-                        len(new_readings),
-                        result.get("total_sent", 0),
-                        f" without_datastream={len(new_readings) - len(marked)} (their marks stay)"
-                        if len(marked) < len(new_readings)
-                        else "",
-                    )
         except Exception as exc:
             logger.exception("%s polling cycle failed", source.source_name)
-            from app.services.health_monitor import health_monitor
-            health_monitor.record_source_error(source.source_name.lower(), f"{type(exc).__name__}: {exc}")
+            health_monitor.record_source_error(health_name, f"{type(exc).__name__}: {exc}")
+
+        if waits.delivered:
+            health_monitor.record_source_wait(health_name, waits.longest())
 
         # Stall watchdog — mirrors the Kafka watchdog pattern. Fires when the
-        # source hasn't delivered fresh data for longer than (poll_interval +
-        # freshness_grace). Unlike Kafka there's no consumer to reconnect, so
-        # the action is alert-only; the poller will keep retrying on the next
-        # cycle regardless.
-        from app.services.health_monitor import health_monitor
-        age = health_monitor.source_age_seconds(source.source_name.lower())
+        # source hasn't delivered fresh data for longer than its stall threshold
+        # (_polling_stale_threshold). Unlike Kafka there's no consumer to
+        # reconnect, so the action is alert-only; the poller will keep retrying
+        # on the next cycle regardless.
+        stale_threshold = _polling_stale_threshold(health_name, poll_seconds)
+        age = health_monitor.source_age_seconds(health_name)
         if age is not None and age > stale_threshold:
             from app.services.alerting import send_alert
             send_alert(
-                f"{source.source_name.lower()}.stall",
+                f"{health_name}.stall",
                 f"No {source.source_name} observations for {int(age)}s "
                 f"(threshold {stale_threshold}s). Check upstream API availability.",
                 level="warning",
@@ -935,7 +1032,7 @@ async def _polling_ingest_loop(source):
                     "threshold_seconds": stale_threshold,
                     "api_url": (getattr(source, '_client', None) and "configured") or "unknown",
                 },
-                dedup_key=f"{source.source_name.lower()}.stall",
+                dedup_key=f"{health_name}.stall",
             )
 
         await asyncio.sleep(poll_seconds)

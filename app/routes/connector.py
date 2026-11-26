@@ -337,31 +337,29 @@ def freshness(response: Response) -> dict:
     ``stale`` flag against its expected interval. Responds HTTP 503 when any
     source is stale so a pull-based uptime monitor (or the monitoring module)
     catches stalls even if the outbound alert webhook can't fire (e.g. the
-    process is degraded).
+    process is degraded). A polling source's threshold is its watchdog's
+    (``_polling_stale_threshold``): poll interval and grace, plus twice the
+    longest wait for data in its last cycle that delivered.
     """
-    from app.main import _kafka_stale_threshold
+    from app.main import _kafka_stale_threshold, _polling_stale_threshold
     from app.services.health_monitor import health_monitor
 
-    grace = max(0, settings.freshness_grace_seconds)
     thresholds: dict[str, float] = {}
     if settings.kafka_tgv_enabled:
         thresholds["kafka"] = _kafka_stale_threshold(max(10, int(settings.kafka_tgv_poll_seconds)))
-    if settings.ohnics_enabled:
-        thresholds["ohnics"] = settings.ohnics_poll_seconds + grace
-    if settings.levellog_enabled:
-        thresholds["levellog"] = settings.levellog_poll_seconds + grace
-    if settings.luchtmeetnet_enabled:
-        thresholds["luchtmeetnet"] = settings.luchtmeetnet_poll_seconds + grace
-    if settings.sensor_community_enabled:
-        thresholds["sensor_community"] = settings.sensor_community_poll_seconds + grace
-    if settings.samen_meten_enabled:
-        thresholds["samen_meten"] = settings.samen_meten_poll_seconds + grace
-    if settings.knmi_weather_enabled:
-        thresholds["knmi_weather"] = settings.knmi_weather_poll_seconds + grace
-    if settings.meet_je_stad_enabled:
-        thresholds["meet_je_stad"] = settings.meet_je_stad_poll_seconds + grace
-    if settings.bro_enabled:
-        thresholds["bro_groundwater"] = settings.bro_poll_seconds + grace
+    polling = {
+        "ohnics": (settings.ohnics_enabled, settings.ohnics_poll_seconds),
+        "levellog": (settings.levellog_enabled, settings.levellog_poll_seconds),
+        "luchtmeetnet": (settings.luchtmeetnet_enabled, settings.luchtmeetnet_poll_seconds),
+        "sensor_community": (settings.sensor_community_enabled, settings.sensor_community_poll_seconds),
+        "samen_meten": (settings.samen_meten_enabled, settings.samen_meten_poll_seconds),
+        "knmi_weather": (settings.knmi_weather_enabled, settings.knmi_weather_poll_seconds),
+        "meet_je_stad": (settings.meet_je_stad_enabled, settings.meet_je_stad_poll_seconds),
+        "bro_groundwater": (settings.bro_enabled, settings.bro_poll_seconds),
+    }
+    for source_name, (enabled, poll_seconds) in polling.items():
+        if enabled:
+            thresholds[source_name] = _polling_stale_threshold(source_name, poll_seconds)
 
     result = health_monitor.source_freshness(thresholds)
     if result["any_stale"]:

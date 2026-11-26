@@ -10,7 +10,9 @@ re-publish to our own FROST servers.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import AsyncGenerator, Iterable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -29,6 +31,9 @@ logger = logging.getLogger("connector.samen_meten")
 
 # Default look-back window when no previous timestamp is known for a Datastream.
 _DEFAULT_LOOKBACK_HOURS = 1
+
+# Seconds between batches when SAMEN_METEN_BATCH_SECONDS is not positive.
+_DEFAULT_BATCH_SECONDS = 300
 
 
 class SamenMetenPollingSource(RestPollingSource):
@@ -59,22 +64,38 @@ class SamenMetenPollingSource(RestPollingSource):
 
     def entity_sets(self) -> list[dict[str, Any]]:
         """Return entity sets for all discovered Things."""
-        sets: list[dict[str, Any]] = []
-        for thing_id, meta in self._discovered_things.items():
-            props = list({ds["observed_property"] for ds in meta.get("datastreams", [])})
-            sets.append(
-                build_entity_set(
-                    thing_name=meta["name"],
-                    lat=meta["lat"],
-                    lon=meta["lon"],
-                    observed_properties=props,
-                    thing_id=thing_id,
-                )
-            )
-        return sets
+        return [self._entity_set(thing_id, meta) for thing_id, meta in self._discovered_things.items()]
+
+    def entity_sets_for(self, readings: Iterable[SensorReading]) -> list[dict[str, Any]]:
+        """The entity sets of the Things ``readings`` come from.
+
+        The polling loop registers these before it pushes a batch; it registers
+        the rest of :meth:`entity_sets` after the cycle's last batch.
+        """
+        sensor_ids = {reading.sensor_id for reading in readings}
+        return [
+            self._entity_set(thing_id, meta)
+            for thing_id, meta in self._discovered_things.items()
+            if samen_meten_sensor_id(thing_id) in sensor_ids
+        ]
+
+    @staticmethod
+    def _entity_set(thing_id: int, meta: dict[str, Any]) -> dict[str, Any]:
+        props = list({ds["observed_property"] for ds in meta.get("datastreams", [])})
+        return build_entity_set(
+            thing_name=meta["name"],
+            lat=meta["lat"],
+            lon=meta["lon"],
+            observed_properties=props,
+            thing_id=thing_id,
+        )
 
     async def _do_fetch_readings(self) -> list[SensorReading]:
-        """Fetch new observations from the Samen Meten STA API.
+        """A whole cycle's readings at once: every batch of :meth:`_do_fetch_reading_batches`."""
+        return [reading async for batch in self._do_fetch_reading_batches() for reading in batch]
+
+    async def _do_fetch_reading_batches(self) -> AsyncGenerator[list[SensorReading], None]:
+        """Fetch new observations from the Samen Meten STA API, in batches.
 
         Step 1: if no Things discovered yet, paginate through /Things until all
                 Things are loaded (respects samen_meten_max_things cap).
@@ -82,34 +103,33 @@ class SamenMetenPollingSource(RestPollingSource):
                 /Datastreams({id})/Observations filtered to new data.
                 Uses concurrent fetches (20 at a time) and skips datastreams
                 that previously returned errors (retried once per hour).
-        Step 3: parse observations into SensorReadings.
+        Step 3: parse observations into SensorReadings, and yield those fetched
+                so far every ``samen_meten_batch_seconds``. A cycle reads 11,000+
+                datastreams and can take two hours; the fetches go on while the
+                polling loop pushes a batch.
         """
-        import asyncio
-
         # Step 1: discover Things
         if not self._discovered_things:
             await self._discover_things()
             if not self._discovered_things:
                 logger.warning("samen_meten: no Things discovered")
-                return []
+                return
 
         # Step 2 & 3: fetch observations per Datastream (concurrent)
         sem = asyncio.Semaphore(20)
-        all_readings: list[SensorReading] = []
-        lock = asyncio.Lock()
         now = datetime.now(UTC)
 
         # Retry blacklisted datastreams once per hour
         retry_cutoff = now - timedelta(hours=1)
 
-        async def _fetch_one(thing_id: int, meta: dict, ds_info: dict) -> None:
+        async def _fetch_one(thing_id: int, meta: dict, ds_info: dict) -> list[SensorReading]:
             ds_id: int = ds_info["ds_id"]
             observed_property: str = ds_info["observed_property"]
 
             # Skip blacklisted datastreams (retry after 1 hour)
             blacklisted_at = self._dead_ds.get(ds_id)
             if blacklisted_at is not None and blacklisted_at > retry_cutoff:
-                return
+                return []
 
             last = self._last_ts.get(ds_id)
             if last is None:
@@ -129,14 +149,14 @@ class SamenMetenPollingSource(RestPollingSource):
                 except Exception:
                     # Blacklist this datastream to skip on future cycles
                     self._dead_ds[ds_id] = now
-                    return
+                    return []
 
             if not isinstance(obs_data, dict):
-                return
+                return []
 
             observations = obs_data.get("value", [])
             if not isinstance(observations, list) or not observations:
-                return
+                return []
 
             # Clear from blacklist on success
             self._dead_ds.pop(ds_id, None)
@@ -154,25 +174,40 @@ class SamenMetenPollingSource(RestPollingSource):
                 thing_name=full_thing_name,
             )
             if readings:
-                newest_ts = max(r.timestamp for r in readings)
-                async with lock:
-                    self._last_ts[ds_id] = newest_ts
-                    all_readings.extend(readings)
+                self._last_ts[ds_id] = max(r.timestamp for r in readings)
+            return readings
 
-        # Build task list
-        tasks = []
-        for thing_id, meta in self._discovered_things.items():
-            for ds_info in meta.get("datastreams", []):
-                tasks.append(_fetch_one(thing_id, meta, ds_info))
-
-        # Run all concurrently (bounded by semaphore)
-        await asyncio.gather(*tasks, return_exceptions=True)
+        # One task per Datastream; the semaphore bounds how many run at once.
+        pending = {
+            asyncio.create_task(_fetch_one(thing_id, meta, ds_info))
+            for thing_id, meta in self._discovered_things.items()
+            for ds_info in meta.get("datastreams", [])
+        }
+        batch_seconds = settings.samen_meten_batch_seconds
+        if batch_seconds <= 0:
+            batch_seconds = _DEFAULT_BATCH_SECONDS
+        try:
+            while pending:
+                done, pending = await asyncio.wait(pending, timeout=batch_seconds)
+                # A Datastream whose fetch raised gives nothing this cycle, as before.
+                batch = [
+                    reading
+                    for task in done
+                    if not task.cancelled() and task.exception() is None
+                    for reading in task.result()
+                ]
+                if batch:
+                    yield batch
+        finally:
+            # The polling loop stopped reading batches (a push raised): stop fetching.
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
 
         skipped = sum(1 for ts in self._dead_ds.values() if ts > retry_cutoff)
         if skipped:
             logger.info("samen_meten: skipped %d blacklisted datastreams", skipped)
-
-        return all_readings
 
     async def _discover_things(self) -> None:
         """Paginate through /Things until all are loaded (or optional cap is hit)."""

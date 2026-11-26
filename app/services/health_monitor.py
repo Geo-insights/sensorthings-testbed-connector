@@ -27,6 +27,9 @@ class HealthMonitor:
         self._source_last_success: dict[str, float] = {}
         self._source_success_counts: dict[str, int] = {}
         self._source_last_error: dict[str, str] = {}
+        # Per polling source: the longest stretch without data in its last cycle
+        # that delivered, which widens its stall threshold.
+        self._source_longest_wait: dict[str, float] = {}
 
     def record_success(self, datastream_id: str) -> None:
         with self._lock:
@@ -60,6 +63,16 @@ class HealthMonitor:
             last = self._source_last_success.get(source)
         return None if last is None else max(0.0, time.time() - last)
 
+    def record_source_wait(self, source: str, seconds: float) -> None:
+        """Record the longest stretch without data in ``source``'s last cycle that delivered."""
+        with self._lock:
+            self._source_longest_wait[source] = max(0.0, seconds)
+
+    def source_longest_wait(self, source: str) -> float | None:
+        """The longest stretch without data in ``source``'s last cycle that delivered, if any."""
+        with self._lock:
+            return self._source_longest_wait.get(source)
+
     def source_freshness(self, thresholds: dict[str, float]) -> dict[str, Any]:
         """Return per-source freshness against the given stale thresholds.
 
@@ -77,6 +90,7 @@ class HealthMonitor:
             last_success = dict(self._source_last_success)
             counts = dict(self._source_success_counts)
             last_error = dict(self._source_last_error)
+            longest_wait = dict(self._source_longest_wait)
 
         sources: dict[str, Any] = {}
         any_stale = False
@@ -94,6 +108,9 @@ class HealthMonitor:
                 ),
                 "age_seconds": round(age, 1) if age is not None else None,
                 "threshold_seconds": round(threshold, 1),
+                "longest_wait_seconds": (
+                    round(longest_wait[source], 1) if source in longest_wait else None
+                ),
                 "success_count": counts.get(source, 0),
                 "last_error": last_error.get(source),
                 "stale": stale,

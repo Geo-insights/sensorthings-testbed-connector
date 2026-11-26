@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import logging
 from abc import abstractmethod
+from collections.abc import AsyncGenerator
+from contextlib import aclosing
 
 from app.models import SensorReading
 from app.services.polling_source import PollingSource
@@ -48,28 +50,53 @@ class RestPollingSource(PollingSource):
     # ------------------------------------------------------------------
 
     async def fetch_readings(self) -> list[SensorReading]:
-        """Fetch readings with automatic health-monitor bookkeeping.
+        """Fetch a cycle's readings at once, with automatic health-monitor bookkeeping.
 
-        Subclasses should override :meth:`_do_fetch_readings` instead of
-        this method.
+        Subclasses should override :meth:`_do_fetch_readings` (or
+        :meth:`_do_fetch_reading_batches`) instead of this method.
+        """
+        readings: list[SensorReading] = []
+        async for batch in self.fetch_reading_batches():
+            readings.extend(batch)
+        return readings
+
+    async def fetch_reading_batches(self) -> AsyncGenerator[list[SensorReading], None]:
+        """Yield a cycle's readings in batches, with automatic health-monitor bookkeeping.
+
+        A fetch that fails part-way records the error and ends the cycle; the
+        batches yielded before it stand. The empty-cycle and discovery alerts
+        look at the whole cycle.
         """
         from app.services.health_monitor import health_monitor
 
+        fetched = 0
         try:
-            readings = await self._do_fetch_readings()
+            # aclosing: when the caller stops reading batches, the source's
+            # fetch stops at once rather than when the generator is collected.
+            async with aclosing(self._do_fetch_reading_batches()) as batches:
+                async for batch in batches:
+                    fetched += len(batch)
+                    yield batch
         except Exception as exc:
             logger.exception("%s: fetch cycle failed", self.source_name)
             health_monitor.record_source_error(
                 self.source_name.lower(),
                 f"{type(exc).__name__}: {exc}",
             )
-            return []
+            return
+        self._after_cycle(fetched)
 
-        if readings:
+    async def _do_fetch_reading_batches(self) -> AsyncGenerator[list[SensorReading], None]:
+        """A cycle's readings in batches; by default one batch, :meth:`_do_fetch_readings`."""
+        yield await self._do_fetch_readings()
+
+    def _after_cycle(self, fetched: int) -> None:
+        """Log a cycle's yield and raise the empty-cycle and discovery alerts."""
+        if fetched:
             self._has_seen_readings = True
             self._consecutive_empty = 0
             logger.info(
-                "%s: fetched %d readings", self.source_name, len(readings),
+                "%s: fetched %d readings", self.source_name, fetched,
             )
         elif self._has_seen_readings:
             # T6: zero-discovery alert — source previously delivered data but
@@ -83,14 +110,12 @@ class RestPollingSource(PollingSource):
         if self.uses_dynamic_discovery and not self.entity_sets():
             self._emit_discovery_empty_alert()
 
-        return readings
-
     @abstractmethod
     async def _do_fetch_readings(self) -> list[SensorReading]:
         """Actual fetch logic — override in subclasses.
 
-        Exceptions propagate to :meth:`fetch_readings` which records them
-        in health_monitor.
+        Exceptions propagate to :meth:`fetch_reading_batches` which records
+        them in health_monitor.
         """
         ...
 
