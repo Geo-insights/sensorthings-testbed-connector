@@ -1,374 +1,366 @@
-"""Tests for the BRO groundwater level polling source (#16).
+"""BRO groundwater source, against the response shapes of the live BRO GM API (checked 2026-11-27).
 
-Covers:
-- discover_wells() with mock response returns well IDs with coordinates
-- discover_wells() respects max_wells cap (>500 wells → capped at configured limit)
-- parse_observations() produces WATER_LEVEL SensorReadings with correct unit "m"
-- build_entity_set() produces valid entity set
-- BROGroundwaterPollingSource is a RestPollingSource subclass
-- BROGroundwaterPollingSource has uses_dynamic_discovery = True
-- Empty well search returns empty list
-- Various location parsing shapes
+Until the rewrite the source parsed a JSON API that does not exist: the well search is namespaced XML (the parser
+found 0 of 959 wells), the GLD list endpoint answered 404, and dossiers are XML. The fixtures below are trimmed
+copies of real responses (well GMW000000007878, dossier GLD000000046233 near Delft).
 """
+
 from __future__ import annotations
 
-from datetime import UTC, datetime
-from unittest.mock import patch
+import asyncio
+import dataclasses
+import logging
+from datetime import UTC, date, datetime, timedelta
+from typing import Any
 
+import httpx
 import pytest
 
+import app.services.api_client as api_client
+import app.services.bro_groundwater_source as bro_source
 from app.services.bro_groundwater_source import BROGroundwaterPollingSource
 from app.services.rest_polling_source import RestPollingSource
 from app.sources.bro_groundwater import (
+    ObservationSummary,
+    Point,
+    Tube,
+    Well,
     build_entity_set,
-    discover_wells,
-    parse_observations,
+    merge_points,
+    parse_points,
+    parse_relations,
+    parse_summary,
+    parse_wells,
+    readings_for,
+    sensor_id_for,
 )
-from app.sta.canonical import CanonicalDatastream
 
-_TS = datetime(2026, 10, 7, 12, 0, 0, tzinfo=UTC)
-
-
-# ---------------------------------------------------------------------------
-# discover_wells
-# ---------------------------------------------------------------------------
+_NS = ('xmlns:gml="http://www.opengis.net/gml/3.2" xmlns:brocom="http://www.broservices.nl/xsd/brocommon/3.0" '
+       'xmlns="http://www.broservices.nl/xsd/dsgmw/1.1"')
 
 
-class TestDiscoverWells:
-    def _make_response(self, n: int) -> dict:
-        """Build a synthetic /gmw/v1/objects/search response with n wells."""
-        return {
-            "broObjects": [
-                {
-                    "broId": f"GMW{i:015d}",
-                    "deliveredLocation": {
-                        "location": {"pos": f"{52.0 + i * 0.001} {4.0 + i * 0.001}"}
-                    },
-                }
-                for i in range(n)
-            ]
-        }
+def _gmw(bro_id: str, lat: float, lon: float, *, removed: str = "nee", deregistered: str = "nee",
+         pos: bool = True) -> str:
+    location = (f'<brocom:standardizedLocation srsName="urn:ogc:def:crs:EPSG::4258"><gml:pos>{lat} {lon}</gml:pos>'
+                f'</brocom:standardizedLocation>') if pos else ""
+    return (f"<dispatchDocument><GMW_C><brocom:broId>{bro_id}</brocom:broId>"
+            f"<brocom:deregistered>{deregistered}</brocom:deregistered>{location}"
+            '<brocom:deliveredLocation srsName="http://www.opengis.net/def/crs/EPSG/0/28992"><gml:pos>83204.000 448440.000'
+            f"</gml:pos></brocom:deliveredLocation><removed>{removed}</removed></GMW_C></dispatchDocument>")
 
-    def test_returns_expected_well_ids(self):
-        resp = self._make_response(3)
-        wells = discover_wells(resp)
-        assert len(wells) == 3
-        ids = {w["well_id"] for w in wells}
-        assert "GMW000000000000000" in ids
-        assert "GMW000000000000001" in ids
-        assert "GMW000000000000002" in ids
 
-    def test_returns_lat_lon(self):
-        resp = {
-            "broObjects": [
-                {
-                    "broId": "GMW000000012345",
-                    "deliveredLocation": {
-                        "location": {"pos": "52.0 4.0"}
-                    },
-                }
-            ]
-        }
-        wells = discover_wells(resp)
-        assert len(wells) == 1
-        assert wells[0]["lat"] == pytest.approx(52.0)
-        assert wells[0]["lon"] == pytest.approx(4.0)
+def _search(*wells: str) -> str:
+    return (f'<?xml version="1.0" encoding="UTF-8"?><dispatchCharacteristicsResponse {_NS}>'
+            f"<brocom:responseType>dispatch</brocom:responseType>{''.join(wells)}</dispatchCharacteristicsResponse>")
 
-    def test_respects_max_wells_cap(self):
-        """500 wells in response but cap=10 → returns exactly 10 with a warning."""
-        resp = self._make_response(500)
-        import logging
-        with patch.object(logging.getLogger("app.sources.bro_groundwater"), "warning") as mock_warn:
-            wells = discover_wells(resp, max_wells=10)
-        assert len(wells) == 10
-        # Warning must mention the overage
-        assert mock_warn.called
-        warning_msg = mock_warn.call_args_list[0][0][0]
-        assert "500" in warning_msg or "%d" in warning_msg  # either interpolated or format string
 
-    def test_max_wells_warns_and_truncates(self, caplog):
-        """Confirm the log WARNING is emitted when wells exceed cap."""
-        resp = self._make_response(50)
-        import logging
-        with caplog.at_level(logging.WARNING, logger="app.sources.bro_groundwater"):
-            wells = discover_wells(resp, max_wells=5)
-        assert len(wells) == 5
-        assert any("50" in r.message or "capping" in r.message.lower() for r in caplog.records)
+RELATIONS = {
+    "gmwBroId": "GMW000000007878",
+    "monitoringTubeReferences": [
+        {"tubeNumber": 1, "screenTopPosition": -4.06, "gmnReferences": [],
+         "gldReferences": [{"broId": "GLD000000046233", "url": "https://publiek.broservices.nl/gm/gld/v1/objects/GLD000000046233"}]},
+        {"tubeNumber": 2, "gldReferences": []},
+    ],
+    "characteristics": None,
+}
 
-    def test_empty_response_returns_empty_list(self):
-        wells = discover_wells({"broObjects": []})
-        assert wells == []
+SUMMARY = [
+    {"observationId": "_a", "startDate": "31-12-2023", "endDate": "19-02-2025", "observationType": "reguliereMeting",
+     "observationStatus": "volledigBeoordeeld"},
+    {"observationId": "_b", "startDate": "11-04-2025", "endDate": "31-12-2025", "observationType": "reguliereMeting",
+     "observationStatus": "voorlopig"},
+    {"observationId": "_c", "startDate": "01-06-2025", "endDate": "01-06-2025", "observationType": "controlemeting",
+     "observationStatus": "voorlopig"},
+]
 
-    def test_missing_bro_objects_key_returns_empty(self):
-        wells = discover_wells({})
-        assert wells == []
 
-    def test_non_list_bro_objects_returns_empty(self):
-        wells = discover_wells({"broObjects": "not_a_list"})
-        assert wells == []
+def _tvp(time: str, value: str, quality: str = "goedgekeurd") -> str:
+    return (f"<wml2:point><wml2:MeasurementTVP><wml2:time>{time}</wml2:time><wml2:value uom=\"m\">{value}</wml2:value>"
+            "<wml2:metadata><wml2:TVPMeasurementMetadata><wml2:qualifier><swe:Category>"
+            '<swe:codeSpace xlink:href="urn:bro:gld:StatusQualityControl"/>'
+            f"<swe:value>{quality}</swe:value></swe:Category></wml2:qualifier></wml2:TVPMeasurementMetadata>"
+            "</wml2:metadata></wml2:MeasurementTVP></wml2:point>")
 
-    def test_object_without_bro_id_is_skipped(self):
-        resp = {
-            "broObjects": [
-                {"deliveredLocation": {"location": {"pos": "52.0 4.0"}}},
-            ]
-        }
-        wells = discover_wells(resp)
-        assert wells == []
 
-    def test_object_with_unparseable_location_is_skipped(self):
-        resp = {
-            "broObjects": [
-                {"broId": "GMW000000012345"},  # no location at all
-            ]
-        }
-        wells = discover_wells(resp)
-        assert wells == []
-
-    def test_location_via_flat_lat_lon_keys(self):
-        """Flat lat/lon keys on the object (test-fixture friendly)."""
-        resp = {
-            "broObjects": [
-                {"broId": "GMW000000099999", "lat": 51.9, "lon": 4.3},
-            ]
-        }
-        wells = discover_wells(resp)
-        assert len(wells) == 1
-        assert wells[0]["lat"] == pytest.approx(51.9)
-        assert wells[0]["lon"] == pytest.approx(4.3)
-
-    def test_location_via_delivered_coordinates_geojson(self):
-        """GeoJSON [lon, lat] shape under deliveredLocation.coordinates."""
-        resp = {
-            "broObjects": [
-                {
-                    "broId": "GMW000000077777",
-                    "deliveredLocation": {"coordinates": [4.4, 52.1]},
-                }
-            ]
-        }
-        wells = discover_wells(resp)
-        assert len(wells) == 1
-        assert wells[0]["lat"] == pytest.approx(52.1)
-        assert wells[0]["lon"] == pytest.approx(4.4)
+def _observation(*points: str) -> str:
+    return ('<?xml version="1.0" encoding="UTF-8"?><dispatchDataResponse xmlns:wml2="http://www.opengis.net/waterml/2.0" '
+            'xmlns:swe="http://www.opengis.net/swe/2.0" xmlns:xlink="http://www.w3.org/1999/xlink">'
+            f"<wml2:MeasurementTimeseries>{''.join(points)}</wml2:MeasurementTimeseries></dispatchDataResponse>")
 
 
 # ---------------------------------------------------------------------------
-# parse_observations
+# Parsing
 # ---------------------------------------------------------------------------
 
 
-class TestParseObservations:
-    def _make_gld_response(self, obs: list[dict]) -> dict:
-        return {"observations": obs}
+class TestParseWells:
+    def test_namespaced_wells_with_their_standardized_location(self):
+        """protects=wells come out of the namespaced XML, at their EPSG:4258 position (not the RD delivered one);
+        fails_when=the parser looks for un-namespaced broId again (0 wells) or reads the RD coordinates;
+        no_claim=which wells BRO holds."""
+        xml = _search(_gmw("GMW2", 52.02, 4.35), _gmw("GMW1", 52.019661020, 4.341227630))
 
-    def test_produces_water_level_readings(self):
-        obs = [{"timestamp": "2026-10-07T12:00:00Z", "value": -1.5}]
-        readings = parse_observations(self._make_gld_response(obs), "GMW000000012345")
-        assert len(readings) == 1
-        r = readings[0]
-        assert r.observed_property == CanonicalDatastream.WATER_LEVEL.value
-        assert r.unit == "m"
-        assert r.value == pytest.approx(-1.5)
+        assert parse_wells(xml, 500) == [Well("GMW1", 52.01966102, 4.34122763), Well("GMW2", 52.02, 4.35)]
 
-    def test_sensor_id_uses_bro_prefix(self):
-        obs = [{"timestamp": "2026-10-07T12:00:00Z", "value": 0.0}]
-        readings = parse_observations(self._make_gld_response(obs), "GMW000000099999")
-        assert readings[0].sensor_id == "bro-GMW000000099999"
+    def test_removed_deregistered_and_unplaced_wells_are_left_out(self):
+        xml = _search(_gmw("GMW1", 52.0, 4.3, removed="ja"), _gmw("GMW2", 52.0, 4.3, deregistered="ja"),
+                      _gmw("GMW3", 52.0, 4.3, pos=False), _gmw("GMW4", 52.0, 4.3))
 
-    def test_thing_name_uses_bro_prefix(self):
-        obs = [{"timestamp": "2026-10-07T12:00:00Z", "value": 0.5}]
-        readings = parse_observations(self._make_gld_response(obs), "GMW000000012345")
-        assert readings[0].thing_name == "BRO GMW000000012345"
+        assert [w.bro_id for w in parse_wells(xml, 500)] == ["GMW4"]
 
-    def test_unit_is_metres(self):
-        obs = [{"timestamp": "2026-10-07T12:00:00Z", "value": -0.75}]
-        readings = parse_observations(self._make_gld_response(obs), "GMW000000012345")
-        assert readings[0].unit == "m"
+    def test_max_wells_keeps_the_first_by_bro_id(self, caplog):
+        xml = _search(*(_gmw(f"GMW{i}", 52.0, 4.3) for i in (3, 1, 2)))
 
-    def test_observed_property_name_is_groundwater_level(self):
-        obs = [{"timestamp": "2026-10-07T12:00:00Z", "value": -1.0}]
-        readings = parse_observations(self._make_gld_response(obs), "GMW000000012345")
-        assert readings[0].observed_property_name == "Groundwater level"
+        with caplog.at_level(logging.WARNING):
+            assert [w.bro_id for w in parse_wells(xml, 2)] == ["GMW1", "GMW2"]
+        assert "BRO_MAX_WELLS" in caplog.text
 
-    def test_timestamp_is_parsed(self):
-        obs = [{"timestamp": "2026-10-07T08:30:00Z", "value": -1.2}]
-        readings = parse_observations(self._make_gld_response(obs), "GMW000000012345")
-        ts = readings[0].timestamp
-        assert ts.year == 2026
-        assert ts.month == 10
-        assert ts.day == 7
-        assert ts.hour == 8
-        assert ts.minute == 30
 
-    def test_phenomenon_time_field_name_accepted(self):
-        """phenomenonTime (STA-style) is also accepted."""
-        obs = [{"phenomenonTime": "2026-10-07T09:00:00+00:00", "result": -0.5}]
-        readings = parse_observations(self._make_gld_response(obs), "GMW000000012345")
-        assert len(readings) == 1
-        assert readings[0].value == pytest.approx(-0.5)
+def test_relations_give_the_tubes_with_a_dossier():
+    """protects=a well's tubes and their GLD ids come from gmw-relations; tubes without a GLD are left out;
+    fails_when=the source asks the GLD API for a well's dossiers (404) or registers tubes without data;
+    no_claim=GMN or GAR references."""
+    assert parse_relations(RELATIONS) == [Tube(1, ("GLD000000046233",))]
+    assert parse_relations({"monitoringTubeReferences": None}) == []
 
-    def test_multiple_observations_all_parsed(self):
-        obs = [
-            {"timestamp": "2026-10-07T10:00:00Z", "value": -1.0},
-            {"timestamp": "2026-10-07T11:00:00Z", "value": -1.1},
-            {"timestamp": "2026-10-07T12:00:00Z", "value": -1.2},
-        ]
-        readings = parse_observations(self._make_gld_response(obs), "GMW000000012345")
-        assert len(readings) == 3
 
-    def test_empty_observations_returns_empty_list(self):
-        readings = parse_observations({"observations": []}, "GMW000000012345")
-        assert readings == []
+def test_summary_dates_are_day_month_year():
+    summary = parse_summary([*SUMMARY, {"startDate": "01-01-2020"}])
 
-    def test_missing_observations_key_returns_empty_list(self):
-        readings = parse_observations({}, "GMW000000012345")
-        assert readings == []
+    assert summary[1] == ObservationSummary("_b", date(2025, 4, 11), date(2025, 12, 31), "reguliereMeting", "voorlopig")
+    assert len(summary) == 3
 
-    def test_non_dict_observations_are_skipped(self):
-        readings = parse_observations({"observations": ["bad", None, 42]}, "GMW000000012345")
-        assert readings == []
 
-    def test_observation_without_timestamp_is_skipped(self):
-        obs = [{"value": -1.0}]  # no timestamp
-        readings = parse_observations(self._make_gld_response(obs), "GMW000000012345")
-        assert readings == []
+def test_points_are_utc_with_their_quality_and_nil_values_skipped():
+    """protects=WaterML points: the offset time to UTC, the value in m, the StatusQualityControl;
+    fails_when=times are kept as local wall clock or a nil value raises;
+    no_claim=other WaterML metadata."""
+    xml = _observation(_tvp("2025-04-11T00:00:00+02:00", "-0.923"), _tvp("2025-04-11T01:00:00+02:00", ""),
+                       _tvp("2025-12-31T23:00:00+01:00", "-0.932", "afgekeurd"))
 
-    def test_observation_without_value_is_skipped(self):
-        obs = [{"timestamp": "2026-10-07T12:00:00Z"}]  # no value
-        readings = parse_observations(self._make_gld_response(obs), "GMW000000012345")
-        assert readings == []
+    assert parse_points(xml) == [
+        Point(datetime(2025, 4, 10, 22, 0, tzinfo=UTC), -0.923, "goedgekeurd"),
+        Point(datetime(2025, 12, 31, 22, 0, tzinfo=UTC), -0.932, "afgekeurd"),
+    ]
 
-    def test_measured_values_key_also_accepted(self):
-        """measuredValues is an alternative field name."""
-        obs = [{"timestamp": "2026-10-07T12:00:00Z", "value": -2.0}]
-        readings = parse_observations({"measuredValues": obs}, "GMW000000012345")
-        assert len(readings) == 1
 
-    def test_negative_water_level_preserved(self):
-        """Below-datum levels are negative — must not be coerced to zero."""
-        obs = [{"timestamp": "2026-10-07T12:00:00Z", "value": -3.45}]
-        readings = parse_observations(self._make_gld_response(obs), "GMW000000099999")
-        assert readings[0].value == pytest.approx(-3.45)
+def test_merge_prefers_the_assessed_value_and_drops_rejected_points():
+    t = datetime(2025, 5, 1, tzinfo=UTC)
+    merged = merge_points([
+        ("volledigBeoordeeld", [Point(t, -1.0, "goedgekeurd")]),
+        ("voorlopig", [Point(t, -1.1, "goedgekeurd"), Point(t + timedelta(hours=1), -1.2, "afgekeurd"),
+                       Point(t + timedelta(hours=2), -1.3, "onbeslist")]),
+    ])
+
+    assert merged == [Point(t, -1.0, "goedgekeurd"), Point(t + timedelta(hours=2), -1.3, "onbeslist")]
+
+
+def test_readings_are_canonical_groundwater_levels_per_tube():
+    t = datetime(2025, 5, 1, tzinfo=UTC)
+    (reading,) = readings_for([Point(t, -0.9, "onbeslist"), Point(t, -1.0, "afgekeurd")], "GMW1", 2)
+
+    assert (reading.sensor_id, reading.observed_property, reading.unit, reading.observed_property_name,
+            reading.quality, reading.thing_name) == (
+        "bro-GMW1-2", "water_level", "m", "Groundwater level", "uncertain", "BRO GMW1")
+
+
+def test_entity_set_has_one_sensor_per_tube():
+    es = build_entity_set(Well("GMW1", 52.01, 4.34), [2, 1])
+
+    assert [s["sensor_id"] for s in es["sensors"]] == [sensor_id_for("GMW1", 1), sensor_id_for("GMW1", 2)]
+    assert es["location"]["location"]["coordinates"] == [4.34, 52.01]
+    assert es["thing"]["properties"]["source"] == "bro_groundwater"
+    assert all(s["observed_properties"] == ["water_level"] for s in es["sensors"])
 
 
 # ---------------------------------------------------------------------------
-# build_entity_set
+# The polling source
 # ---------------------------------------------------------------------------
 
 
-class TestBuildEntitySet:
-    def test_returns_required_keys(self):
-        es = build_entity_set("GMW000000012345", 52.0, 4.0)
-        assert "site_key" in es
-        assert "site_name" in es
-        assert "thing" in es
-        assert "location" in es
-        assert "sensors" in es
-        assert "observed_properties" in es
+class _FakeBro:
+    """Stands in for AsyncAPIClient against BRO: scripted responses, every request recorded."""
 
-    def test_site_key_is_bro(self):
-        es = build_entity_set("GMW000000012345", 52.0, 4.0)
-        assert es["site_key"] == "bro"
+    def __init__(self, *, wells: str, relations: dict[str, Any], summaries: dict[str, list],
+                 observations: dict[str, str], failing: set[str] | None = None) -> None:
+        self.wells, self.relations, self.summaries, self.observations = wells, relations, summaries, observations
+        self.failing = failing or set()
+        self.calls: list[tuple[str, Any]] = []
 
-    def test_thing_name_format(self):
-        es = build_entity_set("GMW000000012345", 52.0, 4.0)
-        assert es["thing"]["name"] == "BRO GMW000000012345"
+    async def post_text(self, path: str, json_body: Any = None) -> str:
+        self.calls.append((path, json_body))
+        return self.wells
 
-    def test_source_property_is_bro_groundwater(self):
-        es = build_entity_set("GMW000000012345", 52.0, 4.0)
-        assert es["thing"]["properties"]["source"] == "bro_groundwater"
+    async def get(self, path: str, params: dict | None = None) -> Any:
+        self.calls.append((path, params))
+        if any(f in path for f in self.failing):
+            raise httpx.ConnectError("BRO unreachable")
+        if path.startswith("/v1/gmw-relations/"):
+            return self.relations[path.rsplit("/", 1)[1]]
+        return self.summaries[path.split("/")[4]]
 
-    def test_bro_well_id_in_properties(self):
-        es = build_entity_set("GMW000000012345", 52.0, 4.0)
-        assert es["thing"]["properties"]["bro_well_id"] == "GMW000000012345"
+    async def get_text(self, path: str, params: dict | None = None) -> str:
+        self.calls.append((path, params))
+        return self.observations[path.rsplit("/", 1)[1]]
 
-    def test_location_coordinates_geojson_lon_lat_order(self):
-        """GeoJSON coordinates must be [lon, lat]."""
-        es = build_entity_set("GMW000000012345", 52.1, 4.3)
-        coords = es["location"]["location"]["coordinates"]
-        assert coords == [4.3, 52.1]
 
-    def test_sensor_id_uses_bro_prefix(self):
-        es = build_entity_set("GMW000000012345", 52.0, 4.0)
-        sensor = es["sensors"][0]
-        assert sensor["sensor_id"] == "bro-GMW000000012345"
+def _settings(monkeypatch, **changes: Any) -> None:
+    base = {"bro_enabled": True, "bro_bbox": "52.0,4.3,52.1,4.4", "bro_max_wells": 500, "bro_initial_days": 30}
+    monkeypatch.setattr(bro_source, "settings", dataclasses.replace(bro_source.settings, **{**base, **changes}))
 
-    def test_observed_properties_contains_water_level(self):
-        es = build_entity_set("GMW000000012345", 52.0, 4.0)
-        assert "water_level" in es["observed_properties"]
 
-    def test_observed_property_is_canonical(self):
-        from app.sta.canonical import resolve
+def _fake(**overrides: Any) -> _FakeBro:
+    args: dict[str, Any] = {
+        "wells": _search(_gmw("GMW000000007878", 52.0197, 4.3412), _gmw("GMW000000009999", 52.03, 4.36)),
+        "relations": {"GMW000000007878": RELATIONS, "GMW000000009999": {"monitoringTubeReferences": []}},
+        "summaries": {"GLD000000046233": SUMMARY},
+        "observations": {
+            "_a": _observation(_tvp("2025-01-01T00:00:00+01:00", "-0.80")),
+            "_b": _observation(_tvp("2025-11-30T00:00:00+01:00", "-0.90"), _tvp("2025-12-15T00:00:00+01:00", "-0.91"),
+                               _tvp("2025-12-31T23:00:00+01:00", "-0.93")),
+        },
+    }
+    args.update(overrides)
+    return _FakeBro(**args)
 
-        es = build_entity_set("GMW000000012345", 52.0, 4.0)
-        for key in es["observed_properties"]:
-            assert resolve(key) is not None, f"observed_property {key!r} not in canonical"
 
-    def test_sensor_observed_properties_lists_water_level(self):
-        es = build_entity_set("GMW000000012345", 52.0, 4.0)
-        assert "water_level" in es["sensors"][0]["observed_properties"]
+def _run(source: BROGroundwaterPollingSource) -> list[Any]:
+    return asyncio.run(source._do_fetch_readings())
 
-    def test_encoding_type_is_geojson(self):
-        es = build_entity_set("GMW000000012345", 52.0, 4.0)
-        assert es["location"]["encodingType"] == "application/geo+json"
 
-    def test_geometry_type_is_point(self):
-        es = build_entity_set("GMW000000012345", 52.0, 4.0)
-        assert es["location"]["location"]["type"] == "Point"
+def test_first_sight_reads_the_last_initial_days_of_the_dossier(monkeypatch):
+    """protects=a tube with no fetched point and no FROST mark gets the last BRO_INITIAL_DAYS of its own data,
+    via the time-filtered observation endpoint, and only regular observations reaching that far are fetched;
+    fails_when=the source asks for the hour before now (BRO is months behind: nothing, ever) or downloads whole
+    dossiers (52 MB);
+    no_claim=what BRO does with the margin (the loop's dedup drops repeats)."""
+    _settings(monkeypatch)
+    source = BROGroundwaterPollingSource()
+    source._client = fake = _fake()
+
+    readings = _run(source)
+
+    # Newest end 31-12-2025, 30 days back: from 2025-12-01 (points from 30 Nov are before it).
+    assert [(r.timestamp, r.value) for r in readings] == [
+        (datetime(2025, 12, 14, 23, 0, tzinfo=UTC), -0.91), (datetime(2025, 12, 31, 22, 0, tzinfo=UTC), -0.93)]
+    fetched = [(path, params) for path, params in fake.calls if "/observations/" in path]
+    assert [path.rsplit("/", 1)[1] for path, _ in fetched] == ["_b"]  # _a ends earlier, _c is a control measurement
+    assert fetched[0][1]["startTVPTime"] == "2025-11-30T00:00:00"
+    assert set(fetched[0][1]) == {"startTVPTime", "endTVPTime"} and "Z" not in fetched[0][1]["endTVPTime"]
+
+
+def test_a_frost_mark_is_where_a_tube_starts(monkeypatch):
+    """protects=after a restart a tube resumes at its newest row in FROST (use_marks), not its first-sight window;
+    fails_when=marks are ignored and every restart re-reads (or skips) a window;
+    no_claim=how the loop seeds the marks."""
+    _settings(monkeypatch)
+    source = BROGroundwaterPollingSource()
+    source._client = _fake()
+    source.use_marks({"bro-GMW000000007878-1::water_level": datetime(2025, 12, 20, tzinfo=UTC)})
+
+    readings = _run(source)
+
+    assert [r.timestamp for r in readings] == [datetime(2025, 12, 31, 22, 0, tzinfo=UTC)]
+
+
+def test_the_next_cycle_starts_after_the_newest_point_fetched(monkeypatch):
+    _settings(monkeypatch)
+    source = BROGroundwaterPollingSource()
+    source._client = fake = _fake()
+    _run(source)
+    fake.calls.clear()
+
+    assert _run(source) == []
+    (fetch,) = [params for path, params in fake.calls if "/observations/" in path]
+    assert fetch["startTVPTime"] == "2025-12-30T22:00:00"  # newest point minus the one-day margin
+    assert not [path for path, _ in fake.calls if "gmw-relations" in path or "searches" in path]  # cached
+
+
+def test_entity_sets_are_the_wells_with_a_dossier(monkeypatch):
+    _settings(monkeypatch)
+    source = BROGroundwaterPollingSource()
+    source._client = _fake()
+    readings = _run(source)
+
+    assert [es["thing"]["name"] for es in source.entity_sets()] == ["BRO GMW000000007878"]
+    assert source.entity_sets_for(readings) == source.entity_sets()
+    assert source.entity_sets_for([]) == []
+
+
+def test_a_failing_well_is_skipped_and_the_rest_go_on(monkeypatch, caplog):
+    _settings(monkeypatch)
+    source = BROGroundwaterPollingSource()
+    source._client = _fake(failing={"GMW000000009999"})
+
+    with caplog.at_level(logging.WARNING):
+        readings = _run(source)
+
+    assert readings and "GMW000000009999 skipped" in caplog.text
+    assert "GMW000000009999" not in source._tubes  # tried again next cycle
+
+
+def test_batches_hold_a_few_wells_each(monkeypatch):
+    _settings(monkeypatch)
+    monkeypatch.setattr(bro_source, "_WELLS_PER_BATCH", 1)
+    source = BROGroundwaterPollingSource()
+    source._client = _fake(relations={"GMW000000007878": RELATIONS, "GMW000000009999": RELATIONS})
+
+    async def batches() -> list[list[Any]]:
+        return [b async for b in source._do_fetch_reading_batches()]
+
+    assert [{r.sensor_id for r in b} for b in asyncio.run(batches())] == [
+        {"bro-GMW000000007878-1"}, {"bro-GMW000000009999-1"}]
+
+
+@pytest.mark.parametrize("bbox", ["", "52.0,4.3"])
+def test_no_or_bad_bbox_discovers_nothing(monkeypatch, caplog, bbox):
+    _settings(monkeypatch, bro_bbox=bbox)
+    source = BROGroundwaterPollingSource()
+    source._client = fake = _fake()
+
+    with caplog.at_level(logging.WARNING):
+        assert _run(source) == []
+    assert fake.calls == [] and "BRO_BBOX" in caplog.text
+
+
+def test_source_polls_daily_by_default():
+    """protects=BRO is polled once a day by default (BRO_POLL_SECONDS unset), and the source is disabled by default;
+    fails_when=the hourly default comes back (BRO is months behind: 24 empty polls a day);
+    no_claim=a value set in the environment."""
+    defaults = {f.name: f.default for f in dataclasses.fields(bro_source.settings)}
+    source = BROGroundwaterPollingSource()
+
+    assert defaults["bro_poll_seconds"] == 86400 and defaults["bro_enabled"] is False
+    assert isinstance(source, RestPollingSource) and source.uses_dynamic_discovery
+    assert source.source_name == "bro_groundwater"
 
 
 # ---------------------------------------------------------------------------
-# BROGroundwaterPollingSource — class-level properties
+# AsyncAPIClient text methods (BRO answers XML)
 # ---------------------------------------------------------------------------
 
 
-class TestBROGroundwaterPollingSource:
-    def test_is_rest_polling_source_subclass(self):
-        assert issubclass(BROGroundwaterPollingSource, RestPollingSource)
+def test_text_methods_return_the_body_and_retry(monkeypatch):
+    """protects=get_text/post_text return the raw body (XML) and retry like get/post;
+    fails_when=they parse JSON or give up on the first 503;
+    no_claim=the wait between retries (sleep is skipped here)."""
+    seen: list[str] = []
 
-    def test_source_name(self):
-        src = BROGroundwaterPollingSource()
-        assert src.source_name == "bro_groundwater"
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.method)
+        if len(seen) == 1:
+            return httpx.Response(503)
+        return httpx.Response(200, text="<xml/>")
 
-    def test_uses_dynamic_discovery_is_true(self):
-        src = BROGroundwaterPollingSource()
-        assert src.uses_dynamic_discovery is True
+    real = httpx.AsyncClient
+    monkeypatch.setattr(api_client.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
 
-    def test_is_disabled_by_default(self):
-        """BRO_ENABLED defaults to false in tests."""
-        src = BROGroundwaterPollingSource()
-        assert not src.is_enabled()
+    async def no_sleep(_: float) -> None:
+        return None
 
-    def test_poll_interval_at_least_10(self):
-        src = BROGroundwaterPollingSource()
-        assert src.poll_interval() >= 10
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+    client = api_client.AsyncAPIClient(base_url="https://bro.test")
 
-    def test_poll_interval_default_is_3600(self):
-        """Default BRO_POLL_SECONDS is 3600."""
-        src = BROGroundwaterPollingSource()
-        assert src.poll_interval() == 3600
-
-    def test_entity_sets_empty_before_discovery(self):
-        src = BROGroundwaterPollingSource()
-        assert src.entity_sets() == []
-
-    def test_entity_sets_populated_after_injecting_wells(self):
-        src = BROGroundwaterPollingSource()
-        src._discovered_wells["GMW000000001111"] = {"lat": 52.0, "lon": 4.0}
-        src._discovered_wells["GMW000000002222"] = {"lat": 52.1, "lon": 4.1}
-        sets = src.entity_sets()
-        assert len(sets) == 2
-        names = {s["thing"]["name"] for s in sets}
-        assert "BRO GMW000000001111" in names
-        assert "BRO GMW000000002222" in names
-
-    def test_entity_set_site_key_is_bro(self):
-        src = BROGroundwaterPollingSource()
-        src._discovered_wells["GMW000000009999"] = {"lat": 51.9, "lon": 4.3}
-        sets = src.entity_sets()
-        assert sets[0]["site_key"] == "bro"
-
-    def test_last_fetch_initially_none(self):
-        src = BROGroundwaterPollingSource()
-        assert src._last_fetch is None
+    assert asyncio.run(client.get_text("/x")) == "<xml/>"
+    assert asyncio.run(client.post_text("/y", json_body={"a": 1})) == "<xml/>"
+    assert seen == ["GET", "GET", "POST"]

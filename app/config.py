@@ -443,9 +443,13 @@ class Settings:
     # --- BRO groundwater (#16) ---
     bro_enabled: bool = os.getenv("BRO_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     bro_api_url: str = os.getenv("BRO_API_URL", "https://publiek.broservices.nl/gm/").strip().rstrip("/")
-    bro_poll_seconds: int = int(os.getenv("BRO_POLL_SECONDS", "3600"))
+    # Daily: owners deliver levels to BRO in batches, often months after measuring.
+    bro_poll_seconds: int = int(os.getenv("BRO_POLL_SECONDS", "86400"))
     bro_bbox: str = os.getenv("BRO_BBOX", "").strip()
     bro_max_wells: int = int(os.getenv("BRO_MAX_WELLS", "500"))
+    # On first sight of a tube (no point fetched, none in FROST): read this many days back
+    # from the newest data of its dossier.
+    bro_initial_days: int = int(os.getenv("BRO_INITIAL_DAYS", "30"))
     # --- Observation push reliability ---
     # Batch pushes via the SensorThings CreateObservations (dataArray) extension.
     frost_batch_push_enabled: bool = os.getenv("FROST_BATCH_PUSH_ENABLED", "true").lower() in {"1", "true", "yes", "on"}

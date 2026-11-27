@@ -71,6 +71,34 @@ class AsyncAPIClient:
                     await asyncio.sleep(wait)
         return None  # unreachable
 
+    async def get_text(self, path: str, params: dict[str, Any] | None = None) -> str:
+        """GET request with retries. Returns the body as text (for XML APIs such as BRO)."""
+        return await self._text("GET", path, params=params)
+
+    async def post_text(self, path: str, json_body: Any = None) -> str:
+        """POST a JSON body with retries. Returns the body as text (for XML APIs such as BRO)."""
+        return await self._text("POST", path, json_body=json_body)
+
+    async def _text(self, method: str, path: str, *, params: dict[str, Any] | None = None,
+                    json_body: Any = None) -> str:
+        import asyncio
+
+        url = f"{self._base_url}{path}" if self._base_url else path
+        async with httpx.AsyncClient(verify=self._verify_ssl, timeout=self._timeout, follow_redirects=True) as client:
+            for attempt in range(1, self._max_retries + 1):
+                try:
+                    resp = await client.request(method, url, params=params, json=json_body, headers=self._headers)
+                    resp.raise_for_status()
+                    return resp.text
+                except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+                    if attempt == self._max_retries:
+                        raise
+                    wait = 2 ** attempt
+                    logger.warning("%s %s %s attempt %d failed: %s (retry in %ds)",
+                                   self.__class__.__name__, method, path, attempt, exc, wait)
+                    await asyncio.sleep(wait)
+        raise RuntimeError("unreachable")  # the loop returns or raises
+
 
 class OAuth2ClientCredentials:
     """Manages OAuth2 client credentials token lifecycle."""
