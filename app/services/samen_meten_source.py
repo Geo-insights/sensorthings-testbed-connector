@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncGenerator, Iterable
+from collections.abc import AsyncGenerator, Iterable, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -29,8 +29,8 @@ from app.sources.samen_meten import (
 
 logger = logging.getLogger("connector.samen_meten")
 
-# Default look-back window when no previous timestamp is known for a Datastream.
-_DEFAULT_LOOKBACK_HOURS = 1
+# Look-back window when SAMEN_METEN_LOOKBACK_HOURS is not positive.
+_DEFAULT_LOOKBACK_HOURS = 6
 
 # Seconds between batches when SAMEN_METEN_BATCH_SECONDS is not positive.
 _DEFAULT_BATCH_SECONDS = 300
@@ -55,6 +55,28 @@ class SamenMetenPollingSource(RestPollingSource):
         self._last_ts: dict[int, datetime] = {}
         # Datastreams that returned errors — skipped until retry (1h cooldown)
         self._dead_ds: dict[int, datetime] = {}
+        # The polling loop's high-water marks (newest timestamp pushed per
+        # sensor_id::observed_property, seeded from FROST at startup): where a
+        # Datastream without a fetched timestamp starts reading (#47).
+        self._marks: Mapping[str, datetime] = {}
+
+    def use_marks(self, marks: Mapping[str, datetime]) -> None:
+        """Start a Datastream without a fetched timestamp at the polling loop's mark for it (#47).
+
+        Without it every Datastream read only the hour before the cycle's start
+        after a restart, and RIVM publishes some values hours late: those were
+        never read. The loop passes its live dict, so marks it advances count too.
+        """
+        self._marks = marks
+
+    def _fetch_from(self, ds_id: int, sensor_id: str, observed_property: str, now: datetime) -> datetime:
+        """Read a Datastream's observations after this time: its last fetched one, else the polling loop's
+        mark for its sensor and property, else ``SAMEN_METEN_LOOKBACK_HOURS`` before the cycle's start."""
+        last = self._last_ts.get(ds_id) or self._marks.get(f"{sensor_id}::{observed_property}")
+        if last is not None:
+            return last
+        hours = settings.samen_meten_lookback_hours
+        return now - timedelta(hours=hours if hours > 0 else _DEFAULT_LOOKBACK_HOURS)
 
     def is_enabled(self) -> bool:
         return settings.samen_meten_enabled
@@ -131,10 +153,10 @@ class SamenMetenPollingSource(RestPollingSource):
             if blacklisted_at is not None and blacklisted_at > retry_cutoff:
                 return []
 
-            last = self._last_ts.get(ds_id)
-            if last is None:
-                last = now - timedelta(hours=_DEFAULT_LOOKBACK_HOURS)
-            filter_ts = last.strftime("%Y-%m-%dT%H:%M:%SZ")
+            sensor_id = samen_meten_sensor_id(thing_id)
+            last = self._fetch_from(ds_id, sensor_id, observed_property, now)
+            # 'Z': the filter is UTC; a naive timestamp counts as UTC.
+            filter_ts = (last.astimezone(UTC) if last.tzinfo else last).strftime("%Y-%m-%dT%H:%M:%SZ")
 
             async with sem:
                 try:
@@ -162,7 +184,6 @@ class SamenMetenPollingSource(RestPollingSource):
             self._dead_ds.pop(ds_id, None)
 
             thing_name = meta["name"]
-            sensor_id = samen_meten_sensor_id(thing_id)
             sensor_name = f"SamenMeten {thing_name} sensor"
             full_thing_name = f"SamenMeten {thing_name}"
 

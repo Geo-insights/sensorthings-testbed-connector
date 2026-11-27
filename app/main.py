@@ -905,6 +905,18 @@ def _batch_entity_sets(source: Any, readings: list[Any]) -> list[dict[str, Any]]
     return source.entity_sets_for(readings) if _registers_per_batch(source) else None
 
 
+def _share_marks(source: Any, marks: dict[str, datetime]) -> None:
+    """Give a source that reads from them (``use_marks``, Samen Meten) the loop's live high-water marks.
+
+    A Samen Meten Datastream without a fetched timestamp starts reading at its
+    mark, the newest observation in FROST, instead of an hour before the cycle
+    (#47). The dict is the loop's own, so marks advanced by later pushes count.
+    """
+    use_marks = getattr(source, "use_marks", None)
+    if callable(use_marks):
+        use_marks(marks)
+
+
 def _registers_per_batch(source: Any) -> bool:
     """Whether a batch registers only its own readings' entity sets (``_batch_entity_sets``)."""
     return callable(getattr(source, "entity_sets_for", None))
@@ -945,6 +957,7 @@ async def _polling_ingest_loop(source):
     last_timestamps = await run_in_threadpool(
         _seed_timestamps_from_frost, source.source_name
     )
+    _share_marks(source, last_timestamps)
 
     while True:
         waits = _CycleWaits()
@@ -964,6 +977,7 @@ async def _polling_ingest_loop(source):
                         last_timestamps = await run_in_threadpool(
                             _seed_timestamps_from_frost, source.source_name
                         )
+                        _share_marks(source, last_timestamps)
 
                     # Only push if entities are registered or we have cached IDs
                     # from a previous run. Pushing before registration generates

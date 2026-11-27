@@ -421,6 +421,9 @@ class Settings:
     # Seconds between Samen Meten pushes while a cycle runs. A cycle reads 11,000+
     # datastreams and can take two hours, so its readings go to FROST in batches.
     samen_meten_batch_seconds: int = int(os.getenv("SAMEN_METEN_BATCH_SECONDS", "300"))
+    # Hours a Samen Meten datastream reads back when neither the source nor FROST knows
+    # its newest observation (#47). RIVM publishes some values hours late.
+    samen_meten_lookback_hours: int = int(os.getenv("SAMEN_METEN_LOOKBACK_HOURS", "6"))
     # --- Buienradar weather (#14) ---
     buienradar_enabled: bool = os.getenv("BUIENRADAR_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     buienradar_api_url: str = os.getenv("BUIENRADAR_API_URL", "https://data.buienradar.nl/2.0/feed/json").strip()
