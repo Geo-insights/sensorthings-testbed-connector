@@ -82,6 +82,7 @@ class KNMIWeatherNormalizer(Normalizer):
     visibility: float | None = None
     sunpower: float | None = None
     rainfalllasthour: float | None = None
+    rainfallrate: float | None = None
 
     NAME_TRANSFORM: ClassVar[dict[str, CanonicalDatastream]] = {
         "temperature": CanonicalDatastream.TEMPERATURE,
@@ -95,6 +96,7 @@ class KNMIWeatherNormalizer(Normalizer):
         "visibility": CanonicalDatastream.VISIBILITY,
         "sunpower": CanonicalDatastream.SOLAR_RADIATION,
         "rainfalllasthour": CanonicalDatastream.PRECIPITATION,
+        "rainfallrate": CanonicalDatastream.RAIN_RATE,
     }
 
 

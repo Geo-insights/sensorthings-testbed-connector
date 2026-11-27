@@ -19,18 +19,22 @@ shifted whenever a station appeared in or dropped out of a response;
 stable ids. Thing, Location and Sensor names stay coordinate based
 (``KNMI-52.36-3.34``) as before, so registration keeps finding them.
 
-KNMI parameter code reference (10-minute observations):
-  ta  = air temperature (0.1 °C)
-  tg  = ground temperature at 10 cm (0.1 °C)
-  ff  = mean wind speed (0.1 m/s)
-  dd  = wind direction (degrees)
-  fxx = max wind gust (0.1 m/s)
-  pp  = air pressure (0.1 hPa)
-  rh  = relative humidity (%)
-  vv  = visibility (0-49: x100m, 50-79: x1km-5km, 80-89: x5km-30km)
-  sq  = sunshine duration (0.1 hour per hour)
-  rg  = global radiation (J/cm2)
-  r1h = precipitation last hour (0.1 mm)
+KNMI parameter codes read, from KNMI's variable table for the dataset
+10-minute-in-situ-meteorological-observations (dataplatform.knmi.nl, dataset
+docs). The EDR API serves them in the units below:
+  ta  = past minute mean air temperature at 1.50 m (°C)
+  tg  = past minute mean air temperature at 10 cm (°C)
+  ff  = past 10 minute mean wind speed, representative for 10 m (m/s)
+  dd  = past 10 minute mean wind direction (degrees)
+  gff = past 10 minute maximum wind gust, representative for 10 m (m/s)
+  pp  = air pressure at mean sea level (hPa)
+  rh  = past minute mean relative humidity at 1.50 m (%)
+  vv  = past 10 minute mean horizontal visibility (m)
+  qg  = past 10 minute mean global solar radiation (W/m2)
+  rg  = past 10 minute mean precipitation intensity, rain gauge (mm/h)
+  R1H = past hour rainfall (mm)
+Until 2026-11 the source read ``rg`` as solar radiation and asked for gust and
+rainfall under codes the dataset does not have (``fxx``, ``r1h``).
 """
 
 from __future__ import annotations
@@ -165,40 +169,31 @@ _DESCRIPTIONS: dict[str, str] = {
     "visibility": "Horizontal visibility at KNMI weather station.",
     "solar_radiation": "Global solar radiation at KNMI weather station.",
     "precipitation": "Precipitation amount (last hour) at KNMI weather station.",
+    "rain_rate": "Precipitation intensity (10-minute mean, rain gauge) at KNMI weather station.",
 }
 
 # Wind conversion: m/s → km/h (canonical WIND_SPEED is km/h)
 _MS_TO_KMH = 3.6
 
-# KNMI EDR API parameter code → (normalizer field, scale factor)
-# EDR CoverageJSON returns values in real SI units (m/s, hPa, °C, %).
+# KNMI EDR API parameter code → (normalizer field, scale factor), the codes as
+# KNMI's variable table names them (see the module docstring). EDR CoverageJSON
+# returns values in real units (m/s, hPa, °C, %, W/m2, mm/h, mm).
 _KNMI_EDR_PARAM_MAP: dict[str, tuple[str, float]] = {
     "ta": ("temperature", 1.0),            # °C
     "tg": ("groundtemperature", 1.0),      # °C
-    "ff": ("windspeedkmh", _MS_TO_KMH),   # m/s → km/h
+    "ff": ("windspeedkmh", _MS_TO_KMH),    # m/s → km/h
     "dd": ("winddirectiondegrees", 1.0),   # degrees
-    "fxx": ("windgustskmh", _MS_TO_KMH),  # m/s → km/h
+    "gff": ("windgustskmh", _MS_TO_KMH),   # m/s → km/h
     "pp": ("airpressure", 1.0),            # hPa
     "rh": ("humidity", 1.0),               # %
     "vv": ("visibility", 1.0),             # m
-    "rg": ("sunpower", 1.0),              # J/cm2
-    "r1h": ("rainfalllasthour", 1.0),      # mm
+    "qg": ("sunpower", 1.0),               # W/m2
+    "rg": ("rainfallrate", 1.0),           # mm/h
+    "R1H": ("rainfalllasthour", 1.0),      # mm
 }
 
-# Legacy Buienradar integer-encoded scale factors (kept for backward compat)
-_WIND_DECI_MS_TO_KMH = 0.36
-_KNMI_PARAM_MAP: dict[str, tuple[str, float]] = {
-    "ta": ("temperature", 0.1),
-    "tg": ("groundtemperature", 0.1),
-    "ff": ("windspeedkmh", _WIND_DECI_MS_TO_KMH),
-    "dd": ("winddirectiondegrees", 1.0),
-    "fxx": ("windgustskmh", _WIND_DECI_MS_TO_KMH),
-    "pp": ("airpressure", 0.1),
-    "rh": ("humidity", 1.0),
-    "vv": ("visibility", 1.0),
-    "rg": ("sunpower", 1.0),
-    "r1h": ("rainfalllasthour", 0.1),
-}
+# The EDR ``parameter-name`` list: every code the parser maps, and only those.
+EDR_PARAMETER_NAMES = ",".join(_KNMI_EDR_PARAM_MAP)
 
 
 def build_entity_set(

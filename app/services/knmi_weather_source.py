@@ -22,6 +22,7 @@ from app.models import SensorReading
 from app.services.api_client import AsyncAPIClient
 from app.services.rest_polling_source import RestPollingSource
 from app.sources.knmi_weather import (
+    EDR_PARAMETER_NAMES,
     KNMILocation,
     build_entity_set,
     coverages_without_station_id,
@@ -141,7 +142,7 @@ class KNMIWeatherPollingSource(RestPollingSource):
         raw_url = (
             f"{base_url}/area"
             f"?coords=POLYGON((3.3 50.7,7.2 50.7,7.2 53.5,3.3 53.5,3.3 50.7))"
-            f"&parameter-name=ta,tg,ff,dd,pp,rh,vv,rg"
+            f"&parameter-name={EDR_PARAMETER_NAMES}"
             f"&datetime={start}/{end}"
         )
 
